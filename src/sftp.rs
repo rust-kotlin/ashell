@@ -61,6 +61,8 @@ pub enum SftpCommand {
     EditFile {
         remote_path: String,
     },
+    CreateDir(String),
+    DeletePaths(Vec<String>),
     UploadEditedFile {
         local_path: String,
         remote_path: String,
@@ -254,6 +256,12 @@ async fn run_sftp(
         .canonicalize(".")
         .await
         .unwrap_or_else(|_| "/".to_string());
+    
+    let _ = events.send(BackendEvent::SftpHome {
+        tab_id: tab_id.clone(),
+        home: home.clone(),
+    });
+
     emit_entries(&events, &tab_id, &sftp, &home).await?;
 
     let mut active_transfers: std::collections::HashMap<String, TransferStateFlag> =
@@ -624,6 +632,85 @@ async fn run_sftp(
                     }
                 });
             }
+            SftpCommand::CreateDir(path) => {
+                let actual_path = if path == "~" {
+                    home.clone()
+                } else if let Some(rest) = path.strip_prefix("~/") {
+                    crate::sftp::join_remote(&home, rest)
+                } else {
+                    path.clone()
+                };
+
+                match sftp.create_dir(&actual_path).await {
+                    Ok(_) => {
+                        let _ = events.send(BackendEvent::SftpStatus {
+                            tab_id: tab_id.clone(),
+                            text: t!("create_folder_success", name = base_name(&actual_path)).to_string(),
+                        });
+                        
+                        // Re-fetch the parent directory to show the newly created folder
+                        if let Some(parent) = parent_dir(&actual_path) {
+                            let _ = commands_tx.send(SftpCommand::ListDir(parent));
+                        } else {
+                            let _ = commands_tx.send(SftpCommand::ListDir("/".to_string()));
+                        }
+                    }
+                    Err(err) => {
+                        let _ = events.send(BackendEvent::SftpStatus {
+                            tab_id: tab_id.clone(),
+                            text: t!("create_folder_failed", err = format!("{err:#}")).to_string(),
+                        });
+                    }
+                }
+            }
+            SftpCommand::DeletePaths(paths) => {
+                let _ = events.send(BackendEvent::SftpStatus {
+                    tab_id: tab_id.clone(),
+                    text: t!("deleting_paths", count = paths.len()).to_string(),
+                });
+
+                let mut errors = Vec::new();
+                for path in paths.clone() {
+                    let actual_path = if path == "~" {
+                        home.clone()
+                    } else if let Some(rest) = path.strip_prefix("~/") {
+                        crate::sftp::join_remote(&home, rest)
+                    } else {
+                        path.clone()
+                    };
+
+                    if let Err(e) = recursive_delete(&sftp, actual_path).await {
+                        errors.push(format!("{path}: {e:#}"));
+                    }
+                }
+
+                if errors.is_empty() {
+                    let _ = events.send(BackendEvent::SftpStatus {
+                        tab_id: tab_id.clone(),
+                        text: t!("delete_success", count = paths.len()).to_string(),
+                    });
+                } else {
+                    let _ = events.send(BackendEvent::SftpStatus {
+                        tab_id: tab_id.clone(),
+                        text: t!("delete_failed", err = errors.join(", ")).to_string(),
+                    });
+                }
+
+                if let Some(first) = paths.first() {
+                    let actual_path = if first == "~" {
+                        home.clone()
+                    } else if let Some(rest) = first.strip_prefix("~/") {
+                        crate::sftp::join_remote(&home, rest)
+                    } else {
+                        first.clone()
+                    };
+                    if let Some(parent) = parent_dir(&actual_path) {
+                        let _ = commands_tx.send(SftpCommand::ListDir(parent));
+                    } else {
+                        let _ = commands_tx.send(SftpCommand::ListDir("/".to_string()));
+                    }
+                }
+            }
         }
     }
 
@@ -631,6 +718,43 @@ async fn run_sftp(
         .disconnect(Disconnect::ByApplication, "bye", "")
         .await;
     Ok(())
+}
+
+use std::future::Future;
+use std::pin::Pin;
+
+fn recursive_delete<'a>(
+    sftp: &'a SftpSession,
+    path: String,
+) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        match sftp.read_dir(&path).await {
+            Ok(entries) => {
+                for entry in entries {
+                    let name = entry.file_name();
+                    if name == "." || name == ".." {
+                        continue;
+                    }
+                    let child_path = crate::sftp::join_remote(&path, &name);
+                    
+                    let meta = entry.metadata();
+                    let permissions = meta.permissions.unwrap_or(0);
+                    let is_dir = (permissions & 0o170_000) == 0o040_000;
+                    
+                    if is_dir {
+                        recursive_delete(sftp, child_path).await?;
+                    } else {
+                        sftp.remove_file(&child_path).await.with_context(|| format!("Failed to delete file {child_path}"))?;
+                    }
+                }
+                sftp.remove_dir(&path).await.with_context(|| format!("Failed to delete dir {path}"))?;
+            }
+            Err(_) => {
+                sftp.remove_file(&path).await.with_context(|| format!("Failed to delete {path}"))?;
+            }
+        }
+        Ok(())
+    })
 }
 
 async fn emit_entries(
@@ -773,7 +897,23 @@ fn base_name(path: &str) -> String {
         .to_string()
 }
 
-fn join_remote(parent: &str, child: &str) -> String {
+pub(crate) fn parent_dir(path: &str) -> Option<String> {
+    if path == "/" || path.is_empty() {
+        return None;
+    }
+    let trimmed = path.trim_end_matches('/');
+    if let Some(idx) = trimmed.rfind('/') {
+        if idx == 0 {
+            Some("/".to_string())
+        } else {
+            Some(trimmed[..idx].to_string())
+        }
+    } else {
+        Some("/".to_string())
+    }
+}
+
+pub(crate) fn join_remote(parent: &str, child: &str) -> String {
     if parent == "/" {
         format!("/{child}")
     } else {

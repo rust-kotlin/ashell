@@ -171,6 +171,9 @@ struct Ashell {
     connection_progress: Option<ConnectionProgress>,
     pending_sftp_path_sync: Option<String>,
     sftp_context_menu: Option<SftpContextMenuState>,
+    sftp_creating_folder: bool,
+    sftp_new_folder_input: Entity<InputState>,
+    sftp_delete_scroll_handle: gpui::ScrollHandle,
     show_hidden_files: bool,
     transfers: Vec<crate::terminal::Transfer>,
     show_transfers_dialog: bool,
@@ -235,6 +238,7 @@ impl Ashell {
                 .placeholder("-----BEGIN OPENSSH PRIVATE KEY-----")
         });
         let sftp_path_input = cx.new(|cx| InputState::new(window, cx).default_value("/"));
+        let sftp_new_folder_input = cx.new(|cx| InputState::new(window, cx).placeholder(t!("new_folder").to_string()));
 
         let _subscriptions = vec![
             cx.subscribe_in(&host_input, window, Self::on_input_event),
@@ -245,6 +249,7 @@ impl Ashell {
             cx.subscribe_in(&key_path_input, window, Self::on_input_event),
             cx.subscribe_in(&key_inline_input, window, Self::on_input_event),
             cx.subscribe_in(&sftp_path_input, window, Self::on_input_event),
+            cx.subscribe_in(&sftp_new_folder_input, window, Self::on_input_event),
         ];
 
         let (events_tx, events_rx) = mpsc::channel();
@@ -330,6 +335,9 @@ impl Ashell {
             connection_progress: None,
             pending_sftp_path_sync: Some("/".into()),
             sftp_context_menu: None,
+            sftp_creating_folder: false,
+            sftp_new_folder_input,
+            sftp_delete_scroll_handle: gpui::ScrollHandle::new(),
             show_hidden_files: false,
             transfers: config.transfers(),
             show_transfers_dialog: false,
@@ -376,6 +384,28 @@ impl Ashell {
                 self.navigate_sftp(if path.is_empty() { "/".into() } else { path }, cx);
                 window.prevent_default();
                 cx.stop_propagation();
+            }
+        } else if input == &self.sftp_new_folder_input {
+            match event {
+                InputEvent::PressEnter { .. } => {
+                    let name = self.sftp_new_folder_input.read(cx).text().to_string();
+                    if !name.is_empty() {
+                        let base_path = self.sftp_path_input.read(cx).text().to_string();
+                        let path = crate::sftp::join_remote(&base_path, &name);
+                        if let Some(id) = self.active_tab.clone() {
+                            if let Some(handle) = self.sftp_handles.get(&id) {
+                                let _ = handle.commands.send(crate::sftp::SftpCommand::CreateDir(path));
+                            }
+                        }
+                    }
+                    self.sftp_creating_folder = false;
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+                InputEvent::Blur => {
+                    self.sftp_creating_folder = false;
+                }
+                _ => {}
             }
         }
         cx.notify();
@@ -517,6 +547,13 @@ impl Ashell {
                     }
                     self.status = reason.into();
                 }
+                BackendEvent::SftpHome { tab_id, home } => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        if let Some(sftp) = tab.sftp.as_mut() {
+                            sftp.home_dir = home;
+                        }
+                    }
+                }
                 BackendEvent::TerminalTitleChanged { tab_id, title } => {
                     if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                         if let Some(sftp) = &tab.sftp {
@@ -527,7 +564,14 @@ impl Ashell {
                             };
 
                             if potential_path.starts_with('/') || potential_path.starts_with('~') {
-                                let path_to_sync = potential_path.to_string();
+                                let path_to_sync = if potential_path == "~" {
+                                    sftp.home_dir.clone()
+                                } else if let Some(rest) = potential_path.strip_prefix("~/") {
+                                    crate::sftp::join_remote(&sftp.home_dir, rest)
+                                } else {
+                                    potential_path.to_string()
+                                };
+                                
                                 if path_to_sync != sftp.current_path {
                                     if let Some(handle) = self.sftp_handles.get(&tab_id) {
                                         handle.list_dir(path_to_sync);
@@ -1381,6 +1425,177 @@ impl Ashell {
                                 )
                         )
                     }
+                })
+        });
+    }
+
+    fn show_delete_confirm_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity();
+        let selected_entries = self.active_sftp().map(|s| s.selected_entries.clone()).unwrap_or_default();
+        if selected_entries.is_empty() {
+            return;
+        }
+
+        let has_system_path = selected_entries.iter().any(|path| {
+            let p = path.as_str();
+            p.starts_with("/bin/") || p == "/bin" ||
+            p.starts_with("/etc/") || p == "/etc" ||
+            p.starts_with("/usr/") || p == "/usr" ||
+            p.starts_with("/var/") || p == "/var" ||
+            p.starts_with("/sys/") || p == "/sys" ||
+            p.starts_with("/dev/") || p == "/dev" ||
+            p.starts_with("/boot/") || p == "/boot" ||
+            p.starts_with("/lib/") || p == "/lib" ||
+            p.starts_with("/opt/") || p == "/opt" ||
+            p.starts_with("/run/") || p == "/run" ||
+            p.starts_with("/sbin/") || p == "/sbin"
+        });
+
+        window.open_dialog(cx, move |dialog: Dialog, _window, _| {
+            dialog
+                .title(t!("confirm_delete").to_string())
+                .w(px(500.))
+                .keyboard(false)
+                .on_ok({
+                    let view = view.clone();
+                    let paths_to_delete: Vec<String> = selected_entries.clone().into_iter().collect();
+                    move |_, window, cx| {
+                        view.update(cx, |this, cx| {
+                            if let Some(id) = this.active_tab.clone() {
+                                if let Some(handle) = this.sftp_handles.get(&id) {
+                                    let _ = handle.commands.send(crate::sftp::SftpCommand::DeletePaths(paths_to_delete.clone()));
+                                }
+                                if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == id) {
+                                    if let Some(sftp) = tab.sftp.as_mut() {
+                                        sftp.selected_entries.clear();
+                                    }
+                                }
+                            }
+                            cx.notify();
+                        });
+                        window.close_dialog(cx);
+                        true
+                    }
+                })
+                .content({
+                    let view = view.clone();
+                    move |content, _window, cx| {
+                        let scroll_handle = view.read(cx).sftp_delete_scroll_handle.clone();
+                        let selected_paths: Vec<String> = view.read(cx)
+                            .active_sftp()
+                            .map(|s| s.selected_entries.clone().into_iter().collect())
+                            .unwrap_or_default();
+                        
+                        let warning_block = if has_system_path {
+                            Some(
+                                div()
+                                    .w_full()
+                                    .p_3()
+                                    .mb_3()
+                                    .rounded_md()
+                                    .bg(gpui::rgba(0xff00001a))
+                                    .border_1()
+                                    .border_color(gpui::rgba(0xff000080))
+                                    .child(
+                                        div()
+                                            .text_color(gpui::rgba(0xff0000ff))
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(t!("system_path_warning").to_string())
+                                    )
+                            )
+                        } else {
+                            None
+                        };
+
+                        let paths_list = div()
+                            .relative()
+                            .max_h(px(200.))
+                            .w_full()
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .bg(cx.theme().background)
+                            .rounded_md()
+                            .child(
+                                v_flex()
+                                    .id("delete-scroll-view")
+                                    .size_full()
+                                    .track_scroll(&scroll_handle)
+                                    .overflow_y_scroll()
+                                    .p_2()
+                                    .gap_1()
+                                    .children(selected_paths.into_iter().map(|path| {
+                                        div()
+                                            .text_size(rems(0.917))
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(path)
+                                    }))
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .right_0()
+                                    .child(
+                                        gpui_component::scroll::Scrollbar::vertical(&scroll_handle)
+                                            .scrollbar_show(gpui_component::scroll::ScrollbarShow::Always)
+                                    )
+                            );
+
+                        content.child(
+                            v_flex()
+                                .w_full()
+                                .gap_2()
+                                .children(warning_block)
+                                .child(
+                                    div()
+                                        .text_size(rems(1.0))
+                                        .mb_2()
+                                        .child(t!("confirm_delete_desc", count = view.read(cx).active_sftp().map(|s| s.selected_entries.len()).unwrap_or(0)).to_string())
+                                )
+                                .child(paths_list)
+                        )
+                    }
+                })
+                .footer({
+                    let view = view.clone();
+                    let paths_to_delete: Vec<String> = selected_entries.clone().into_iter().collect();
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("cancel")
+                                .ghost()
+                                .label(t!("cancel").to_string())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("confirm")
+                                .danger()
+                                .label(t!("confirm").to_string())
+                                .on_click({
+                                    let view = view.clone();
+                                    move |_, window, cx| {
+                                        view.update(cx, |this, cx| {
+                                            if let Some(id) = this.active_tab.clone() {
+                                                if let Some(handle) = this.sftp_handles.get(&id) {
+                                                    let _ = handle.commands.send(crate::sftp::SftpCommand::DeletePaths(paths_to_delete.clone()));
+                                                }
+                                                if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == id) {
+                                                    if let Some(sftp) = tab.sftp.as_mut() {
+                                                        sftp.selected_entries.clear();
+                                                    }
+                                                }
+                                            }
+                                            cx.notify();
+                                        });
+                                        window.close_dialog(cx);
+                                    }
+                                }),
+                        )
                 })
         });
     }
@@ -3255,6 +3470,36 @@ impl Ashell {
                         .on_click(cx.listener(|this, _, _, cx| this.refresh_sftp(cx))),
                 )
                 .child(
+                    Button::new("sftp-new-folder")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Folder)
+                        .label(t!("new_folder").to_string())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.sftp_creating_folder = true;
+                            this.sftp_new_folder_input.update(cx, |input, cx| {
+                                input.set_value("", window, cx);
+                                input.focus_handle(cx).focus(window, cx);
+                            });
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("sftp-delete-selected")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Close)
+                        .label(if selected_entries.is_empty() {
+                            t!("delete_selected").to_string()
+                        } else {
+                            format!("{} ({})", t!("delete_selected").to_string(), selected_entries.len())
+                        })
+                        .disabled(selected_entries.is_empty())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.show_delete_confirm_dialog(window, cx);
+                        })),
+                )
+                .child(
                     Button::new("sftp-upload-file")
                         .ghost()
                         .small()
@@ -3454,14 +3699,48 @@ impl Ashell {
                     .w_full()
                     .relative()
                     .child(
-                        uniform_list("remote-files-list", entries.len(), {
+                        uniform_list("remote-files-list", entries.len() + if self.sftp_creating_folder { 1 } else { 0 }, {
                             let entries = entries.clone();
                             let selected_path = selected_path.clone();
                             let view = view.clone();
+                            let creating_folder = self.sftp_creating_folder;
+                            let new_folder_input = self.sftp_new_folder_input.clone();
                             move |visible_range, window, cx| {
                                 visible_range
                                     .map(|ix| {
-                                        let entry = entries[ix].clone();
+                                        if creating_folder && ix == 0 {
+                                            return h_flex()
+                                                .w_full()
+                                                .h(px(28.))
+                                                .items_center()
+                                                .gap_2()
+                                                .px_3()
+                                                .bg(cx.theme().tab_active)
+                                                .border_b_1()
+                                                .border_color(cx.theme().border.opacity(0.35))
+                                                .child(
+                                                    h_flex()
+                                                        .w(px(24.))
+                                                        .flex_none()
+                                                        .items_center()
+                                                        .justify_center(),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w(px(24.))
+                                                        .flex_none()
+                                                        .text_size(rems(1.0))
+                                                        .child("📁"),
+                                                )
+                                                .child(
+                                                    gpui_component::input::Input::new(&new_folder_input)
+                                                        .flex_1()
+                                                )
+                                                .into_any_element();
+                                        }
+
+                                        let actual_ix = if creating_folder { ix - 1 } else { ix };
+                                        let entry = entries[actual_ix].clone();
                                         let left_row = entry.clone();
                                         let right_row = entry.clone();
                                         let remote_path = entry.full_path.clone();

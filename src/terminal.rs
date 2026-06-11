@@ -61,6 +61,10 @@ pub enum BackendEvent {
         tab_id: String,
         reason: String,
     },
+    SftpHome {
+        tab_id: String,
+        home: String,
+    },
     TransferProgress {
         #[allow(dead_code)]
         tab_id: String,
@@ -159,6 +163,7 @@ pub struct SftpUiState {
     pub selected_path: Option<String>,
     pub preview: Option<PreviewData>,
     pub selected_entries: std::collections::HashSet<String>,
+    pub home_dir: String,
 }
 
 impl TerminalTab {
@@ -204,6 +209,7 @@ impl TerminalTab {
             selected_path: None,
             preview: None,
             selected_entries: std::collections::HashSet::new(),
+            home_dir: "/".into(),
         });
         tab
     }
