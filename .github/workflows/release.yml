@@ -168,3 +168,74 @@ jobs:
           files: dist/**/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+  cask:
+    name: Update Homebrew Cask
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Homebrew Tap
+        uses: actions/checkout@v4
+        with:
+          repository: rust-kotlin/homebrew-taps
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: tap
+
+      - name: Download all macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: macos-*
+          path: dist
+
+      - name: Update Cask
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          SHA_ARM=$(sha256sum dist/macos-aarch64/*.zip | cut -d' ' -f1)
+          SHA_INTEL=$(sha256sum dist/macos-x86_64/*.zip | cut -d' ' -f1)
+          
+          mkdir -p tap/Casks
+          CASK_FILE="tap/Casks/ashell.rb"
+          
+          if [ ! -f "$CASK_FILE" ]; then
+            cat > "$CASK_FILE" <<'EOF'
+          cask "ashell" do
+            version "0.0.0"
+            
+            on_arm do
+              sha256 "0"
+              url "https://github.com/rust-kotlin/ashell/releases/download/v#{version}/ashell-#{version}-macos-aarch64.zip"
+            end
+            on_intel do
+              sha256 "0"
+              url "https://github.com/rust-kotlin/ashell/releases/download/v#{version}/ashell-#{version}-macos-x86_64.zip"
+            end
+
+            name "ashell"
+            desc "ashell is a modern, fast, GPUI Component-based desktop terminal client written in Rust."
+            homepage "https://github.com/rust-kotlin/ashell"
+
+            app "ashell.app"
+          end
+          EOF
+            # Remove the 10 leading spaces added for YAML formatting
+            sed -i 's/^          //' "$CASK_FILE"
+          fi
+          
+          sed -i "s|version \".*\"|version \"${VERSION}\"|" "$CASK_FILE"
+          sed -i "/on_arm do/,/end/ s|sha256 \".*\"|sha256 \"${SHA_ARM}\"|" "$CASK_FILE"
+          sed -i "/on_intel do/,/end/ s|sha256 \".*\"|sha256 \"${SHA_INTEL}\"|" "$CASK_FILE"
+
+      - name: Commit and Push
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [[ -n $(git status -s) ]]; then
+            git add Casks/ashell.rb
+            git commit -m "chore: bump ashell to v${VERSION}"
+            git push
+          else
+            echo "No changes to commit"
+          fi
