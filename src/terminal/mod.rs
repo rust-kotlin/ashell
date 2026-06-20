@@ -177,6 +177,8 @@ impl TerminalTab {
         title: String,
         backend: BackendTx,
         events: std::sync::mpsc::Sender<BackendEvent>,
+        cols: u16,
+        rows: u16,
     ) -> Self {
         Self::new(
             id,
@@ -185,6 +187,8 @@ impl TerminalTab {
             "local shell".into(),
             backend,
             events,
+            cols,
+            rows,
         )
     }
 
@@ -193,6 +197,8 @@ impl TerminalTab {
         session: &Session,
         backend: BackendTx,
         events: std::sync::mpsc::Sender<BackendEvent>,
+        cols: u16,
+        rows: u16,
     ) -> Self {
         let mut tab = Self::new(
             id,
@@ -204,6 +210,8 @@ impl TerminalTab {
             ),
             backend,
             events,
+            cols,
+            rows,
         );
         tab.session = Some(session.clone());
         tab.connected = false;
@@ -217,7 +225,11 @@ impl TerminalTab {
         status: String,
         backend: BackendTx,
         events: std::sync::mpsc::Sender<BackendEvent>,
+        cols: u16,
+        rows: u16,
     ) -> Self {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
         Self {
             id: id.clone(),
             title,
@@ -226,9 +238,9 @@ impl TerminalTab {
             connected: matches!(kind, TabKind::Local),
             session: None,
             processor: Processor::new(),
-            term: new_term(100, 30, backend.clone(), id, events),
-            cols: 100,
-            rows: 30,
+            term: new_term(cols, rows, backend.clone(), id, events),
+            cols,
+            rows,
             backend,
             scroll_pixel_y: 0.0,
         }

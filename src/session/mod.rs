@@ -13,28 +13,36 @@ use self::config::{AuthMethod, Session};
 use crate::{
     Ashell, ConnectionProgress, PaneLayout, SelectorEntry, TabGroup,
     app::constants::{
-        DEFAULT_COLS, DEFAULT_ROWS, SIDEBAR_WIDTH, TAB_BAR_HEIGHT, TERMINAL_PADDING_X,
-        TERMINAL_PADDING_Y,
+        SIDEBAR_WIDTH, TAB_BAR_HEIGHT, TERMINAL_PADDING_X, TERMINAL_PADDING_Y,
     },
     backend::{local, ssh},
     terminal::{BackendCommand, RenderSnapshot, TabKind, TerminalTab},
 };
 
 impl Ashell {
+    fn configured_terminal_size(&self) -> (u16, u16) {
+        self.config.terminal_size()
+    }
+
     pub(crate) fn open_local(&mut self, cx: &mut Context<Self>) {
         let id = Uuid::new_v4().to_string();
+        let (cols, rows) = self.configured_terminal_size();
         match local::spawn_local_terminal(
             id.clone(),
-            DEFAULT_COLS,
-            DEFAULT_ROWS,
+            cols,
+            rows,
             self.events_tx.clone(),
         ) {
             Ok(backend) => {
                 let title = if cfg!(windows) { "PowerShell" } else { "Local" }.to_string();
-                let mut tab =
-                    TerminalTab::new_local(id.clone(), title, backend, self.events_tx.clone());
-                tab.resize(DEFAULT_COLS, DEFAULT_ROWS);
-                self.tabs.push(tab);
+                self.tabs.push(TerminalTab::new_local(
+                    id.clone(),
+                    title,
+                    backend,
+                    self.events_tx.clone(),
+                    cols,
+                    rows,
+                ));
                 self.active_tab = Some(id.clone());
                 self.pane_root = PaneLayout::Single(id.clone());
                 self.focused_pane_path = vec![];
@@ -260,6 +268,30 @@ impl Ashell {
         cx.notify();
     }
 
+    pub(crate) fn change_terminal_cols(&mut self, delta: i16, cx: &mut Context<Self>) {
+        let (cols, rows) = self.configured_terminal_size();
+        let next_cols = (cols as i16 + delta).clamp(40, 240) as u16;
+        self.config.set_terminal_size(next_cols, rows);
+        self.config.clear_window_bounds();
+        if let Err(err) = self.config.save() {
+            tracing::warn!("failed to save terminal size: {err:#}");
+        }
+        self.status = format!("terminal size: {}x{}", next_cols, rows).into();
+        cx.notify();
+    }
+
+    pub(crate) fn change_terminal_rows(&mut self, delta: i16, cx: &mut Context<Self>) {
+        let (cols, rows) = self.configured_terminal_size();
+        let next_rows = (rows as i16 + delta).clamp(12, 80) as u16;
+        self.config.set_terminal_size(cols, next_rows);
+        self.config.clear_window_bounds();
+        if let Err(err) = self.config.save() {
+            tracing::warn!("failed to save terminal size: {err:#}");
+        }
+        self.status = format!("terminal size: {}x{}", cols, next_rows).into();
+        cx.notify();
+    }
+
     pub(crate) fn change_ui_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.ui_font_size = (self.ui_font_size + delta).clamp(8.0, 24.0);
         self.config.set_ui_font_size(self.ui_font_size);
@@ -423,12 +455,13 @@ impl Ashell {
             session.host
         );
         let id = Uuid::new_v4().to_string();
+        let (cols, rows) = self.configured_terminal_size();
         let backend = ssh::spawn_ssh_terminal(
             self.runtime.handle(),
             id.clone(),
             session.clone(),
-            DEFAULT_COLS,
-            DEFAULT_ROWS,
+            cols,
+            rows,
             self.events_tx.clone(),
         );
         self.tabs.push(TerminalTab::new_ssh(
@@ -436,6 +469,8 @@ impl Ashell {
             &session,
             backend,
             self.events_tx.clone(),
+            cols,
+            rows,
         ));
         self.active_tab = Some(id.clone());
         self.pane_root = PaneLayout::Single(id.clone());
@@ -515,6 +550,7 @@ impl Ashell {
             return;
         }
 
+        let (cols, rows) = self.configured_terminal_size();
         for (ix, tab_id, session) in retry_tabs {
             // Close old backend
             self.tabs[ix].backend.send(BackendCommand::Close);
@@ -524,14 +560,20 @@ impl Ashell {
                 self.runtime.handle(),
                 tab_id.clone(),
                 session.clone(),
-                DEFAULT_COLS,
-                DEFAULT_ROWS,
+                cols,
+                rows,
                 self.events_tx.clone(),
             );
 
             // Replace tab state in-place to reuse the UI component
-            self.tabs[ix] =
-                TerminalTab::new_ssh(tab_id.clone(), &session, backend, self.events_tx.clone());
+            self.tabs[ix] = TerminalTab::new_ssh(
+                tab_id.clone(),
+                &session,
+                backend,
+                self.events_tx.clone(),
+                cols,
+                rows,
+            );
 
             // Find group to restart SFTP
             if let Some(group) = self
@@ -948,12 +990,13 @@ impl Ashell {
             None => return,
         };
         let new_id = Uuid::new_v4().to_string();
+        let (cols, rows) = self.configured_terminal_size();
         let mut tab = match current_tab.kind {
             TabKind::Local => {
                 match local::spawn_local_terminal(
                     new_id.clone(),
-                    DEFAULT_COLS,
-                    DEFAULT_ROWS,
+                    cols,
+                    rows,
                     self.events_tx.clone(),
                 ) {
                     Ok(backend) => TerminalTab::new_local(
@@ -961,6 +1004,8 @@ impl Ashell {
                         "Local".into(),
                         backend,
                         self.events_tx.clone(),
+                        cols,
+                        rows,
                     ),
                     Err(err) => {
                         self.status = format!("failed to split: {err:#}").into();
@@ -979,8 +1024,8 @@ impl Ashell {
                     self.runtime.handle(),
                     new_id.clone(),
                     session.clone(),
-                    DEFAULT_COLS,
-                    DEFAULT_ROWS,
+                    cols,
+                    rows,
                     self.events_tx.clone(),
                 );
                 let sftp_handle = crate::sftp::spawn_sftp(
@@ -990,10 +1035,17 @@ impl Ashell {
                     self.events_tx.clone(),
                 );
                 self.sftp_handles.insert(new_id.clone(), sftp_handle);
-                TerminalTab::new_ssh(new_id.clone(), &session, backend, self.events_tx.clone())
+                TerminalTab::new_ssh(
+                    new_id.clone(),
+                    &session,
+                    backend,
+                    self.events_tx.clone(),
+                    cols,
+                    rows,
+                )
             }
         };
-        tab.resize(DEFAULT_COLS, DEFAULT_ROWS);
+        tab.resize(cols, rows);
         // Do NOT add to tab_groups — pane stays within the existing group
         self.tabs.push(tab);
         // Do NOT scroll tab bar or add tab bar entry

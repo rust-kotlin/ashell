@@ -5,6 +5,8 @@ use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::app::constants::{DEFAULT_COLS, DEFAULT_ROWS};
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthMethod {
@@ -120,6 +122,10 @@ pub struct ConfigFile {
     pub locale: String,
     #[serde(default = "default_terminal_font_size")]
     pub terminal_font_size: f32,
+    #[serde(default = "default_terminal_cols")]
+    pub terminal_cols: u16,
+    #[serde(default = "default_terminal_rows")]
+    pub terminal_rows: u16,
     #[serde(default = "default_ui_font_size")]
     pub ui_font_size: f32,
     #[serde(default)]
@@ -166,6 +172,14 @@ fn default_locale() -> String {
 
 fn default_terminal_font_size() -> f32 {
     18.0
+}
+
+fn default_terminal_cols() -> u16 {
+    DEFAULT_COLS
+}
+
+fn default_terminal_rows() -> u16 {
+    DEFAULT_ROWS
 }
 
 fn default_ui_font_size() -> f32 {
@@ -320,6 +334,13 @@ impl ConfigStore {
         }
     }
 
+    pub fn terminal_size(&self) -> (u16, u16) {
+        (
+            self.cache.terminal_cols.clamp(40, 240),
+            self.cache.terminal_rows.clamp(12, 80),
+        )
+    }
+
     pub fn set_theme_preferences(
         &mut self,
         follow_system_theme: bool,
@@ -368,8 +389,17 @@ impl ConfigStore {
         self.cache.body_panels = body_panels;
     }
 
+    pub fn clear_window_bounds(&mut self) {
+        self.cache.window_bounds = None;
+    }
+
     pub fn set_terminal_font_size(&mut self, terminal_font_size: f32) {
         self.cache.terminal_font_size = terminal_font_size.max(10.0);
+    }
+
+    pub fn set_terminal_size(&mut self, cols: u16, rows: u16) {
+        self.cache.terminal_cols = cols.clamp(40, 240);
+        self.cache.terminal_rows = rows.clamp(12, 80);
     }
 
     pub fn ui_font_size(&self) -> f32 {

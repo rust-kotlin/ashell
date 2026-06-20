@@ -2,6 +2,10 @@ use gpui::{App, AppContext as _, Bounds, WindowOptions, point, px, size};
 use gpui_component::Root;
 
 use crate::Ashell;
+use crate::app::constants::{
+    COLLAPSED_SIDEBAR_WIDTH, SIDEBAR_WIDTH, TAB_BAR_HEIGHT, TERMINAL_PADDING_X,
+    TERMINAL_PADDING_Y,
+};
 use crate::session::config::ConfigStore;
 
 pub(crate) fn bind_workspace_keys(cx: &mut gpui::App) {
@@ -225,8 +229,24 @@ pub(crate) fn open_main_window(cx: &mut App) {
         });
     } else if let Some(display) = cx.displays().first().cloned() {
         let display_bounds = display.bounds();
-        let width = display_bounds.size.width * 0.8;
-        let height = display_bounds.size.height * 0.9;
+        let (cols, rows) = config.terminal_size();
+        let font_size = config.terminal_font_size();
+        let cell_width = (font_size * 0.646).max(6.0);
+        let line_height = (font_size * 1.385).max(font_size + 2.0);
+        let sidebar_width = if config.sidebar_collapsed() {
+            COLLAPSED_SIDEBAR_WIDTH
+        } else {
+            SIDEBAR_WIDTH
+        };
+        let desired_width = cols as f32 * cell_width + sidebar_width + TERMINAL_PADDING_X + 16.0;
+        let desired_height =
+            rows as f32 * line_height + TAB_BAR_HEIGHT + TERMINAL_PADDING_Y + 248.0;
+        let width = px(desired_width)
+            .min(display_bounds.size.width * 0.85)
+            .max(px(720.));
+        let height = px(desired_height)
+            .min(display_bounds.size.height * 0.86)
+            .max(px(560.));
 
         let x = display_bounds.origin.x + (display_bounds.size.width - width) / 2.0;
 

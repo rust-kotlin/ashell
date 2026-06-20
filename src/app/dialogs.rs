@@ -1341,6 +1341,78 @@ impl Ashell {
                                                         })
                                                     )
                                                 )
+                                                .item(
+                                                    SettingItem::new(
+                                                        t!("terminal_size").to_string(),
+                                                        SettingField::render({
+                                                            let view = view_clone_for_general.clone();
+                                                            move |_, window, cx| {
+                                                                let (cols, rows) = view.read(cx).config.terminal_size();
+                                                                v_flex()
+                                                                    .gap_2()
+                                                                    .child(
+                                                                        h_flex()
+                                                                            .items_center()
+                                                                            .gap_3()
+                                                                            .child(
+                                                                                Button::new("terminal-rows-down")
+                                                                                    .small()
+                                                                                    .label("-")
+                                                                                    .on_click(window.listener_for(
+                                                                                        &view,
+                                                                                        |this, _, _, cx| this.change_terminal_rows(-1, cx),
+                                                                                    )),
+                                                                            )
+                                                                            .child(
+                                                                                div()
+                                                                                    .min_w(px(64.))
+                                                                                    .text_center()
+                                                                                    .child(format!("{}{}", rows, t!("terminal_rows"))),
+                                                                            )
+                                                                            .child(
+                                                                                Button::new("terminal-rows-up")
+                                                                                    .small()
+                                                                                    .label("+")
+                                                                                    .on_click(window.listener_for(
+                                                                                        &view,
+                                                                                        |this, _, _, cx| this.change_terminal_rows(1, cx),
+                                                                                    )),
+                                                                            ),
+                                                                    )
+                                                                    .child(
+                                                                        h_flex()
+                                                                            .items_center()
+                                                                            .gap_3()
+                                                                            .child(
+                                                                                Button::new("terminal-cols-down")
+                                                                                    .small()
+                                                                                    .label("-")
+                                                                                    .on_click(window.listener_for(
+                                                                                        &view,
+                                                                                        |this, _, _, cx| this.change_terminal_cols(-1, cx),
+                                                                                    )),
+                                                                            )
+                                                                            .child(
+                                                                                div()
+                                                                                    .min_w(px(64.))
+                                                                                    .text_center()
+                                                                                    .child(format!("{}{}", cols, t!("terminal_cols"))),
+                                                                            )
+                                                                            .child(
+                                                                                Button::new("terminal-cols-up")
+                                                                                    .small()
+                                                                                    .label("+")
+                                                                                    .on_click(window.listener_for(
+                                                                                        &view,
+                                                                                        |this, _, _, cx| this.change_terminal_cols(1, cx),
+                                                                                    )),
+                                                                            ),
+                                                                    )
+                                                                    .into_any_element()
+                                                            }
+                                                        })
+                                                    ).description(t!("terminal_size_hint").to_string())
+                                                )
                                         )
                                         .group(
                                             SettingGroup::new()
