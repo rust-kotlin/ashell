@@ -21,7 +21,7 @@ use crate::app::resizable::{h_resizable, resizable_panel, v_resizable};
 use rust_i18n::t;
 
 use crate::{
-    Ashell, PaneLayout,
+    Ashell, DropZone, PaneLayout,
     app::constants::{COLLAPSED_SIDEBAR_WIDTH, SIDEBAR_WIDTH, TERMINAL_KEY_CONTEXT},
     sftp::format_mtime,
     sftp::ops::is_editable_text_file,
@@ -2162,11 +2162,19 @@ impl Ashell {
                                             }
                                         })
                                         .unwrap_or(cx.theme().success);
+                                    let drag_gid = gid.clone();
                                     Tab::new()
                                         .min_w(px(80.))
                                         .prefix(div().w(px(5.)).h(px(32.)).bg(dot_color))
                                         .child(
                                             div()
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, event: &MouseDownEvent, _, _| {
+                                                        this.pending_drag_group = Some(drag_gid.clone());
+                                                        this.tab_drag_start = Some(event.position);
+                                                    }),
+                                                )
                                                 .when(ix == selected, |this| {
                                                     this.font_weight(FontWeight::BOLD)
                                                         .text_color(cx.theme().primary)
@@ -2301,6 +2309,84 @@ impl Ashell {
             .when(self.search_active, |el| {
                 el.child(self.render_search_bar(window, cx))
             })
+            // Drop-zone overlay — shown while dragging a tab to split
+            .when(self.dragging_group_id.is_some(), |el| {
+                el.child(self.render_drop_zone_overlay(cx))
+            })
+    }
+
+    fn render_drop_zone_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let accent = cx.theme().accent;
+        let highlight_bg = accent.opacity(0.25);
+        let dim_bg = hsla(0., 0., 0., 0.35);
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .bg(dim_bg)
+            // Left zone
+            .child(
+                div()
+                    .absolute()
+                    .top(px(4.))
+                    .left(px(4.))
+                    .bottom(px(4.))
+                    .w(px(100.))
+                    .rounded_lg()
+                    .when(self.drop_zone == Some(DropZone::Left), |this| {
+                        this.bg(highlight_bg)
+                            .border_2()
+                            .border_color(accent)
+                    }),
+            )
+            // Right zone
+            .child(
+                div()
+                    .absolute()
+                    .top(px(4.))
+                    .right(px(4.))
+                    .bottom(px(4.))
+                    .w(px(100.))
+                    .rounded_lg()
+                    .when(self.drop_zone == Some(DropZone::Right), |this| {
+                        this.bg(highlight_bg)
+                            .border_2()
+                            .border_color(accent)
+                    }),
+            )
+            // Up zone
+            .child(
+                div()
+                    .absolute()
+                    .top(px(4.))
+                    .left(px(4.))
+                    .right(px(4.))
+                    .h(px(60.))
+                    .rounded_lg()
+                    .when(self.drop_zone == Some(DropZone::Up), |this| {
+                        this.bg(highlight_bg)
+                            .border_2()
+                            .border_color(accent)
+                    }),
+            )
+            // Down zone
+            .child(
+                div()
+                    .absolute()
+                    .bottom(px(4.))
+                    .left(px(4.))
+                    .right(px(4.))
+                    .h(px(60.))
+                    .rounded_lg()
+                    .when(self.drop_zone == Some(DropZone::Down), |this| {
+                        this.bg(highlight_bg)
+                            .border_2()
+                            .border_color(accent)
+                    }),
+            )
     }
 
     fn render_pane_tree(
@@ -2749,6 +2835,9 @@ impl Render for Ashell {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .font_family(self.ui_font_family.clone())
+            // Global tab-drag handlers (fire after child handlers due to bubbling)
+            .on_mouse_move(cx.listener(Self::on_tab_drag_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_tab_drag_mouse_up))
             .on_action(cx.listener(|this, _: &crate::OpenSettings, window, cx| this.show_settings_dialog(window, cx)))
             .on_action(cx.listener(|this, _: &crate::OpenSession, window, cx| this.show_selector_dialog(window, cx)))
             .on_action(cx.listener(|this, _: &crate::OpenTransfers, window, cx| this.show_transfers_dialog(window, cx)))
@@ -2829,7 +2918,13 @@ impl Render for Ashell {
                                     this.on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, _| {
-                                            this.should_move_window = true;
+                                            // Don't start window move if the user
+                                            // might be initiating a tab drag
+                                            if this.pending_drag_group.is_none()
+                                                && this.dragging_group_id.is_none()
+                                            {
+                                                this.should_move_window = true;
+                                            }
                                         }),
                                     )
                                     .on_mouse_up(

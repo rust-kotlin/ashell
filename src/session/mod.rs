@@ -4,7 +4,7 @@ pub mod ssh_keys;
 
 use gpui::{
     AppContext as _, Context, Entity, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    SharedString, Window, px,
+    MouseUpEvent, Pixels, Point, SharedString, Window, px,
 };
 use gpui_component::{Theme, WindowExt as _, input::InputState};
 use rust_i18n::t;
@@ -13,7 +13,7 @@ use uuid::Uuid;
 use self::config::{AuthMethod, Session};
 
 use crate::{
-    Ashell, PaneLayout, SelectorEntry, TabGroup,
+    Ashell, DropZone, PaneLayout, SelectorEntry, TabGroup,
     app::constants::{DEFAULT_COLS, DEFAULT_ROWS},
     backend::{local, ssh},
     terminal::{BackendCommand, RenderSnapshot, TabKind, TerminalTab},
@@ -1470,5 +1470,198 @@ impl Ashell {
                 self.search_target_tab = None;
             }
         }
+    }
+
+    // ─── Tab drag-to-split ───────────────────────────────────────────
+
+    /// Called on every mouse_move at the root level. Detects drag start
+    /// (threshold exceeded) and updates the current drop zone.
+    pub(crate) fn on_tab_drag_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Promote pending drag → active drag once the mouse moves past a threshold
+        if self.dragging_group_id.is_none() {
+            if let (Some(start), Some(group_id)) =
+                (self.tab_drag_start, self.pending_drag_group.as_ref())
+            {
+                let dx: f32 = (event.position.x - start.x).into();
+                let dy: f32 = (event.position.y - start.y).into();
+                if (dx * dx + dy * dy).sqrt() > 5.0 {
+                    self.dragging_group_id = Some(group_id.clone());
+                    self.pending_drag_group = None;
+                    cx.notify();
+                }
+            }
+        }
+
+        // Update drop zone while dragging
+        if self.dragging_group_id.is_some() {
+            let new_zone = self.compute_drop_zone(event.position);
+            if new_zone != self.drop_zone {
+                self.drop_zone = new_zone;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Called on mouse_up at the root level. If a drag is active and a
+    /// valid drop zone is set, moves the source group's tab into the
+    /// current group as a split pane.
+    pub(crate) fn on_tab_drag_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let source_group_id = self.dragging_group_id.take();
+        let zone = self.drop_zone.take();
+        self.pending_drag_group = None;
+        self.tab_drag_start = None;
+
+        if let (Some(source_group_id), Some(zone)) = (source_group_id, zone) {
+            let direction = match zone {
+                DropZone::Left => "left",
+                DropZone::Right => "right",
+                DropZone::Up => "up",
+                DropZone::Down => "down",
+            };
+            self.move_group_to_split(&source_group_id, direction, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Determine which drop zone the mouse is hovering over, based on the
+    /// terminal panel bounds. Returns `None` when the mouse is outside the
+    /// terminal area.
+    fn compute_drop_zone(&self, position: Point<Pixels>) -> Option<DropZone> {
+        let bounds = self.terminal_panel_bounds?;
+        if !bounds.contains(&position) {
+            return None;
+        }
+        let center_x = bounds.origin.x + bounds.size.width / 2.0;
+        let center_y = bounds.origin.y + bounds.size.height / 2.0;
+        let dx = position.x - center_x;
+        let dy = position.y - center_y;
+        if dx.abs() > dy.abs() {
+            if dx < px(0.) {
+                Some(DropZone::Left)
+            } else {
+                Some(DropZone::Right)
+            }
+        } else if dy < px(0.) {
+            Some(DropZone::Up)
+        } else {
+            Some(DropZone::Down)
+        }
+    }
+
+    /// Move the first (and only) tab from *source_group_id* into the
+    /// currently active group as a new split pane in *direction*.
+    pub(crate) fn move_group_to_split(
+        &mut self,
+        source_group_id: &str,
+        direction: &str,
+        cx: &mut Context<Self>,
+    ) {
+        // Don't move onto self
+        if self.active_group.as_deref() == Some(source_group_id) {
+            return;
+        }
+
+        // Find source group
+        let source_ix = match self.tab_groups.iter().position(|g| g.id == source_group_id) {
+            Some(ix) => ix,
+            None => return,
+        };
+
+        // Only support moving single-pane groups for now
+        let source_tab_ids: Vec<String> = self.tab_groups[source_ix]
+            .pane_root
+            .tab_ids()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        if source_tab_ids.is_empty() {
+            return;
+        }
+        if source_tab_ids.len() > 1 {
+            self.status = "cannot drag a group with multiple panes".into();
+            cx.notify();
+            return;
+        }
+
+        let tab_id = source_tab_ids[0].clone();
+
+        // Current focused tab in the target group — this is what we split from
+        let current_id = match self.pane_root.focused_tab_id(&self.focused_pane_path) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return,
+        };
+
+        // Remove the source group entirely (it has only one tab)
+        self.tab_groups.remove(source_ix);
+
+        // Close the source group's SFTP handle (keyed by group id) and
+        // re-spawn a fresh one keyed by the tab id, following the same
+        // pattern as `split_current_pane`.
+        if let Some(old_handle) = self.sftp_handles.remove(source_group_id) {
+            old_handle.close();
+        }
+        let source_session = self
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.session.clone());
+        if let Some(session) = source_session {
+            let sftp_handle = crate::sftp::spawn_sftp(
+                self.runtime.handle(),
+                tab_id.clone(),
+                session,
+                self.events_tx.clone(),
+            );
+            self.sftp_handles.insert(tab_id.clone(), sftp_handle);
+        }
+
+        // Build the split layout (same structure as split_current_pane)
+        let current_pane = PaneLayout::Single(current_id);
+        let new_pane = PaneLayout::Single(tab_id.clone());
+
+        let split_layout = match direction {
+            "left" | "right" => {
+                let children = match direction {
+                    "left" => vec![new_pane, current_pane],
+                    _ => vec![current_pane, new_pane],
+                };
+                PaneLayout::Vertical(children, 0.5)
+            }
+            "up" | "down" => {
+                let children = match direction {
+                    "up" => vec![new_pane, current_pane],
+                    _ => vec![current_pane, new_pane],
+                };
+                PaneLayout::Horizontal(children, 0.5)
+            }
+            _ => return,
+        };
+
+        self.pane_root
+            .replace_at(&self.focused_pane_path, split_layout);
+        self.sync_pane_root_to_group();
+
+        // Focus the newly moved pane
+        let mut new_path = self.focused_pane_path.clone();
+        if direction == "right" || direction == "down" {
+            new_path.push(1);
+        } else {
+            new_path.push(0);
+        }
+        self.focused_pane_path = new_path;
+        self.active_tab = Some(tab_id);
+        self.status = "tab dragged to split".into();
+        cx.notify();
     }
 }

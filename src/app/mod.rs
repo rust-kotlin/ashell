@@ -281,6 +281,11 @@ pub(crate) struct Ashell {
     pub(crate) terminal_selecting: bool,
     pub(crate) dragging_splitter: Option<(Vec<usize>, usize)>, // (parent_path, child_index)
     pub(crate) drag_split_origin: Option<gpui::Point<Pixels>>,
+    // Tab drag-to-split state
+    pub(crate) pending_drag_group: Option<String>,
+    pub(crate) tab_drag_start: Option<gpui::Point<Pixels>>,
+    pub(crate) dragging_group_id: Option<String>,
+    pub(crate) drop_zone: Option<DropZone>,
     pub(crate) terminal_marked_text: Option<String>,
     pub(crate) sftp_panel_minimized: bool,
     pub(crate) sidebar_collapsed: bool,
@@ -332,6 +337,14 @@ pub(crate) struct HoveredUrl {
     pub(crate) url: String,
     pub(crate) tab_id: String,
     pub(crate) cells: Vec<(usize, usize)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DropZone {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 #[derive(Clone)]
@@ -672,6 +685,10 @@ impl Ashell {
             terminal_marked_text: None,
             dragging_splitter: None,
             drag_split_origin: None,
+            pending_drag_group: None,
+            tab_drag_start: None,
+            dragging_group_id: None,
+            drop_zone: None,
             sftp_panel_minimized: config.sftp_panel_minimized(),
             sidebar_collapsed: config.sidebar_collapsed(),
             collapsed_saved_scroll_handle: gpui::ScrollHandle::new(),

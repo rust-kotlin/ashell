@@ -369,6 +369,11 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Skip terminal mouse handling during tab drag-to-split
+        if self.dragging_group_id.is_some() || self.pending_drag_group.is_some() {
+            return;
+        }
+
         // Handle split drag
         if self.dragging_splitter.is_some() {
             if event.pressed_button == Some(MouseButton::Left) {
@@ -472,6 +477,11 @@ impl Ashell {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Skip during tab drag — root handler takes care of it
+        if self.dragging_group_id.is_some() || self.pending_drag_group.is_some() {
+            return;
+        }
+
         if self.dragging_splitter.is_some() {
             self.end_drag_split();
         }
