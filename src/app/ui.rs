@@ -23,6 +23,7 @@ use rust_i18n::t;
 use crate::{
     Ashell, DropZone, PaneLayout,
     app::constants::{COLLAPSED_SIDEBAR_WIDTH, SIDEBAR_WIDTH, TERMINAL_KEY_CONTEXT},
+    app::TabContextMenuState,
     sftp::format_mtime,
     sftp::ops::is_editable_text_file,
     system::format_bytes,
@@ -2163,6 +2164,7 @@ impl Ashell {
                                         })
                                         .unwrap_or(cx.theme().success);
                                     let drag_gid = gid.clone();
+                                    let context_gid = gid.clone();
                                     Tab::new()
                                         .min_w(px(80.))
                                         .prefix(div().w(px(5.)).h(px(32.)).bg(dot_color))
@@ -2207,6 +2209,18 @@ impl Ashell {
                                                         }
                                                     },
                                                 )),
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Right,
+                                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                                this.tab_context_menu = Some(
+                                                    TabContextMenuState {
+                                                        group_id: context_gid.clone(),
+                                                        position: event.position,
+                                                    },
+                                                );
+                                                cx.notify();
+                                            }),
                                         )
                                 },
                             ))
@@ -2398,6 +2412,31 @@ impl Ashell {
                             .border_color(accent)
                     }),
             )
+            // "Detach to new window" hint — shown when the cursor is near
+            // or outside the window edge during a tab drag.
+            .when(self.dragging_outside, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px(px(16.))
+                                .py(px(10.))
+                                .rounded_lg()
+                                .bg(accent.opacity(0.9))
+                                .text_color(hsla(0., 0., 100., 0.95))
+                                .text_sm()
+                                .child(t!("drag_detach_hint").to_string()),
+                        ),
+                )
+            })
     }
 
     fn render_pane_tree(
@@ -3041,6 +3080,72 @@ impl Render for Ashell {
                                                         })),
                                                 )
                                             },
+                                        ),
+                                ),
+                        ),
+                )
+            })
+            .when_some(self.tab_context_menu.clone(), |this, menu| {
+                let detach_gid = menu.group_id.clone();
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.tab_context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, _, _, cx| {
+                                this.tab_context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .left(menu.position.x)
+                                .top(menu.position.y)
+                                .w(px(200.))
+                                .p_1()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .bg(cx.theme().popover)
+                                .shadow_lg()
+                                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                })
+                                .on_mouse_down(MouseButton::Right, |_, window, cx| {
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                })
+                                .child(
+                                    v_flex()
+                                        .w_full()
+                                        .child(
+                                            Button::new("tab-context-detach")
+                                                .ghost()
+                                                .w_full()
+                                                .justify_start()
+                                                .label(t!("settings_detach_tab").to_string())
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    this.tab_context_menu = None;
+                                                    this.activate_group(
+                                                        detach_gid.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                    this.detach_tab_to_new_window(cx);
+                                                })),
                                         ),
                                 ),
                         ),

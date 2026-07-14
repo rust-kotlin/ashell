@@ -13,7 +13,7 @@ use std::{
     collections::HashMap,
     ops::Range,
     rc::Rc,
-    sync::mpsc,
+    sync::{Arc, OnceLock, mpsc},
     time::{Duration, Instant},
 };
 
@@ -34,8 +34,22 @@ use crate::{
     session::config::{AuthMethod, ConfigStore},
     session::ssh_config::SshConfigEntry,
     system::{SystemSampler, SystemSnapshot},
-    terminal::{self, BackendEvent, TabKind, TerminalTab},
+    terminal::{self, BackendCommand, BackendEvent, TabKind, TerminalTab},
 };
+
+/// Returns a process-wide shared tokio runtime.
+///
+/// Previously each window (`Ashell`) owned its own `Runtime::new()`, which meant
+/// every additional window spawned another full set of worker threads
+/// (one per CPU core by default). Sharing a single `Arc<Runtime>` across all
+/// windows keeps the thread count flat regardless of how many windows are open.
+static SHARED_RUNTIME: OnceLock<Arc<Runtime>> = OnceLock::new();
+
+pub(crate) fn shared_runtime() -> Arc<Runtime> {
+    SHARED_RUNTIME
+        .get_or_init(|| Arc::new(Runtime::new().expect("create tokio runtime")))
+        .clone()
+}
 
 #[derive(Clone, Debug)]
 pub(crate) enum PaneLayout {
@@ -267,6 +281,7 @@ pub(crate) struct Ashell {
     pub(crate) connection_progress: Option<ConnectionProgress>,
     pub(crate) pending_sftp_path_sync: Option<String>,
     pub(crate) sftp_context_menu: Option<SftpContextMenuState>,
+    pub(crate) tab_context_menu: Option<TabContextMenuState>,
     pub(crate) sftp_creating_folder: bool,
     pub(crate) sftp_new_folder_input: Entity<InputState>,
     pub(crate) sftp_delete_scroll_handle: gpui::ScrollHandle,
@@ -286,6 +301,9 @@ pub(crate) struct Ashell {
     pub(crate) tab_drag_start: Option<gpui::Point<Pixels>>,
     pub(crate) dragging_group_id: Option<String>,
     pub(crate) drop_zone: Option<DropZone>,
+    /// True while dragging a tab and the cursor is near/outside the window
+    /// edge, indicating that releasing will detach to a new window.
+    pub(crate) dragging_outside: bool,
     pub(crate) terminal_marked_text: Option<String>,
     pub(crate) sftp_panel_minimized: bool,
     pub(crate) sidebar_collapsed: bool,
@@ -321,7 +339,7 @@ pub(crate) struct Ashell {
     pub(crate) sftp_handles: std::collections::HashMap<String, crate::sftp::SftpHandle>,
 
     pub(crate) remote_sample_in_flight: bool,
-    pub(crate) runtime: Runtime,
+    pub(crate) runtime: Arc<Runtime>,
     pub(crate) events_rx: mpsc::Receiver<BackendEvent>,
     pub(crate) events_tx: mpsc::Sender<BackendEvent>,
     pub(crate) last_window_size: Option<gpui::Size<Pixels>>,
@@ -366,6 +384,12 @@ pub(crate) struct ConnectionProgress {
 pub(crate) struct SftpContextMenuState {
     pub(crate) remote_path: String,
     pub(crate) is_dir: bool,
+    pub(crate) position: Point<Pixels>,
+}
+
+#[derive(Clone)]
+pub(crate) struct TabContextMenuState {
+    pub(crate) group_id: String,
     pub(crate) position: Point<Pixels>,
 }
 
@@ -660,6 +684,7 @@ impl Ashell {
             connection_progress: None,
             pending_sftp_path_sync: Some("/".into()),
             sftp_context_menu: None,
+            tab_context_menu: None,
             sftp_creating_folder: false,
             sftp_new_folder_input,
             sftp_delete_scroll_handle: gpui::ScrollHandle::new(),
@@ -689,6 +714,7 @@ impl Ashell {
             tab_drag_start: None,
             dragging_group_id: None,
             drop_zone: None,
+            dragging_outside: false,
             sftp_panel_minimized: config.sftp_panel_minimized(),
             sidebar_collapsed: config.sidebar_collapsed(),
             collapsed_saved_scroll_handle: gpui::ScrollHandle::new(),
@@ -720,7 +746,7 @@ impl Ashell {
             sftp_handles: std::collections::HashMap::new(),
 
             remote_sample_in_flight: false,
-            runtime: Runtime::new().expect("create tokio runtime"),
+            runtime: shared_runtime(),
             events_rx,
             events_tx,
             last_window_size: None,
@@ -1243,6 +1269,27 @@ impl Ashell {
             self.handle_tab_close(tab_id);
         }
         cx.notify();
+    }
+
+    /// Clean up all SSH sessions and SFTP handles when the window is closing.
+    pub(crate) fn cleanup_on_window_close(&mut self) {
+        tracing::info!("[ui] cleaning up {} tabs and {} sftp handles on window close",
+            self.tabs.len(), self.sftp_handles.len());
+
+        // Send Close to all terminal backends (SSH channels and local PTY)
+        for tab in &self.tabs {
+            tab.send_backend(BackendCommand::Close);
+        }
+
+        // Close all SFTP handles
+        for (_, handle) in self.sftp_handles.drain() {
+            handle.close();
+        }
+
+        self.tabs.clear();
+        self.tab_groups.clear();
+        self.active_tab = None;
+        self.active_group = None;
     }
 
     pub(crate) fn save_layout_state(&self, window: &mut gpui::Window, cx: &gpui::App) {

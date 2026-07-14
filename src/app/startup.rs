@@ -343,7 +343,11 @@ fn open_window_with_options(
                 tracing::warn!("[ui] window not found in app during close, skipping save layout state.");
                 return true;
             }
-            view_clone.read(cx).save_layout_state(window, cx);
+            view_clone.update(cx, |this, cx| {
+                this.save_layout_state(window, cx);
+                this.cleanup_on_window_close();
+                cx.notify();
+            });
             true
         });
 

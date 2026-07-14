@@ -1509,14 +1509,50 @@ impl Ashell {
         cx.notify();
     }
 
+    /// Detach a specific tab group (identified by group_id) to a new window.
+    /// Used when the user drags a tab outside the window boundary.
+    /// Extracts the first tab's session, closes it in this window, and opens
+    /// a new window that auto-connects to the same session.
+    pub(crate) fn detach_group_to_new_window(
+        &mut self,
+        group_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self.tab_groups.iter().find(|g| g.id == group_id) else {
+            return;
+        };
+        let tab_ids = group.pane_root.tab_ids();
+        let Some(first_tab_id) = tab_ids.first() else {
+            return;
+        };
+        let first_tab_id = first_tab_id.to_string();
+        let Some(tab) = self.tabs.iter().find(|t| t.id == first_tab_id) else {
+            return;
+        };
+        let session = tab.session.clone();
+        let is_local = tab.kind == TabKind::Local;
+
+        self.close_tab(first_tab_id, cx);
+
+        if is_local {
+            crate::app::startup::open_new_window(None, cx);
+        } else if let Some(session) = session {
+            crate::app::startup::open_new_window(Some(session), cx);
+        }
+        self.status = "tab detached to new window".into();
+        cx.notify();
+    }
+
     // ─── Tab drag-to-split ───────────────────────────────────────────
 
     /// Called on every mouse_move at the root level. Detects drag start
-    /// (threshold exceeded) and updates the current drop zone.
+    /// (threshold exceeded) and updates the current drop zone. Also tracks
+    /// whether the cursor is near/outside the window edge to indicate that
+    /// releasing will detach the tab to a new window.
     pub(crate) fn on_tab_drag_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Promote pending drag → active drag once the mouse moves past a threshold
@@ -1534,11 +1570,30 @@ impl Ashell {
             }
         }
 
-        // Update drop zone while dragging
+        // Update drop zone and outside-window indicator while dragging
         if self.dragging_group_id.is_some() {
             let new_zone = self.compute_drop_zone(event.position);
             if new_zone != self.drop_zone {
                 self.drop_zone = new_zone;
+                cx.notify();
+            }
+
+            // Check if the cursor is near or outside the window edge.
+            // When no split drop zone is active and the cursor is close to
+            // the boundary, flag it so the overlay can show a "detach" hint.
+            let viewport = window.viewport_size();
+            let edge_margin = px(24.);
+            let near_edge = event.position.x <= edge_margin
+                || event.position.y <= edge_margin
+                || event.position.x >= viewport.width - edge_margin
+                || event.position.y >= viewport.height - edge_margin
+                || event.position.x < px(0.)
+                || event.position.y < px(0.)
+                || event.position.x > viewport.width
+                || event.position.y > viewport.height;
+            let should_show = near_edge && self.drop_zone.is_none();
+            if should_show != self.dragging_outside {
+                self.dragging_outside = should_show;
                 cx.notify();
             }
         }
@@ -1546,28 +1601,48 @@ impl Ashell {
 
     /// Called on mouse_up at the root level. If a drag is active and a
     /// valid drop zone is set, moves the source group's tab into the
-    /// current group as a split pane.
+    /// current group as a split pane. If no drop zone is set and the mouse
+    /// was released outside the window, detaches the tab to a new window.
     pub(crate) fn on_tab_drag_mouse_up(
         &mut self,
-        _event: &MouseUpEvent,
-        _window: &mut Window,
+        event: &MouseUpEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let source_group_id = self.dragging_group_id.take();
         let zone = self.drop_zone.take();
         self.pending_drag_group = None;
         self.tab_drag_start = None;
+        self.dragging_outside = false;
 
-        if let (Some(source_group_id), Some(zone)) = (source_group_id, zone) {
-            let direction = match zone {
-                DropZone::Left => "left",
-                DropZone::Right => "right",
-                DropZone::Up => "up",
-                DropZone::Down => "down",
-            };
-            self.move_group_to_split(&source_group_id, direction, cx);
-        } else {
-            cx.notify();
+        match (source_group_id, zone) {
+            (Some(source_group_id), Some(zone)) => {
+                let direction = match zone {
+                    DropZone::Left => "left",
+                    DropZone::Right => "right",
+                    DropZone::Up => "up",
+                    DropZone::Down => "down",
+                };
+                self.move_group_to_split(&source_group_id, direction, cx);
+            }
+            (Some(source_group_id), None) => {
+                // No drop zone — check if the mouse was released outside the
+                // window. If so, detach the tab group to a new window.
+                let viewport = window.viewport_size();
+                let margin = px(16.);
+                let outside = event.position.x < -margin
+                    || event.position.y < -margin
+                    || event.position.x > viewport.width + margin
+                    || event.position.y > viewport.height + margin;
+                if outside {
+                    self.detach_group_to_new_window(&source_group_id, cx);
+                } else {
+                    cx.notify();
+                }
+            }
+            _ => {
+                cx.notify();
+            }
         }
     }
 
