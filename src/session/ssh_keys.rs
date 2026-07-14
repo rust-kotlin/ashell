@@ -31,6 +31,43 @@ pub fn normalize_inline_private_key(value: &str) -> String {
     normalized
 }
 
+/// Decode a private key from inline content, optionally with a passphrase.
+/// Returns the parsed `PrivateKey` on success.
+pub fn decode_key(content: &str, passphrase: Option<&str>) -> Result<PrivateKey> {
+    let normalized = normalize_inline_private_key(content);
+    Ok(russh::keys::decode_secret_key(&normalized, passphrase)?)
+}
+
+/// Detect the key type string from parsed key content.
+/// Returns one of: "ed25519", "rsa", "ecdsa", "dsa", or "unknown".
+pub fn detect_key_type(key: &PrivateKey) -> String {
+    let alg = key.algorithm();
+    let s = alg.as_str();
+    if s.contains("ed25519") {
+        "ed25519".to_string()
+    } else if s.contains("rsa") {
+        "rsa".to_string()
+    } else if s.contains("ecdsa") {
+        "ecdsa".to_string()
+    } else if s.contains("dsa") {
+        "dsa".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+/// Compute the SHA256 fingerprint string (e.g. "SHA256:xxxx...") for a key.
+pub fn compute_fingerprint(key: &PrivateKey) -> String {
+    key.fingerprint(HashAlg::Sha256).to_string()
+}
+
+/// Validate, detect type, and compute fingerprint for raw key content.
+/// Returns `(key_type, fingerprint)` on success.
+pub fn validate_and_inspect(content: &str, passphrase: Option<&str>) -> Result<(String, String)> {
+    let key = decode_key(content, passphrase)?;
+    Ok((detect_key_type(&key), compute_fingerprint(&key)))
+}
+
 pub fn private_keys_with_algs(keypair: PrivateKey) -> Result<Vec<PrivateKeyWithHashAlg>> {
     let mut algs = Vec::new();
     let key_arc = Arc::new(keypair);

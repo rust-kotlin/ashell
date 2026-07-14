@@ -13,6 +13,33 @@ pub enum AuthMethod {
     Config,
 }
 
+/// A user-imported SSH private key managed by ashell.
+///
+/// The key file content is copied into `inline_content` at import time,
+/// so deleting the original file does not affect connections that use
+/// this managed key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedKey {
+    pub id: String,
+    /// User-given name / remark for this key.
+    pub name: String,
+    /// Detected key type: "ed25519", "rsa", "ecdsa", "dsa", or "unknown".
+    #[serde(default)]
+    pub key_type: String,
+    /// SHA256 fingerprint string (e.g. "SHA256:xxxx...") for display & dedup.
+    #[serde(default)]
+    pub fingerprint: String,
+    /// The actual private key file content (copy of the original).
+    pub inline_content: String,
+    /// Passphrase for the key (stored in plaintext, same security level
+    /// as Session.password — file is 0o600 on unix).
+    #[serde(default)]
+    pub passphrase: String,
+    /// Import timestamp (unix epoch seconds).
+    #[serde(default)]
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -29,6 +56,10 @@ pub struct Session {
     pub private_key_inline: String,
     #[serde(default)]
     pub passphrase: String,
+    /// Reference to a ManagedKey.id. When set, the key content is resolved
+    /// from the managed key at connection time (not stored in the session).
+    #[serde(default)]
+    pub managed_key_id: Option<String>,
     #[serde(default)]
     pub last_used: Option<String>,
     #[serde(default = "default_global_proxy_type")]
@@ -57,6 +88,7 @@ impl Session {
             private_key_path: String::new(),
             private_key_inline: String::new(),
             passphrase: String::new(),
+            managed_key_id: None,
             last_used: None,
             proxy_type: "none".to_string(),
             proxy_host: String::new(),
@@ -86,6 +118,7 @@ impl Session {
             private_key_path,
             private_key_inline,
             passphrase,
+            managed_key_id: None,
             last_used: None,
             proxy_type: "none".to_string(),
             proxy_host: String::new(),
@@ -167,6 +200,8 @@ pub struct ConfigFile {
     pub cursor_style: CursorStyle,
     #[serde(default)]
     pub sessions: Vec<Session>,
+    #[serde(default)]
+    pub managed_keys: Vec<ManagedKey>,
     #[serde(default)]
     pub window_bounds: Option<SavedWindowBounds>,
     #[serde(default)]
@@ -286,6 +321,7 @@ impl Default for ConfigFile {
             title_bar_style: TitleBarStyle::default(),
             cursor_style: CursorStyle::default(),
             sessions: Vec::new(),
+            managed_keys: Vec::new(),
             window_bounds: None,
             workspace_panels: None,
             body_panels: None,
@@ -752,6 +788,39 @@ impl ConfigStore {
 
     pub fn remove(&mut self, id: &str) {
         self.cache.sessions.retain(|s| s.id != id);
+    }
+
+    // ── Managed keys CRUD ──────────────────────────────────────────
+
+    pub fn managed_keys(&self) -> &[ManagedKey] {
+        &self.cache.managed_keys
+    }
+
+    pub fn get_managed_key(&self, id: &str) -> Option<&ManagedKey> {
+        self.cache.managed_keys.iter().find(|k| k.id == id)
+    }
+
+    pub fn upsert_managed_key(&mut self, key: ManagedKey) {
+        if let Some(existing) = self
+            .cache
+            .managed_keys
+            .iter_mut()
+            .find(|k| k.id == key.id)
+        {
+            *existing = key;
+        } else {
+            self.cache.managed_keys.push(key);
+        }
+    }
+
+    pub fn remove_managed_key(&mut self, id: &str) {
+        self.cache.managed_keys.retain(|k| k.id != id);
+        // Also clear the reference from any session that used this key.
+        for s in &mut self.cache.sessions {
+            if s.managed_key_id.as_deref() == Some(id) {
+                s.managed_key_id = None;
+            }
+        }
     }
 
     pub fn save(&self) -> Result<()> {

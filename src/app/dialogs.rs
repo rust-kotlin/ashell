@@ -146,45 +146,179 @@ impl Ashell {
                                     )
                                 })
                                 .when(is_key, |this| {
-                                    this.child(
+                                    let managed_keys = view.read(cx).managed_keys.clone();
+                                    let managed_key_selected = view.read(cx).managed_key_selected.clone();
+                                    let using_custom_key_path = view.read(cx).using_custom_key_path;
+                                    let theme = cx.theme();
+                                    let show_managed = managed_key_selected.is_some()
+                                        && !using_custom_key_path;
+
+                                    let key_label = if let Some(mk_id) = &managed_key_selected {
+                                        managed_keys
+                                            .iter()
+                                            .find(|k| &k.id == mk_id)
+                                            .map(|mk| format!("{} ({})", mk.name, mk.key_type))
+                                            .unwrap_or_else(|| t!("select_managed_key").to_string())
+                                    } else {
+                                        t!("select_managed_key").to_string()
+                                    };
+
+                                    let this = this.child(
                                         h_flex()
                                             .gap_2()
                                             .child(
-                                                div()
-                                                    .flex_1()
-                                                    .cursor_pointer()
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        window.listener_for(
-                                                            &view,
-                                                            |this, _, window, cx| {
-                                                                this.pick_ssh_key_path(window, cx);
-                                                            },
-                                                        ),
-                                                    )
-                                                    .child(
-                                                        Input::new(&key_path_input).tab_index(4),
+                                                Button::new("managed-key-select")
+                                                    .small()
+                                                    .label(key_label)
+                                                    .dropdown_menu_with_anchor(
+                                                        Anchor::BottomLeft,
+                                                        {
+                                                            let view = view.clone();
+                                                            move |mut menu, window, cx| {
+                                                                let keys =
+                                                                    view.read(cx).managed_keys.clone();
+                                                                let selected = view
+                                                                    .read(cx)
+                                                                    .managed_key_selected
+                                                                    .clone();
+                                                                menu = menu.min_w(200.);
+                                                                for key in keys {
+                                                                    let is_checked =
+                                                                        selected.as_deref()
+                                                                            == Some(&key.id);
+                                                                    let label = format!(
+                                                                        "{} ({})",
+                                                                        key.name, key.key_type
+                                                                    );
+                                                                    let key_id = key.id.clone();
+                                                                    menu = menu.item(
+                                                                        PopupMenuItem::new(label)
+                                                                            .checked(is_checked)
+                                                                            .on_click(window.listener_for(&view, move |this, _, _, cx| {
+                                                                                this.select_managed_key(key_id.clone(), cx);
+                                                                            })),
+                                                                    );
+                                                                }
+                                                                menu
+                                                            }
+                                                        },
                                                     ),
                                             )
                                             .child(
-                                                Button::new("clear-key-path")
+                                                Button::new("import-new-key")
+                                                    .small()
                                                     .ghost()
-                                                    .icon(IconName::Close)
+                                                    .icon(IconName::Plus)
+                                                    .label(t!("import_new_key").to_string())
                                                     .on_click(window.listener_for(
                                                         &view,
                                                         |this, _, window, cx| {
-                                                            Self::set_input_value(
-                                                                &this.key_path_input,
-                                                                "",
-                                                                window,
-                                                                cx,
-                                                            );
+                                                            this.import_managed_key(window, cx);
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new("use-custom-path")
+                                                    .small()
+                                                    .ghost()
+                                                    .when(using_custom_key_path, |b| b.primary())
+                                                    .label(t!("use_custom_path").to_string())
+                                                    .on_click(window.listener_for(
+                                                        &view,
+                                                        |this, _, _, cx| {
+                                                            this.use_custom_key_path(cx);
                                                         },
                                                     )),
                                             ),
-                                    )
-                                    .child(Input::new(&key_inline_input).h(px(128.)).tab_index(5))
-                                    .child(Input::new(&passphrase_input).mask_toggle().tab_index(6))
+                                    );
+
+                                    if show_managed {
+                                        let info = managed_key_selected
+                                            .as_ref()
+                                            .and_then(|id| {
+                                                managed_keys.iter().find(|k| &k.id == id)
+                                            })
+                                            .map(|mk| {
+                                                format!(
+                                                    "{}: {}  |  {}: {}",
+                                                    t!("key_type"),
+                                                    mk.key_type,
+                                                    t!("key_fingerprint"),
+                                                    mk.fingerprint
+                                                )
+                                            });
+                                        let this = if let Some(info) = info {
+                                            this.child(
+                                                div()
+                                                    .px(px(8.))
+                                                    .py(px(6.))
+                                                    .rounded_md()
+                                                    .border_1()
+                                                    .border_color(theme.border)
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(info),
+                                            )
+                                        } else {
+                                            this
+                                        };
+                                        this.child(
+                                            Input::new(&passphrase_input)
+                                                .mask_toggle()
+                                                .tab_index(6),
+                                        )
+                                    } else {
+                                        this.child(
+                                            h_flex()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .cursor_pointer()
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            window.listener_for(
+                                                                &view,
+                                                                |this, _, window, cx| {
+                                                                    this.pick_ssh_key_path(
+                                                                        window, cx,
+                                                                    );
+                                                                },
+                                                            ),
+                                                        )
+                                                        .child(
+                                                            Input::new(&key_path_input)
+                                                                .tab_index(4),
+                                                        ),
+                                                )
+                                                .child(
+                                                    Button::new("clear-key-path")
+                                                        .ghost()
+                                                        .icon(IconName::Close)
+                                                        .on_click(window.listener_for(
+                                                            &view,
+                                                            |this, _, window, cx| {
+                                                                Self::set_input_value(
+                                                                    &this.key_path_input,
+                                                                    "",
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                ),
+                                        )
+                                        .child(
+                                            Input::new(&key_inline_input)
+                                                .h(px(128.))
+                                                .tab_index(5),
+                                        )
+                                        .child(
+                                            Input::new(&passphrase_input)
+                                                .mask_toggle()
+                                                .tab_index(6),
+                                        )
+                                    }
                                 })
                                 .when(is_config, |this| {
                                     let entries = view.read(cx).ssh_config_entries.clone();
@@ -1947,6 +2081,153 @@ impl Ashell {
                                                             }
                                                         })
                                                     ).description(t!("reset_layout_hint").to_string())
+                                                )
+                                        )
+                                        // ── SSH Keys management group ──
+                                        .group(
+                                            SettingGroup::new()
+                                                .title(t!("settings_group_keys").to_string())
+                                                .item(
+                                                    SettingItem::new(
+                                                        t!("key_management").to_string(),
+                                                        SettingField::render({
+                                                            let view = view_clone_for_general.clone();
+                                                            move |_, window, _cx| {
+                                                                Button::new("import-key")
+                                                                    .small()
+                                                                    .primary()
+                                                                    .label(t!("import_key").to_string())
+                                                                    .on_click(window.listener_for(&view, |this, _, window, cx| {
+                                                                        this.import_managed_key(window, cx);
+                                                                    }))
+                                                                    .into_any_element()
+                                                            }
+                                                        })
+                                                    ).description(t!("key_management_desc").to_string())
+                                                )
+                                                .item(
+                                                    SettingItem::render({
+                                                        let view = view_clone_for_general.clone();
+                                                        move |_, _window, cx| {
+                                                            let keys = view.read(cx).managed_keys.clone();
+                                                            if keys.is_empty() {
+                                                                return div()
+                                                                    .py(px(12.))
+                                                                    .text_color(cx.theme().muted_foreground)
+                                                                    .child(t!("no_managed_keys").to_string())
+                                                                    .into_any_element();
+                                                            }
+                                                            let mut list = v_flex().gap_2();
+                                                            for key in keys {
+                                                                let view = view.clone();
+                                                                let key_id = key.id.clone();
+                                                                let key_name = key.name.clone();
+                                                                let key_type = key.key_type.clone();
+                                                                let fingerprint = {
+                                                                    let fp = key.fingerprint.clone();
+                                                                    if fp.len() > 30 {
+                                                                        format!("{}…", &fp[..30])
+                                                                    } else {
+                                                                        fp
+                                                                    }
+                                                                };
+                                                                let is_editing = view.read(cx).editing_managed_key_id.as_deref() == Some(&key.id);
+                                                                let rename_input = view.read(cx).key_inline_input.clone();
+                                                                list = list.child(
+                                                                    h_flex()
+                                                                        .items_center()
+                                                                        .gap_2()
+                                                                        .px(px(8.))
+                                                                        .py(px(6.))
+                                                                        .rounded_md()
+                                                                        .border_1()
+                                                                        .border_color(cx.theme().border)
+                                                                        .child(
+                                                                            div()
+                                                                                .px(px(6.))
+                                                                                .py(px(2.))
+                                                                                .rounded(px(4.))
+                                                                                .text_xs()
+                                                                                .text_color(cx.theme().primary)
+                                                                                .bg(cx.theme().accent.opacity(0.15))
+                                                                                .child(key_type)
+                                                                        )
+                                                                        .child(
+                                                                            if is_editing {
+                                                                                div().flex_1().child(
+                                                                                    Input::new(&rename_input)
+                                                                                        .small()
+                                                                                )
+                                                                            } else {
+                                                                                div().flex_1().child(key_name.clone())
+                                                                            }
+                                                                        )
+                                                                        .child(
+                                                                            div()
+                                                                                .text_xs()
+                                                                                .text_color(cx.theme().muted_foreground)
+                                                                                .child(fingerprint)
+                                                                        )
+                                                                        .child(
+                                                                            if is_editing {
+                                                                                Button::new(SharedString::from(format!("key-save-{}", key_id)))
+                                                                                    .ghost()
+                                                                                    .xsmall()
+                                                                                    .icon(IconName::Check)
+                                                                                    .on_click({
+                                                                                        let view = view.clone();
+                                                                                        let key_id = key_id.clone();
+                                                                                        move |_, _window, cx| {
+                                                                                            let new_name = view.read(cx).key_inline_input.read(cx).value().trim().to_string();
+                                                                                            if !new_name.is_empty() {
+                                                                                                let key_id = key_id.clone();
+                                                                                                view.update(cx, |this, cx| {
+                                                                                                    this.rename_managed_key(key_id, new_name, cx);
+                                                                                                });
+                                                                                            }
+                                                                                        }
+                                                                                    })
+                                                                            } else {
+                                                                                Button::new(SharedString::from(format!("key-rename-{}", key_id)))
+                                                                                    .ghost()
+                                                                                    .xsmall()
+                                                                                    .label(t!("key_rename").to_string())
+                                                                                    .on_click({
+                                                                                        let view = view.clone();
+                                                                                        let key_id = key_id.clone();
+                                                                                        let key_name = key_name.clone();
+                                                                                        move |_, window, cx| {
+                                                                                            let key_name = key_name.clone();
+                                                                                            view.update(cx, |this, cx| {
+                                                                                                this.editing_managed_key_id = Some(key_id.clone());
+                                                                                                Self::set_input_value(&this.key_inline_input, key_name, window, cx);
+                                                                                                cx.notify();
+                                                                                            });
+                                                                                        }
+                                                                                    })
+                                                                            }
+                                                                        )
+                                                                        .child(
+                                                                            Button::new(SharedString::from(format!("key-delete-{}", key_id)))
+                                                                                .ghost()
+                                                                                .xsmall()
+                                                                                .icon(IconName::Delete)
+                                                                                .on_click({
+                                                                                    let view = view.clone();
+                                                                                    let key_id = key_id.clone();
+                                                                                    move |_, _window, cx| {
+                                                                                        let key_id = key_id.clone();
+                                                                                        view.update(cx, |this, cx| {
+                                                                                            this.delete_managed_key(key_id, cx);
+                                                                                        });
+                                                                                    }
+                                                                                })
+                                                                        )
+                                                                );
+                                                            }
+                                                            list.into_any_element()
+                                                        }
+                                                    })
                                                 )
                                         )
                                 )

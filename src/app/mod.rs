@@ -31,7 +31,7 @@ use rust_i18n::t;
 use tokio::runtime::Runtime;
 
 use crate::{
-    session::config::{AuthMethod, ConfigStore},
+    session::config::{AuthMethod, ConfigStore, ManagedKey},
     session::ssh_config::SshConfigEntry,
     system::{SharedSystemSampler, SystemSampler, SystemSnapshot},
     terminal::{self, BackendCommand, BackendEvent, TabKind, TerminalTab},
@@ -266,6 +266,14 @@ pub(crate) struct Ashell {
     pub(crate) ssh_config_entries: Vec<SshConfigEntry>,
     pub(crate) ssh_config_selected: Option<usize>,
     pub(crate) editing_session_id: Option<String>,
+    /// Managed SSH keys cache (mirrors ConfigStore for UI rendering).
+    pub(crate) managed_keys: Vec<ManagedKey>,
+    /// Selected managed key id in the SSH connection form.
+    pub(crate) managed_key_selected: Option<String>,
+    /// Whether the SSH form is using a custom key path (not a managed key).
+    pub(crate) using_custom_key_path: bool,
+    /// ID of the managed key being renamed in settings (None = not editing).
+    pub(crate) editing_managed_key_id: Option<String>,
     pub(crate) follow_system_theme: bool,
     pub(crate) theme_mode: ThemeMode,
     pub(crate) light_theme_name: SharedString,
@@ -665,6 +673,10 @@ impl Ashell {
             ssh_config_entries: crate::session::ssh_config::parse_ssh_config().unwrap_or_default(),
             ssh_config_selected: None,
             editing_session_id: None,
+            managed_keys: config.managed_keys().to_vec(),
+            managed_key_selected: None,
+            using_custom_key_path: false,
+            editing_managed_key_id: None,
             follow_system_theme,
             theme_mode,
             light_theme_name,

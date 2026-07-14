@@ -10,7 +10,7 @@ use gpui_component::{Theme, WindowExt as _, input::InputState};
 use rust_i18n::t;
 use uuid::Uuid;
 
-use self::config::{AuthMethod, Session};
+use self::config::{AuthMethod, ManagedKey, Session};
 
 use crate::{
     Ashell, DropZone, PaneLayout, SelectorEntry, TabGroup,
@@ -103,7 +103,22 @@ impl Ashell {
         let mut session = match self.ssh_auth_method {
             AuthMethod::Password => Session::password(host, port, user, password),
             AuthMethod::Key => {
-                Session::key(host, port, user, key_path, key_inline, passphrase)
+                // If a managed key is selected, reference it by id.
+                // The actual key content is resolved at connection time.
+                if let Some(mk_id) = &self.managed_key_selected {
+                    let mut s = Session::key(
+                        host.clone(),
+                        port,
+                        user.clone(),
+                        String::new(),
+                        String::new(),
+                        passphrase.clone(),
+                    );
+                    s.managed_key_id = Some(mk_id.clone());
+                    s
+                } else {
+                    Session::key(host, port, user, key_path, key_inline, passphrase)
+                }
             }
             AuthMethod::Config => {
                 // Force key_inline to empty — config mode never uses inline key content.
@@ -155,6 +170,8 @@ impl Ashell {
         self.editing_session_id = None;
         self.ssh_auth_method = AuthMethod::Password;
         self.ssh_config_selected = None;
+        self.managed_key_selected = None;
+        self.using_custom_key_path = false;
         Self::set_input_value(&self.session_name_input, "", window, cx);
         Self::set_input_value(&self.host_input, "", window, cx);
         Self::set_input_value(&self.port_input, "22", window, cx);
@@ -178,6 +195,11 @@ impl Ashell {
     ) {
         self.editing_session_id = Some(session.id.clone());
         self.ssh_auth_method = session.auth;
+        // Restore managed key selection or custom path mode.
+        self.managed_key_selected = session.managed_key_id.clone();
+        self.using_custom_key_path =
+            session.auth == AuthMethod::Key && session.managed_key_id.is_none()
+                && !session.private_key_path.is_empty();
         Self::set_input_value(&self.session_name_input, session.name.clone(), window, cx);
         Self::set_input_value(&self.host_input, session.host.clone(), window, cx);
         Self::set_input_value(&self.port_input, session.port.to_string(), window, cx);
@@ -260,6 +282,136 @@ impl Ashell {
             Ok::<(), anyhow::Error>(())
         })
         .detach();
+    }
+
+    // ── Managed SSH keys ────────────────────────────────────────────
+
+    /// Open a file picker to import a private key into managed storage.
+    /// Reads the file content, validates it, detects type + fingerprint,
+    /// and saves a new `ManagedKey`.
+    pub(crate) fn import_managed_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let start_dir = directories::BaseDirs::new()
+            .map(|d| d.home_dir().join(".ssh"))
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        let file_dialog = rfd::AsyncFileDialog::new()
+            .set_directory(start_dir)
+            .pick_file();
+
+        cx.spawn_in(window, async move |this, mut cx| {
+            if let Some(file) = file_dialog.await {
+                let path = file.path().to_path_buf();
+                let content = std::fs::read_to_string(&path).unwrap_or_default();
+                let file_name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("imported-key")
+                    .to_string();
+                let _ = gpui::AsyncWindowContext::update(&mut cx, |_window, cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        this.finalize_key_import(content, file_name, cx);
+                    });
+                });
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    /// Validate raw key content and save as a new ManagedKey.
+    /// Reports errors via `self.status`.
+    fn finalize_key_import(
+        &mut self,
+        content: String,
+        default_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let passphrase = self.passphrase_input.read(cx).value().to_string();
+        let pass_opt = (!passphrase.is_empty()).then_some(passphrase.as_str());
+
+        match crate::session::ssh_keys::validate_and_inspect(&content, pass_opt) {
+            Ok((key_type, fingerprint)) => {
+                // Check for duplicate fingerprint
+                if self
+                    .config
+                    .managed_keys()
+                    .iter()
+                    .any(|k| k.fingerprint == fingerprint)
+                {
+                    self.status = t!("key_duplicate_fingerprint").to_string().into();
+                    cx.notify();
+                    return;
+                }
+                let key = ManagedKey {
+                    id: Uuid::new_v4().to_string(),
+                    name: default_name,
+                    key_type,
+                    fingerprint,
+                    inline_content: content,
+                    passphrase,
+                    created_at: chrono::Local::now().timestamp(),
+                };
+                self.config.upsert_managed_key(key.clone());
+                if let Err(err) = self.config.save() {
+                    tracing::warn!("failed to save config: {err:#}");
+                }
+                self.managed_keys = self.config.managed_keys().to_vec();
+                self.status = t!("key_imported").to_string().into();
+                cx.notify();
+            }
+            Err(err) => {
+                self.status = format!("{}: {err:#}", t!("key_import_failed")).into();
+                cx.notify();
+            }
+        }
+    }
+
+    /// Rename a managed key.
+    pub(crate) fn rename_managed_key(
+        &mut self,
+        key_id: String,
+        new_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(key) = self.config.managed_keys().iter().find(|k| k.id == key_id).cloned() else {
+            return;
+        };
+        let mut updated = key;
+        updated.name = new_name;
+        self.config.upsert_managed_key(updated);
+        if let Err(err) = self.config.save() {
+            tracing::warn!("failed to save config: {err:#}");
+        }
+        self.managed_keys = self.config.managed_keys().to_vec();
+        self.editing_managed_key_id = None;
+        cx.notify();
+    }
+
+    /// Delete a managed key by id. Also clears the reference from any
+    /// session that used it.
+    pub(crate) fn delete_managed_key(&mut self, key_id: String, cx: &mut Context<Self>) {
+        self.config.remove_managed_key(&key_id);
+        if let Err(err) = self.config.save() {
+            tracing::warn!("failed to save config: {err:#}");
+        }
+        self.managed_keys = self.config.managed_keys().to_vec();
+        if self.managed_key_selected.as_deref() == Some(&key_id) {
+            self.managed_key_selected = None;
+        }
+        cx.notify();
+    }
+
+    /// Select a managed key in the connection form.
+    pub(crate) fn select_managed_key(&mut self, key_id: String, cx: &mut Context<Self>) {
+        self.managed_key_selected = Some(key_id);
+        self.using_custom_key_path = false;
+        cx.notify();
+    }
+
+    /// Switch the connection form to use a custom key path (file picker).
+    pub(crate) fn use_custom_key_path(&mut self, cx: &mut Context<Self>) {
+        self.managed_key_selected = None;
+        self.using_custom_key_path = true;
+        cx.notify();
     }
 
     pub(crate) fn open_new_ssh_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -543,13 +695,31 @@ impl Ashell {
         }
     }
 
-    pub(crate) fn open_ssh_session(&mut self, session: Session, cx: &mut Context<Self>) {
+    pub(crate) fn open_ssh_session(&mut self, mut session: Session, cx: &mut Context<Self>) {
         tracing::info!(
             "[session] opening ssh tab for session '{}' ({}@{})",
             session.name,
             session.user,
             session.host
         );
+
+        // Resolve managed key reference: fill inline content from the
+        // ManagedKey so the backend can authenticate without the original file.
+        if let Some(mk_id) = &session.managed_key_id {
+            if let Some(mk) = self.config.get_managed_key(mk_id) {
+                session.private_key_inline = mk.inline_content.clone();
+                session.private_key_path.clear();
+                if session.passphrase.is_empty() {
+                    session.passphrase = mk.passphrase.clone();
+                }
+            } else {
+                tracing::warn!(
+                    "[session] managed key '{}' not found, falling back to explicit key",
+                    mk_id
+                );
+            }
+        }
+
         let id = Uuid::new_v4().to_string();
         let backend = ssh::spawn_ssh_terminal(
             self.runtime.handle(),
