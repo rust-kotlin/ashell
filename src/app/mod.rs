@@ -33,7 +33,7 @@ use tokio::runtime::Runtime;
 use crate::{
     session::config::{AuthMethod, ConfigStore},
     session::ssh_config::SshConfigEntry,
-    system::{SystemSampler, SystemSnapshot},
+    system::{SharedSystemSampler, SystemSampler, SystemSnapshot},
     terminal::{self, BackendCommand, BackendEvent, TabKind, TerminalTab},
 };
 
@@ -48,6 +48,18 @@ static SHARED_RUNTIME: OnceLock<Arc<Runtime>> = OnceLock::new();
 pub(crate) fn shared_runtime() -> Arc<Runtime> {
     SHARED_RUNTIME
         .get_or_init(|| Arc::new(Runtime::new().expect("create tokio runtime")))
+        .clone()
+}
+
+/// Process-wide shared system sampler. Avoids each window independently
+/// reading `/proc` (and equivalents) — only one sample runs per interval
+/// regardless of how many windows are open.
+static SHARED_SYSTEM_SAMPLER: OnceLock<Arc<std::sync::Mutex<SharedSystemSampler>>> =
+    OnceLock::new();
+
+pub(crate) fn shared_system_sampler() -> Arc<std::sync::Mutex<SharedSystemSampler>> {
+    SHARED_SYSTEM_SAMPLER
+        .get_or_init(|| Arc::new(std::sync::Mutex::new(SharedSystemSampler::new())))
         .clone()
 }
 
@@ -313,7 +325,7 @@ pub(crate) struct Ashell {
     pub(crate) config: ConfigStore,
     pub(crate) active_title_bar_style: crate::session::config::TitleBarStyle,
     pub(crate) cursor_style: crate::session::config::CursorStyle,
-    pub(crate) system_sampler: SystemSampler,
+    pub(crate) system_sampler: Arc<std::sync::Mutex<SharedSystemSampler>>,
     pub(crate) recording_action: Option<String>,
     pub(crate) active_dialog: Option<DialogKind>,
     /// Error message when a recorded keybinding conflicts with another
@@ -574,8 +586,8 @@ impl Ashell {
         let (events_tx, events_rx) = mpsc::channel();
         let workspace_panels = cx.new(|_| ResizableState::default());
         let body_panels = cx.new(|_| ResizableState::default());
-        let mut system_sampler = SystemSampler::new();
-        let system = system_sampler.sample();
+        let system_sampler = shared_system_sampler();
+        let system = system_sampler.lock().unwrap().sample().clone();
         let default_light_theme_name = ThemeRegistry::global(cx).default_light_theme().name.clone();
         let default_dark_theme_name = ThemeRegistry::global(cx).default_dark_theme().name.clone();
         let follow_system_theme = config.follow_system_theme();
@@ -1105,7 +1117,7 @@ impl Ashell {
                     return false;
                 }
             }
-            let snapshot = self.system_sampler.sample();
+            let snapshot = self.system_sampler.lock().unwrap().sample().clone();
             let cpu_usage = snapshot.cpu_percent;
             self.cpu_history.push(cpu_usage);
             if self.cpu_history.len() > 20 {

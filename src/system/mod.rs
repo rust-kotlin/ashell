@@ -130,6 +130,42 @@ impl SystemSampler {
     }
 }
 
+/// A process-wide shared system sampler that caches the latest snapshot.
+///
+/// Multiple windows each calling `sample()` within the same interval will
+/// only trigger the expensive sampling work once; subsequent callers
+/// receive the cached snapshot. This avoids N× redundant reads of
+/// `/proc` (and equivalents) when N windows are open.
+pub struct SharedSystemSampler {
+    sampler: SystemSampler,
+    last_snapshot: SystemSnapshot,
+    last_sample_instant: Instant,
+}
+
+impl SharedSystemSampler {
+    pub fn new() -> Self {
+        let mut sampler = SystemSampler::new();
+        let last_snapshot = sampler.sample();
+        Self {
+            sampler,
+            last_snapshot,
+            last_sample_instant: Instant::now(),
+        }
+    }
+
+    /// Returns the latest snapshot. Performs the expensive sampling only if
+    /// the interval has elapsed since the last sample; otherwise returns
+    /// the cached snapshot. Callers should clone the result if they need
+    /// to own it beyond the borrow.
+    pub fn sample(&mut self) -> &SystemSnapshot {
+        if self.last_sample_instant.elapsed() >= SystemSampler::interval() {
+            self.last_snapshot = self.sampler.sample();
+            self.last_sample_instant = Instant::now();
+        }
+        &self.last_snapshot
+    }
+}
+
 fn ratio(used: u64, total: u64) -> f32 {
     if total == 0 {
         0.0
