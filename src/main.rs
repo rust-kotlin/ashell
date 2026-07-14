@@ -16,9 +16,9 @@ rust_i18n::i18n!("locales", fallback = "en");
 gpui::actions!(ashell_terminal, [TerminalTabKey, TerminalBacktabKey]);
 
 pub(crate) use app::keybinding_recorder::{
-    ClosePane, FocusPaneDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp, NewSsh, OpenSearch,
-    OpenSession, OpenSettings, OpenTransfers, SplitPaneDown, SplitPaneLeft, SplitPaneRight,
-    SplitPaneUp, ToggleSftpZoom, ToggleSidebar, Copy, Paste,
+    ClosePane, DetachTabToWindow, FocusPaneDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp,
+    NewSsh, NewWindow, OpenSearch, OpenSession, OpenSettings, OpenTransfers, SplitPaneDown,
+    SplitPaneLeft, SplitPaneRight, SplitPaneUp, ToggleSftpZoom, ToggleSidebar, Copy, Paste,
 };
 
 pub(crate) use app::{
@@ -35,12 +35,13 @@ fn main() {
         .with_quit_mode(gpui::QuitMode::LastWindowClosed);
 
     #[cfg(not(target_os = "macos"))]
-    let app = gpui_platform::application().with_assets(Assets);
+    let app = gpui_platform::application()
+        .with_assets(Assets)
+        .with_quit_mode(gpui::QuitMode::LastWindowClosed);
 
+    // On reopen (e.g. dock click), always open a new window
     app.on_reopen(|cx| {
-        if cx.windows().is_empty() {
-            app::startup::open_main_window(cx);
-        }
+        app::startup::open_new_window(None, cx);
     });
     app.run(move |cx| {
         gpui_component::init(cx);

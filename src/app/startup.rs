@@ -2,7 +2,7 @@ use gpui::{App, AppContext as _, Bounds, WindowOptions, point, px, size};
 use gpui_component::Root;
 
 use crate::Ashell;
-use crate::session::config::ConfigStore;
+use crate::session::config::{ConfigStore, Session};
 
 pub(crate) fn bind_workspace_keys(cx: &mut gpui::App) {
     let config = ConfigStore::load().unwrap_or_else(|_| ConfigStore::in_memory());
@@ -228,6 +228,24 @@ pub(crate) fn open_main_window(cx: &mut App) {
         })
     });
 
+    let window_options = build_window_options(&config, cx, None);
+    open_window_with_options(window_options, None, cx);
+}
+
+/// Open a new window, optionally auto-connecting to a session.
+pub(crate) fn open_new_window(session: Option<Session>, cx: &mut App) {
+    let config = ConfigStore::load().unwrap_or_else(|_| ConfigStore::in_memory());
+    // Offset new windows so they don't completely overlap
+    let offset = Some((px(40.), px(40.)));
+    let window_options = build_window_options(&config, cx, offset);
+    open_window_with_options(window_options, session, cx);
+}
+
+fn build_window_options(
+    config: &ConfigStore,
+    cx: &App,
+    offset: Option<(gpui::Pixels, gpui::Pixels)>,
+) -> WindowOptions {
     let mut window_options = WindowOptions::default();
 
     if config.title_bar_style() == crate::session::config::TitleBarStyle::Integrated {
@@ -268,10 +286,13 @@ pub(crate) fn open_main_window(cx: &mut App) {
                 y,
                 width,
                 height,
-            } => gpui::WindowBounds::Windowed(Bounds::new(
-                point(px(*x), px(*y)),
-                size(px(*width), px(*height)),
-            )),
+            } => {
+                let (mx, my) = offset.unwrap_or((px(0.), px(0.)));
+                gpui::WindowBounds::Windowed(Bounds::new(
+                    point(px(*x) + mx, px(*y) + my),
+                    size(px(*width), px(*height)),
+                ))
+            }
         });
     } else if let Some(display) = cx.displays().first().cloned() {
         let display_bounds = display.bounds();
@@ -285,23 +306,35 @@ pub(crate) fn open_main_window(cx: &mut App) {
         #[cfg(not(target_os = "macos"))]
         let y = display_bounds.origin.y + (display_bounds.size.height - height) / 2.0;
 
+        let (ox, oy) = offset.unwrap_or((px(0.), px(0.)));
         window_options.window_bounds = Some(gpui::WindowBounds::Windowed(Bounds::new(
-            point(x, y),
+            point(x + ox, y + oy),
             size(width, height),
         )));
     }
 
+    window_options
+}
+
+fn open_window_with_options(
+    window_options: WindowOptions,
+    session: Option<Session>,
+    cx: &mut App,
+) {
     cx.open_window(window_options, |window, cx| {
         window.activate_window();
         window.set_window_title("ashell");
         gpui_component::Theme::sync_system_appearance(Some(window), cx);
         let view = cx.new(|cx| Ashell::new(window, cx));
 
-        tracing::info!("[ui] main application window opened");
+        // Auto-connect if a session was provided
+        if let Some(ref session) = session {
+            view.update(cx, |this, cx| this.open_ssh_session(session.clone(), cx));
+        }
+
+        tracing::info!("[ui] application window opened");
         let focus_handle = view.read(cx).focus_handle.clone();
         window.focus(&focus_handle, cx);
-
-
 
         let view_clone = view.clone();
         window.on_window_should_close(cx, move |window: &mut gpui::Window, cx: &mut gpui::App| {

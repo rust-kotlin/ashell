@@ -2258,6 +2258,17 @@ impl Ashell {
                                 this.split_current_pane("right", cx);
                             })),
                     )
+                    .child(
+                        Button::new("new-window")
+                            .secondary()
+                            .small()
+                            .rounded(px(999.))
+                            .icon(IconName::ExternalLink)
+                            .tooltip(t!("settings_new_window").to_string())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_new_window(cx);
+                            })),
+                    )
                     .child(self.render_search_button(cx)),
             )
     }
@@ -2842,6 +2853,8 @@ impl Render for Ashell {
             .on_action(cx.listener(|this, _: &crate::OpenSession, window, cx| this.show_selector_dialog(window, cx)))
             .on_action(cx.listener(|this, _: &crate::OpenTransfers, window, cx| this.show_transfers_dialog(window, cx)))
             .on_action(cx.listener(|this, _: &crate::NewSsh, window, cx| this.show_ssh_dialog(window, cx)))
+            .on_action(cx.listener(|this, _: &crate::NewWindow, _, cx| this.open_new_window(cx)))
+            .on_action(cx.listener(|this, _: &crate::DetachTabToWindow, _, cx| this.detach_tab_to_new_window(cx)))
             .on_action(cx.listener(|this, _: &crate::OpenSearch, window, cx| this.toggle_search(window, cx)))
             .on_action(cx.listener(|this, _: &crate::ToggleSidebar, _, cx| {
                 this.sidebar_collapsed = !this.sidebar_collapsed;

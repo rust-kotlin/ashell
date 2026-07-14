@@ -1472,6 +1472,43 @@ impl Ashell {
         }
     }
 
+    // ─── Multi-window support ────────────────────────────────────────
+
+    /// Open a new blank window.
+    pub(crate) fn open_new_window(&mut self, cx: &mut Context<Self>) {
+        crate::app::startup::open_new_window(None, cx);
+        self.status = "new window opened".into();
+        cx.notify();
+    }
+
+    /// Detach the current active tab into a new window.
+    /// For SSH tabs: extracts the session, closes the tab here, opens a new
+    /// window that auto-connects to the same session.
+    /// For Local tabs: opens a new window with a local terminal.
+    pub(crate) fn detach_tab_to_new_window(&mut self, cx: &mut Context<Self>) {
+        let Some(active_id) = self.active_tab.clone() else {
+            return;
+        };
+        let Some(tab) = self.tabs.iter().find(|t| t.id == active_id) else {
+            return;
+        };
+
+        let session = tab.session.clone();
+        let is_local = tab.kind == TabKind::Local;
+
+        // Close the tab in this window (sends Close to backend, removes from groups)
+        self.close_tab(active_id, cx);
+
+        if is_local {
+            crate::app::startup::open_new_window(None, cx);
+        } else if let Some(session) = session {
+            crate::app::startup::open_new_window(Some(session), cx);
+        }
+
+        self.status = "tab detached to new window".into();
+        cx.notify();
+    }
+
     // ─── Tab drag-to-split ───────────────────────────────────────────
 
     /// Called on every mouse_move at the root level. Detects drag start

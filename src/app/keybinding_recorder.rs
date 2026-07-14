@@ -18,6 +18,8 @@ gpui::actions!(
         OpenSession,
         OpenTransfers,
         NewSsh,
+        NewWindow,
+        DetachTabToWindow,
         OpenSearch,
         ToggleSidebar,
         ToggleSftpZoom,
@@ -64,6 +66,16 @@ pub(crate) const WORKSPACE_ACTIONS: &[WorkspaceAction] = &[
         id: "NewSsh",
         label_key: "settings_new_ssh",
         default_suffix: "n",
+    },
+    WorkspaceAction {
+        id: "NewWindow",
+        label_key: "settings_new_window",
+        default_suffix: "shift-n",
+    },
+    WorkspaceAction {
+        id: "DetachTabToWindow",
+        label_key: "settings_detach_tab",
+        default_suffix: "shift-w",
     },
     WorkspaceAction {
         id: "OpenSearch",
@@ -305,7 +317,7 @@ impl KeybindingsPage {
         let groups = [
             (
                 "settings_group_keybind_general",
-                vec!["OpenSettings", "OpenSession", "OpenTransfers", "NewSsh", "OpenSearch", "Copy", "Paste"],
+                vec!["OpenSettings", "OpenSession", "OpenTransfers", "NewSsh", "NewWindow", "DetachTabToWindow", "OpenSearch", "Copy", "Paste"],
             ),
             (
                 "settings_group_keybind_zoom",
