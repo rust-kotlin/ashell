@@ -165,7 +165,7 @@ impl Ashell {
             return;
         };
 
-        if tab.render_snapshot().display_offset > 0 {
+        if tab.display_offset() > 0 {
             tab.scroll_to_bottom();
         }
         tab.clear_selection();
@@ -204,7 +204,7 @@ impl Ashell {
             return;
         };
 
-        if tab.render_snapshot().display_offset > 0 {
+        if tab.display_offset() > 0 {
             tab.scroll_to_bottom();
         }
 
@@ -236,7 +236,7 @@ impl Ashell {
             return;
         };
 
-        if tab.render_snapshot().display_offset > 0 {
+        if tab.display_offset() > 0 {
             tab.scroll_to_bottom();
         }
         tab.clear_selection();
@@ -291,7 +291,7 @@ impl Ashell {
             return;
         };
 
-        if tab.render_snapshot().display_offset > 0 {
+        if tab.display_offset() > 0 {
             tab.scroll_to_bottom();
         }
         tab.clear_selection();

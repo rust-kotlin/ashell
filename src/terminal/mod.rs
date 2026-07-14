@@ -341,10 +341,8 @@ impl TerminalTab {
             });
         }
 
-        // Get highlights from cache or recompute, only if keyword_highlight is enabled.
-        let is_enabled = crate::session::config::ConfigStore::load()
-            .map(|c| c.keyword_highlight())
-            .unwrap_or(false);
+        // 读取进程级缓存的关键词高亮开关（避免每帧磁盘读 ConfigStore::load()）
+        let is_enabled = crate::session::config::ConfigStore::keyword_highlight_cached();
 
         let highlights = if is_enabled {
             let mut cache = self.highlight_cache.borrow_mut();
@@ -427,6 +425,14 @@ impl TerminalTab {
 
     pub fn scroll_to_bottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// 轻量获取当前视口的滚动偏移量（是否在回看历史）。
+    ///
+    /// 替代此前为判断 `display_offset > 0` 而调用完整 `render_snapshot()`
+    /// （含 cell 迭代 + 高亮计算）的重型做法。
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
     }
 
     #[allow(dead_code)]

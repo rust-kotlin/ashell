@@ -1,4 +1,7 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs, path::PathBuf,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::{Context, Result};
 use directories::BaseDirs;
@@ -358,6 +361,14 @@ pub struct ConfigStore {
     cache: ConfigFile,
 }
 
+/// 进程级缓存：关键词高亮是否启用。
+///
+/// 此前 `TerminalTab::render_snapshot()` 每帧都会调用 `ConfigStore::load()`
+/// 从磁盘读取配置文件来判断是否启用关键词高亮——活动终端每帧 2-4 次磁盘 I/O。
+/// 改为在此原子变量中缓存，仅在 `load()` / `set_keyword_highlight()` 时更新，
+/// 渲染路径通过 [`ConfigStore::keyword_highlight_cached`] 零成本读取。
+static KEYWORD_HIGHLIGHT_CACHED: AtomicBool = AtomicBool::new(false);
+
 impl ConfigStore {
     pub fn load() -> Result<Self> {
         let path = Self::config_path()?;
@@ -409,6 +420,8 @@ impl ConfigStore {
         if cache.sync_device_id.is_empty() {
             cache.sync_device_id = Uuid::new_v4().to_string();
         }
+        // 同步进程级缓存，避免渲染路径每帧磁盘读
+        KEYWORD_HIGHLIGHT_CACHED.store(cache.keyword_highlight, Ordering::Relaxed);
         Ok(Self { path, cache })
     }
 
@@ -667,8 +680,14 @@ impl ConfigStore {
         self.cache.keyword_highlight
     }
 
+    /// 读取进程级缓存的关键词高亮开关，供渲染热路径使用（零分配、零磁盘 I/O）。
+    pub fn keyword_highlight_cached() -> bool {
+        KEYWORD_HIGHLIGHT_CACHED.load(Ordering::Relaxed)
+    }
+
     pub fn set_keyword_highlight(&mut self, val: bool) {
         self.cache.keyword_highlight = val;
+        KEYWORD_HIGHLIGHT_CACHED.store(val, Ordering::Relaxed);
     }
 
     pub fn terminal_font_family(&self) -> &str {

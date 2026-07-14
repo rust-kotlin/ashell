@@ -4,6 +4,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -1361,6 +1362,10 @@ async fn download_file_impl(
     let mut transferred = 0u64;
 
     let mut buffer = vec![0u8; 128 * 1024];
+    // 节流：每 100ms 或每 1MB 上报一次进度，避免大文件传输洪泛 UI 线程
+    // （此前每 128KB 上报一次，1GB 文件约 8000 个事件 → 全量重渲染）
+    let mut last_progress_time = Instant::now();
+    let mut last_reported = 0u64;
     loop {
         flag.yield_if_paused(events, tab_id, id, transferred, total)
             .await?;
@@ -1377,13 +1382,19 @@ async fn download_file_impl(
             .with_context(|| format!("write {}", local.display()))?;
 
         transferred += read as u64;
-        let _ = events.send(BackendEvent::TransferProgress {
-            tab_id: tab_id.to_string(),
-            id: id.to_string(),
-            transferred,
-            total,
-            state: crate::terminal::TransferState::Running,
-        });
+        if last_progress_time.elapsed() >= Duration::from_millis(100)
+            || transferred - last_reported >= 1024 * 1024
+        {
+            let _ = events.send(BackendEvent::TransferProgress {
+                tab_id: tab_id.to_string(),
+                id: id.to_string(),
+                transferred,
+                total,
+                state: crate::terminal::TransferState::Running,
+            });
+            last_progress_time = Instant::now();
+            last_reported = transferred;
+        }
     }
     local_file.flush().await.context("flush local file")?;
 
@@ -1560,6 +1571,9 @@ async fn upload_file_impl(
         .with_context(|| format!("create remote {remote_path}"))?;
 
     let mut buffer = vec![0u8; 128 * 1024];
+    // 节流：每 100ms 或每 1MB 上报一次进度，避免大文件传输洪泛 UI 线程
+    let mut last_progress_time = Instant::now();
+    let mut last_reported = 0u64;
     loop {
         let cur = transferred.load(Ordering::Relaxed);
         flag.yield_if_paused(events, tab_id, id, cur, total).await?;
@@ -1573,13 +1587,19 @@ async fn upload_file_impl(
             .with_context(|| format!("write remote {remote_path}"))?;
 
         let new_cur = transferred.fetch_add(read as u64, Ordering::Relaxed) + read as u64;
-        let _ = events.send(BackendEvent::TransferProgress {
-            tab_id: tab_id.to_string(),
-            id: id.to_string(),
-            transferred: new_cur,
-            total,
-            state: crate::terminal::TransferState::Running,
-        });
+        if last_progress_time.elapsed() >= Duration::from_millis(100)
+            || new_cur - last_reported >= 1024 * 1024
+        {
+            let _ = events.send(BackendEvent::TransferProgress {
+                tab_id: tab_id.to_string(),
+                id: id.to_string(),
+                transferred: new_cur,
+                total,
+                state: crate::terminal::TransferState::Running,
+            });
+            last_progress_time = Instant::now();
+            last_reported = new_cur;
+        }
     }
     remote.flush().await.context("flush remote file")?;
     Ok(())

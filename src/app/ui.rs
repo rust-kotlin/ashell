@@ -2742,7 +2742,7 @@ impl Render for Ashell {
             if let Some(scrollbar) = self.terminal_scrollbars.get(&active_id) {
                 if let Some(new_display_offset) = scrollbar.future_display_offset.take() {
                     if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active_id) {
-                        let current = tab.render_snapshot().display_offset;
+                        let current = tab.display_offset();
                         match new_display_offset.cmp(&current) {
                             std::cmp::Ordering::Greater => {
                                 tab.scroll_up_by(new_display_offset - current)
