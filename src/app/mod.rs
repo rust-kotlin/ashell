@@ -13,14 +13,14 @@ use std::{
     collections::HashMap,
     ops::Range,
     rc::Rc,
-    sync::{Arc, OnceLock, mpsc},
+    sync::{Arc, Mutex, OnceLock, mpsc},
     time::{Duration, Instant},
 };
 
 use crate::app::resizable::ResizableState;
 use gpui::{
-    AppContext as _, Bounds, Context, Entity, FocusHandle, Pixels, Point, SharedString, Size,
-    UniformListScrollHandle, Window, point, px, size,
+    AnyWindowHandle, AppContext as _, Bounds, Context, Entity, FocusHandle, Pixels, Point,
+    SharedString, Size, UniformListScrollHandle, Window, point, px, size,
 };
 use gpui_component::{
     Theme, ThemeMode, ThemeRegistry,
@@ -61,6 +61,72 @@ pub(crate) fn shared_system_sampler() -> Arc<std::sync::Mutex<SharedSystemSample
     SHARED_SYSTEM_SAMPLER
         .get_or_init(|| Arc::new(std::sync::Mutex::new(SharedSystemSampler::new())))
         .clone()
+}
+
+// ─── Cross-window registry ────────────────────────────────────────
+// Each open ashell window registers its `WindowHandle` + `Entity<Ashell>`
+// + current screen-space bounds here. This lets a tab being dragged in
+// one window find another window to merge into by hit-testing the
+// cursor's screen position against every other window's bounds.
+
+pub(crate) struct WindowEntry {
+    pub window_handle: AnyWindowHandle,
+    pub entity: Entity<Ashell>,
+    pub screen_bounds: Bounds<Pixels>,
+}
+
+static WINDOW_REGISTRY: OnceLock<Arc<Mutex<Vec<WindowEntry>>>> = OnceLock::new();
+
+pub(crate) fn window_registry() -> Arc<Mutex<Vec<WindowEntry>>> {
+    WINDOW_REGISTRY
+        .get_or_init(|| Arc::new(Mutex::new(Vec::new())))
+        .clone()
+}
+
+/// Register a window when it opens.
+pub(crate) fn register_window(window_handle: AnyWindowHandle, entity: Entity<Ashell>) {
+    let registry = window_registry();
+    let mut guard = registry.lock().unwrap();
+    if let Some(entry) = guard.iter_mut().find(|e| e.window_handle == window_handle) {
+        entry.entity = entity;
+    } else {
+        guard.push(WindowEntry {
+            window_handle,
+            entity,
+            screen_bounds: Bounds::default(),
+        });
+    }
+}
+
+/// Deregister a window when it closes.
+pub(crate) fn deregister_window(window_handle: AnyWindowHandle) {
+    let registry = window_registry();
+    let mut guard = registry.lock().unwrap();
+    guard.retain(|e| e.window_handle != window_handle);
+}
+
+/// Update the stored screen bounds for `window_handle`.
+pub(crate) fn update_window_bounds(window_handle: AnyWindowHandle, bounds: Bounds<Pixels>) {
+    let registry = window_registry();
+    if let Ok(mut guard) = registry.lock() {
+        if let Some(entry) = guard.iter_mut().find(|e| e.window_handle == window_handle) {
+            entry.screen_bounds = bounds;
+        }
+    }
+}
+
+/// Find another window (other than `exclude`) whose screen bounds contain
+/// `screen_pos`. Returns the target's entity and a clone of its bounds.
+pub(crate) fn find_window_at_screen_pos(
+    exclude: &AnyWindowHandle,
+    screen_pos: Point<Pixels>,
+) -> Option<(Entity<Ashell>, Bounds<Pixels>)> {
+    let registry = window_registry();
+    let guard = registry.lock().unwrap();
+    guard
+        .iter()
+        .find(|e| &e.window_handle != exclude && e.screen_bounds.contains(&screen_pos))
+        .map(|e| (e.entity.clone(), e.screen_bounds))
 }
 
 #[derive(Clone, Debug)]
@@ -324,6 +390,14 @@ pub(crate) struct Ashell {
     /// True while dragging a tab and the cursor is near/outside the window
     /// edge, indicating that releasing will detach to a new window.
     pub(crate) dragging_outside: bool,
+    /// When set, the user is dragging a tab from THIS window over ANOTHER
+    /// independent window. Holds the target window's entity + the drop zone
+    /// within that target. Releasing the mouse merges the dragged tab into
+    /// the target window as a split pane.
+    pub(crate) merge_target: Option<(Entity<Ashell>, DropZone)>,
+    /// Drop zone shown on THIS window when a tab is being dragged over it
+    /// from another window. Drives the incoming-drop overlay.
+    pub(crate) incoming_drop_zone: Option<DropZone>,
     pub(crate) terminal_marked_text: Option<String>,
     pub(crate) sftp_panel_minimized: bool,
     pub(crate) sidebar_collapsed: bool,
@@ -739,6 +813,8 @@ impl Ashell {
             dragging_group_id: None,
             drop_zone: None,
             dragging_outside: false,
+            merge_target: None,
+            incoming_drop_zone: None,
             sftp_panel_minimized: config.sftp_panel_minimized(),
             sidebar_collapsed: config.sidebar_collapsed(),
             collapsed_saved_scroll_handle: gpui::ScrollHandle::new(),

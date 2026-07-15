@@ -2335,15 +2335,24 @@ impl Ashell {
                 el.child(self.render_search_bar(window, cx))
             })
             // Drop-zone overlay — shown while dragging a tab to split
-            .when(self.dragging_group_id.is_some(), |el| {
-                el.child(self.render_drop_zone_overlay(cx))
-            })
+            // (either an in-window drag, or an incoming cross-window drag).
+            .when(
+                self.dragging_group_id.is_some() || self.incoming_drop_zone.is_some(),
+                |el| el.child(self.render_drop_zone_overlay(cx)),
+            )
+    }
+
+    /// Effective drop zone to highlight: prefers the in-window drag zone,
+    /// falls back to the incoming cross-window drag zone.
+    fn effective_drop_zone(&self) -> Option<DropZone> {
+        self.drop_zone.or(self.incoming_drop_zone)
     }
 
     fn render_drop_zone_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let accent = cx.theme().accent;
         let highlight_bg = accent.opacity(0.25);
         let dim_bg = hsla(0., 0., 0., 0.35);
+        let zone = self.effective_drop_zone();
 
         div()
             .absolute()
@@ -2361,7 +2370,7 @@ impl Ashell {
                     .bottom(px(4.))
                     .w(px(100.))
                     .rounded_lg()
-                    .when(self.drop_zone == Some(DropZone::Left), |this| {
+                    .when(zone == Some(DropZone::Left), |this| {
                         this.bg(highlight_bg)
                             .border_2()
                             .border_color(accent)
@@ -2376,7 +2385,7 @@ impl Ashell {
                     .bottom(px(4.))
                     .w(px(100.))
                     .rounded_lg()
-                    .when(self.drop_zone == Some(DropZone::Right), |this| {
+                    .when(zone == Some(DropZone::Right), |this| {
                         this.bg(highlight_bg)
                             .border_2()
                             .border_color(accent)
@@ -2391,7 +2400,7 @@ impl Ashell {
                     .right(px(4.))
                     .h(px(60.))
                     .rounded_lg()
-                    .when(self.drop_zone == Some(DropZone::Up), |this| {
+                    .when(zone == Some(DropZone::Up), |this| {
                         this.bg(highlight_bg)
                             .border_2()
                             .border_color(accent)
@@ -2406,15 +2415,18 @@ impl Ashell {
                     .right(px(4.))
                     .h(px(60.))
                     .rounded_lg()
-                    .when(self.drop_zone == Some(DropZone::Down), |this| {
+                    .when(zone == Some(DropZone::Down), |this| {
                         this.bg(highlight_bg)
                             .border_2()
                             .border_color(accent)
                     }),
             )
             // "Detach to new window" hint — shown when the cursor is near
-            // or outside the window edge during a tab drag.
-            .when(self.dragging_outside, |this| {
+            // or outside the source window edge during a tab drag, but ONLY
+            // when the drag is not currently hovering over another window
+            // (i.e. no merge target). When a merge target exists, the target
+            // window shows its own drop zone overlay instead.
+            .when(self.dragging_outside && self.merge_target.is_none(), |this| {
                 this.child(
                     div()
                         .absolute()
@@ -2434,6 +2446,31 @@ impl Ashell {
                                 .text_color(hsla(0., 0., 100., 0.95))
                                 .text_sm()
                                 .child(t!("drag_detach_hint").to_string()),
+                        ),
+                )
+            })
+            // "Merge into this window" hint — shown on the target window
+            // while a tab from another window is being dragged over it.
+            .when(self.incoming_drop_zone.is_some(), |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px(px(16.))
+                                .py(px(10.))
+                                .rounded_lg()
+                                .bg(accent.opacity(0.9))
+                                .text_color(hsla(0., 0., 100., 0.95))
+                                .text_sm()
+                                .child(t!("drag_merge_hint").to_string()),
                         ),
                 )
             })
@@ -2733,6 +2770,19 @@ impl Render for Ashell {
             self.active_tab = self.tabs.first().map(|tab| tab.id.clone());
         }
         self.sync_sftp_path_input(window, cx);
+
+        // Refresh this window's screen-space bounds in the cross-window
+        // registry so other windows can hit-test against it during a
+        // cross-window tab drag.
+        {
+            let handle = window.window_handle();
+            let screen_bounds = match window.window_bounds() {
+                gpui::WindowBounds::Fullscreen(b)
+                | gpui::WindowBounds::Maximized(b)
+                | gpui::WindowBounds::Windowed(b) => b,
+            };
+            crate::app::update_window_bounds(handle, screen_bounds);
+        }
 
         if self.show_transfers_dialog {
             self.show_transfers_dialog = false;
