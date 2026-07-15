@@ -327,6 +327,10 @@ fn open_window_with_options(
         gpui_component::Theme::sync_system_appearance(Some(window), cx);
         let view = cx.new(|cx| Ashell::new(window, cx));
 
+        // Register this window in the cross-window registry so other
+        // windows can find it when merging a dragged tab into it.
+        crate::app::register_window(window.window_handle(), view.clone());
+
         // Auto-connect if a session was provided
         if let Some(ref session) = session {
             view.update(cx, |this, cx| this.open_ssh_session(session.clone(), cx));
@@ -348,6 +352,9 @@ fn open_window_with_options(
                 this.cleanup_on_window_close();
                 cx.notify();
             });
+            // Remove from the cross-window registry so other windows stop
+            // considering this one as a merge target.
+            crate::app::deregister_window(handle);
             true
         });
 

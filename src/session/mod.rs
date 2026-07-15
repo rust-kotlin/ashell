@@ -3,8 +3,8 @@ pub mod ssh_config;
 pub mod ssh_keys;
 
 use gpui::{
-    AppContext as _, Context, Entity, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, SharedString, Window, px,
+    AppContext as _, Bounds, Context, Entity, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Window, px,
 };
 use gpui_component::{Theme, WindowExt as _, input::InputState};
 use rust_i18n::t;
@@ -1718,7 +1718,8 @@ impl Ashell {
     /// Called on every mouse_move at the root level. Detects drag start
     /// (threshold exceeded) and updates the current drop zone. Also tracks
     /// whether the cursor is near/outside the window edge to indicate that
-    /// releasing will detach the tab to a new window.
+    /// releasing will detach the tab to a new window, OR — if the cursor is
+    /// over another independent window — sets up a cross-window merge.
     pub(crate) fn on_tab_drag_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -1748,31 +1749,129 @@ impl Ashell {
                 cx.notify();
             }
 
-            // Check if the cursor is near or outside the window edge.
-            // When no split drop zone is active and the cursor is close to
-            // the boundary, flag it so the overlay can show a "detach" hint.
-            let viewport = window.viewport_size();
-            let edge_margin = px(24.);
-            let near_edge = event.position.x <= edge_margin
-                || event.position.y <= edge_margin
-                || event.position.x >= viewport.width - edge_margin
-                || event.position.y >= viewport.height - edge_margin
-                || event.position.x < px(0.)
-                || event.position.y < px(0.)
-                || event.position.x > viewport.width
-                || event.position.y > viewport.height;
-            let should_show = near_edge && self.drop_zone.is_none();
-            if should_show != self.dragging_outside {
-                self.dragging_outside = should_show;
+            // While the cursor is inside the source's terminal area (an
+            // in-window split drop zone is active), we never target another
+            // window. Clear any stale merge target.
+            if self.drop_zone.is_some() {
+                self.clear_merge_target(cx);
+                if self.dragging_outside {
+                    self.dragging_outside = false;
+                    cx.notify();
+                }
+                return;
+            }
+
+            // No in-window drop zone. Now check whether the cursor's screen
+            // position is over ANOTHER independent window — if so, treat this
+            // as a cross-window merge instead of a detach-to-new-window.
+            let source_handle = window.window_handle();
+            let screen_pos = Self::screen_position(window, event.position);
+            let new_merge = crate::app::find_window_at_screen_pos(&source_handle, screen_pos).map(
+                |(entity, target_bounds)| {
+                    let zone = Self::compute_drop_zone_for_bounds(screen_pos, target_bounds);
+                    (entity, zone)
+                },
+            );
+
+            let changed = match (&self.merge_target, &new_merge) {
+                (None, None) => false,
+                (Some(_), None) | (None, Some(_)) => true,
+                (Some((_, a)), Some((_, b))) => a != b,
+            };
+
+            if changed {
+                // Clear the previous target's incoming_drop_zone.
+                self.clear_merge_target(cx);
+
+                if let Some((ref target_entity, zone)) = new_merge {
+                    // Set the new target's incoming_drop_zone so its overlay
+                    // shows where the dragged tab will land.
+                    let target_clone = target_entity.clone();
+                    target_clone.update(cx, |target, cx| {
+                        target.incoming_drop_zone = Some(zone);
+                        cx.notify();
+                    });
+                    self.merge_target = Some(new_merge.unwrap());
+                }
                 cx.notify();
             }
+
+            // If a merge target is active, suppress the detach hint on the
+            // source window (the target window shows its own overlay).
+            let mut should_show_outside = false;
+            if self.merge_target.is_none() {
+                let viewport = window.viewport_size();
+                let edge_margin = px(24.);
+                let near_edge = event.position.x <= edge_margin
+                    || event.position.y <= edge_margin
+                    || event.position.x >= viewport.width - edge_margin
+                    || event.position.y >= viewport.height - edge_margin
+                    || event.position.x < px(0.)
+                    || event.position.y < px(0.)
+                    || event.position.x > viewport.width
+                    || event.position.y > viewport.height;
+                should_show_outside = near_edge && self.drop_zone.is_none();
+            }
+            if should_show_outside != self.dragging_outside {
+                self.dragging_outside = should_show_outside;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Convert a window-local cursor position to a screen-space position by
+    /// adding the source window's screen-space origin.
+    fn screen_position(window: &Window, local: Point<Pixels>) -> Point<Pixels> {
+        let origin = match window.window_bounds() {
+            gpui::WindowBounds::Fullscreen(b)
+            | gpui::WindowBounds::Maximized(b)
+            | gpui::WindowBounds::Windowed(b) => b.origin,
+        };
+        Point::new(origin.x + local.x, origin.y + local.y)
+    }
+
+    /// Compute the drop zone (Left/Right/Up/Down) within `target_bounds` for
+    /// a cursor at absolute `screen_pos`. Used for cross-window merges where
+    /// we don't have the target's terminal panel bounds, only its window
+    /// bounds.
+    fn compute_drop_zone_for_bounds(
+        screen_pos: Point<Pixels>,
+        target_bounds: Bounds<Pixels>,
+    ) -> DropZone {
+        let center_x = target_bounds.origin.x + target_bounds.size.width / 2.0;
+        let center_y = target_bounds.origin.y + target_bounds.size.height / 2.0;
+        let dx = screen_pos.x - center_x;
+        let dy = screen_pos.y - center_y;
+        if dx.abs() > dy.abs() {
+            if dx < px(0.) {
+                DropZone::Left
+            } else {
+                DropZone::Right
+            }
+        } else if dy < px(0.) {
+            DropZone::Up
+        } else {
+            DropZone::Down
+        }
+    }
+
+    /// Clear the current cross-window merge target and reset the target
+    /// window's `incoming_drop_zone`.
+    fn clear_merge_target(&mut self, cx: &mut Context<Self>) {
+        if let Some((target, _)) = self.merge_target.take() {
+            target.update(cx, |target, cx| {
+                target.incoming_drop_zone = None;
+                cx.notify();
+            });
         }
     }
 
     /// Called on mouse_up at the root level. If a drag is active and a
     /// valid drop zone is set, moves the source group's tab into the
     /// current group as a split pane. If no drop zone is set and the mouse
-    /// was released outside the window, detaches the tab to a new window.
+    /// was released over ANOTHER independent window, merges the dragged tab
+    /// into that target window as a split pane. Otherwise, if released
+    /// outside the source window, detaches the tab to a new window.
     pub(crate) fn on_tab_drag_mouse_up(
         &mut self,
         event: &MouseUpEvent,
@@ -1781,9 +1880,44 @@ impl Ashell {
     ) {
         let source_group_id = self.dragging_group_id.take();
         let zone = self.drop_zone.take();
+        // Always consume the cross-window merge target on mouse_up. If we
+        // are about to merge, this also clears the target's
+        // `incoming_drop_zone` overlay.
+        let merge_target = self.merge_target.take();
+        if let Some((target_entity, _)) = &merge_target {
+            target_entity.update(cx, |target, cx| {
+                target.incoming_drop_zone = None;
+                cx.notify();
+            });
+        }
         self.pending_drag_group = None;
         self.tab_drag_start = None;
         self.dragging_outside = false;
+
+        // Cross-window merge takes priority: if a merge target was set when
+        // the mouse was released, transfer the dragged tab into the target
+        // window as a split pane rather than detaching.
+        if let (Some(source_group_id), Some((target_entity, merge_zone))) =
+            (source_group_id.as_deref(), merge_target)
+        {
+            // Extract the dragged tab's session info from this (source)
+            // window before closing the source group. We reuse the same
+            // extraction logic as `detach_group_to_new_window`.
+            if let Some((session, is_local)) = self.extract_session_from_group(source_group_id) {
+                // Close the source group + tab in THIS window.
+                self.close_dragged_source_group(source_group_id, cx);
+
+                target_entity.update(cx, |target, cx| {
+                    target.receive_dragged_tab(session, is_local, merge_zone, cx);
+                });
+                self.status = "tab merged into another window".into();
+                cx.notify();
+                return;
+            }
+            // Fallback: if extraction failed, just clear drag state.
+            cx.notify();
+            return;
+        }
 
         match (source_group_id, zone) {
             (Some(source_group_id), Some(zone)) => {
@@ -1814,6 +1948,165 @@ impl Ashell {
                 cx.notify();
             }
         }
+    }
+
+    /// Extract the first tab's `(session, is_local)` info from a drag
+    /// source group, without removing anything. Returns `None` if the
+    /// group can't be found or has no tabs. Used by the cross-window merge
+    /// path to gather what's needed to re-spawn the tab in the target
+    /// window before closing the source group.
+    fn extract_session_from_group(&self, group_id: &str) -> Option<(Option<Session>, bool)> {
+        let group = self.tab_groups.iter().find(|g| g.id == group_id)?;
+        let tab_ids = group.pane_root.tab_ids();
+        let first_tab_id = tab_ids.first()?.to_string();
+        let tab = self.tabs.iter().find(|t| t.id == first_tab_id)?;
+        Some((tab.session.clone(), tab.kind == TabKind::Local))
+    }
+
+    /// Close the source group (and its tabs) in THIS window after the
+    /// dragged tab has been handed off to another window for merging.
+    /// Reuses the existing `close_tab`/`handle_tab_close` path so all the
+    /// usual cleanup (sftp handle close, pane_root.remove_tab, next-active
+    /// selection, etc.) is done consistently.
+    fn close_dragged_source_group(&mut self, group_id: &str, cx: &mut Context<Self>) {
+        let first_tab_id = self
+            .tab_groups
+            .iter()
+            .find(|g| g.id == group_id)
+            .and_then(|g| g.pane_root.tab_ids().first().map(|s| s.to_string()));
+        if let Some(id) = first_tab_id {
+            self.close_tab(id, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Receive a tab dragged in from another window. Spawns a fresh
+    /// backend (local or SSH) for the dragged session and adds it to THIS
+    /// window as a split pane in the direction indicated by `zone`,
+    /// mirroring the structure of `split_current_pane`.
+    pub(crate) fn receive_dragged_tab(
+        &mut self,
+        session: Option<Session>,
+        is_local: bool,
+        zone: DropZone,
+        cx: &mut Context<Self>,
+    ) {
+        let current_id = match self.pane_root.focused_tab_id(&self.focused_pane_path) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => {
+                // No target pane to split from — open as a new standalone
+                // group instead, so the merge still works.
+                if is_local {
+                    self.open_local(cx);
+                } else if let Some(session) = session {
+                    self.open_ssh_session(session, cx);
+                } else {
+                    cx.notify();
+                }
+                return;
+            }
+        };
+
+        let new_id = Uuid::new_v4().to_string();
+        let direction = match zone {
+            DropZone::Left => "left",
+            DropZone::Right => "right",
+            DropZone::Up => "up",
+            DropZone::Down => "down",
+        };
+
+        let mut tab = if is_local {
+            match local::spawn_local_terminal(
+                new_id.clone(),
+                DEFAULT_COLS,
+                DEFAULT_ROWS,
+                self.events_tx.clone(),
+            ) {
+                Ok(backend) => TerminalTab::new_local(
+                    new_id.clone(),
+                    "Local".into(),
+                    backend,
+                    self.events_tx.clone(),
+                ),
+                Err(err) => {
+                    self.status = format!("failed to merge: {err:#}").into();
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            let Some(session) = session.as_ref() else {
+                self.status = "cannot merge: no session info".into();
+                cx.notify();
+                return;
+            };
+            let mut session = session.clone();
+            // Resolve managed key reference (same as open_ssh_session).
+            if let Some(mk_id) = &session.managed_key_id {
+                if let Some(mk) = self.config.get_managed_key(mk_id) {
+                    session.private_key_inline = mk.inline_content.clone();
+                    session.private_key_path.clear();
+                    if session.passphrase.is_empty() {
+                        session.passphrase = mk.passphrase.clone();
+                    }
+                }
+            }
+            let backend = ssh::spawn_ssh_terminal(
+                self.runtime.handle(),
+                new_id.clone(),
+                session.clone(),
+                DEFAULT_COLS,
+                DEFAULT_ROWS,
+                self.events_tx.clone(),
+            );
+            let sftp_handle = crate::sftp::spawn_sftp(
+                self.runtime.handle(),
+                new_id.clone(),
+                session.clone(),
+                self.events_tx.clone(),
+            );
+            self.sftp_handles.insert(new_id.clone(), sftp_handle);
+            TerminalTab::new_ssh(new_id.clone(), &session, backend, self.events_tx.clone())
+        };
+        tab.resize(DEFAULT_COLS, DEFAULT_ROWS);
+        self.tabs.push(tab);
+
+        let current_pane = PaneLayout::Single(current_id);
+        let new_pane = PaneLayout::Single(new_id.clone());
+
+        let split_layout = match direction {
+            "left" | "right" => {
+                let children = match direction {
+                    "left" => vec![new_pane, current_pane],
+                    _ => vec![current_pane, new_pane],
+                };
+                PaneLayout::Vertical(children, 0.5)
+            }
+            "up" | "down" => {
+                let children = match direction {
+                    "up" => vec![new_pane, current_pane],
+                    _ => vec![current_pane, new_pane],
+                };
+                PaneLayout::Horizontal(children, 0.5)
+            }
+            _ => return,
+        };
+
+        self.pane_root
+            .replace_at(&self.focused_pane_path, split_layout);
+        self.sync_pane_root_to_group();
+
+        let mut new_path = self.focused_pane_path.clone();
+        if direction == "right" || direction == "down" {
+            new_path.push(1);
+        } else {
+            new_path.push(0);
+        }
+        self.focused_pane_path = new_path;
+        self.active_tab = Some(new_id);
+        self.status = "tab merged from another window".into();
+        cx.notify();
     }
 
     /// Determine which drop zone the mouse is hovering over, based on the
