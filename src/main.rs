@@ -41,7 +41,7 @@ fn main() {
 
     // On reopen (e.g. dock click), always open a new window
     app.on_reopen(|cx| {
-        app::startup::open_new_window(None, cx);
+        app::startup::open_new_window(None, None, cx);
     });
     app.run(move |cx| {
         gpui_component::init(cx);

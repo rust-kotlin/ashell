@@ -1,6 +1,9 @@
 pub mod config;
 pub mod ssh_config;
 pub mod ssh_keys;
+pub mod store;
+
+use std::collections::{HashMap, HashSet};
 
 use gpui::{
     AppContext as _, Bounds, Context, Entity, KeyDownEvent, MouseButton, MouseDownEvent,
@@ -14,26 +17,40 @@ use self::config::{AuthMethod, ManagedKey, Session};
 
 use crate::{
     Ashell, DropZone, PaneLayout, SelectorEntry, TabGroup,
-    app::constants::{DEFAULT_COLS, DEFAULT_ROWS},
+    app::{
+        constants::{DEFAULT_COLS, DEFAULT_ROWS},
+        tab_drag::{DragTarget, DropIntent, TargetUpdate},
+    },
     backend::{local, ssh},
     terminal::{BackendCommand, RenderSnapshot, TabKind, TerminalTab},
 };
 
+pub(crate) struct GroupTransfer {
+    group: TabGroup,
+    group_index: usize,
+    tabs: Vec<(usize, TerminalTab)>,
+    sftp_handles: HashMap<String, crate::sftp::SftpHandle>,
+    route_ids: Vec<String>,
+    active_tab: Option<String>,
+    was_active_group: bool,
+}
+
 impl Ashell {
     pub(crate) fn open_local(&mut self, cx: &mut Context<Self>) {
         let id = Uuid::new_v4().to_string();
+        let events = self.backend_events_sender(cx);
         match local::spawn_local_terminal(
             id.clone(),
             DEFAULT_COLS,
             DEFAULT_ROWS,
-            self.events_tx.clone(),
+            events.clone(),
         ) {
             Ok(backend) => {
                 let title = if cfg!(windows) { "PowerShell" } else { "Local" }.to_string();
-                let mut tab =
-                    TerminalTab::new_local(id.clone(), title, backend, self.events_tx.clone());
+                let mut tab = TerminalTab::new_local(id.clone(), title, backend, events);
                 tab.resize(DEFAULT_COLS, DEFAULT_ROWS);
                 self.tabs.push(tab);
+                self.register_backend_route(id.clone(), cx);
                 self.active_tab = Some(id.clone());
                 self.pane_root = PaneLayout::Single(id.clone());
                 self.focused_pane_path = vec![];
@@ -721,19 +738,21 @@ impl Ashell {
         }
 
         let id = Uuid::new_v4().to_string();
+        let events = self.backend_events_sender(cx);
+        self.register_backend_route(id.clone(), cx);
         let backend = ssh::spawn_ssh_terminal(
             self.runtime.handle(),
             id.clone(),
             session.clone(),
             DEFAULT_COLS,
             DEFAULT_ROWS,
-            self.events_tx.clone(),
+            events.clone(),
         );
         self.tabs.push(TerminalTab::new_ssh(
             id.clone(),
             &session,
             backend,
-            self.events_tx.clone(),
+            events.clone(),
         ));
         self.active_tab = Some(id.clone());
         self.connection_progress = Some(crate::app::ConnectionProgress {
@@ -772,11 +791,12 @@ impl Ashell {
             }
         }
         cx.notify();
+        self.register_backend_route(group_id.clone(), cx);
         let sftp_handle = crate::sftp::spawn_sftp(
             self.runtime.handle(),
             group_id.clone(),
             session,
-            self.events_tx.clone(),
+            events,
         );
         self.sftp_handles.insert(group_id.clone(), sftp_handle);
         self.active_tab = Some(id.clone());
@@ -813,6 +833,8 @@ impl Ashell {
         let new_generation = self.tabs[ix].backend_generation + 1;
         let cols = self.tabs[ix].cols;
         let rows = self.tabs[ix].rows;
+        let events = self.backend_events_sender(cx);
+        self.register_backend_route(tab_id.to_string(), cx);
 
         // Close old backend (sends Close through the shared Arc<Mutex>)
         self.tabs[ix].send_backend(BackendCommand::Close);
@@ -825,7 +847,7 @@ impl Ashell {
                 session.clone(),
                 cols,
                 rows,
-                self.events_tx.clone(),
+                events.clone(),
             );
 
             // Swap the backend — the Term's internal listener shares the
@@ -855,11 +877,12 @@ impl Ashell {
                     if let Some(old_handle) = self.sftp_handles.remove(&group_id) {
                         old_handle.close();
                     }
+                    self.register_backend_route(group_id.clone(), cx);
                     let sftp_handle = crate::sftp::spawn_sftp(
                         self.runtime.handle(),
                         group_id.clone(),
                         session,
-                        self.events_tx.clone(),
+                        events.clone(),
                     );
                     self.sftp_handles.insert(group_id.clone(), sftp_handle);
 
@@ -872,12 +895,7 @@ impl Ashell {
             }
         } else {
             // Local tab: spawn new local shell
-            match local::spawn_local_terminal(
-                tab_id.to_string(),
-                cols,
-                rows,
-                self.events_tx.clone(),
-            ) {
+            match local::spawn_local_terminal(tab_id.to_string(), cols, rows, events) {
                 Ok(backend) => {
                     // Swap the backend — preserves terminal history.
                     self.tabs[ix].set_backend(backend);
@@ -1227,25 +1245,26 @@ impl Ashell {
             Some(id) if !id.is_empty() => id.to_string(),
             _ => return,
         };
-        // Find current tab to clone its type/session
-        let current_tab = match self.tabs.iter().find(|t| t.id == current_id) {
-            Some(tab) => tab,
+        let (current_kind, current_session) = match self.tabs.iter().find(|t| t.id == current_id) {
+            Some(tab) => (tab.kind, tab.session.clone()),
             None => return,
         };
         let new_id = Uuid::new_v4().to_string();
-        let mut tab = match current_tab.kind {
+        let events = self.backend_events_sender(cx);
+        self.register_backend_route(new_id.clone(), cx);
+        let mut tab = match current_kind {
             TabKind::Local => {
                 match local::spawn_local_terminal(
                     new_id.clone(),
                     DEFAULT_COLS,
                     DEFAULT_ROWS,
-                    self.events_tx.clone(),
+                    events.clone(),
                 ) {
                     Ok(backend) => TerminalTab::new_local(
                         new_id.clone(),
                         "Local".into(),
                         backend,
-                        self.events_tx.clone(),
+                        events.clone(),
                     ),
                     Err(err) => {
                         self.status = format!("failed to split: {err:#}").into();
@@ -1255,7 +1274,7 @@ impl Ashell {
                 }
             }
             TabKind::Ssh => {
-                let Some(session) = current_tab.session.clone() else {
+                let Some(session) = current_session else {
                     self.status = "cannot split: no session info".into();
                     cx.notify();
                     return;
@@ -1266,16 +1285,16 @@ impl Ashell {
                     session.clone(),
                     DEFAULT_COLS,
                     DEFAULT_ROWS,
-                    self.events_tx.clone(),
+                    events.clone(),
                 );
                 let sftp_handle = crate::sftp::spawn_sftp(
                     self.runtime.handle(),
                     new_id.clone(),
                     session.clone(),
-                    self.events_tx.clone(),
+                    events.clone(),
                 );
                 self.sftp_handles.insert(new_id.clone(), sftp_handle);
-                TerminalTab::new_ssh(new_id.clone(), &session, backend, self.events_tx.clone())
+                TerminalTab::new_ssh(new_id.clone(), &session, backend, events)
             }
         };
         tab.resize(DEFAULT_COLS, DEFAULT_ROWS);
@@ -1646,7 +1665,7 @@ impl Ashell {
 
     /// Open a new blank window.
     pub(crate) fn open_new_window(&mut self, cx: &mut Context<Self>) {
-        crate::app::startup::open_new_window(None, cx);
+        crate::app::startup::open_new_window(None, Some(self.session_store.clone()), cx);
         self.status = "new window opened".into();
         cx.notify();
     }
@@ -1666,50 +1685,59 @@ impl Ashell {
         let session = tab.session.clone();
         let is_local = tab.kind == TabKind::Local;
 
-        // Close the tab in this window (sends Close to backend, removes from groups)
-        self.close_tab(active_id, cx);
-
+        // Window creation is the prepare step. Only commit the source close
+        // after the target window has been constructed successfully.
         if is_local {
-            crate::app::startup::open_new_window(None, cx);
+            crate::app::startup::open_new_window(None, Some(self.session_store.clone()), cx);
         } else if let Some(session) = session {
-            crate::app::startup::open_new_window(Some(session), cx);
+            crate::app::startup::open_new_window(
+                Some(session),
+                Some(self.session_store.clone()),
+                cx,
+            );
+        } else {
+            self.status = "cannot detach: SSH session information is missing".into();
+            cx.notify();
+            return;
         }
+        self.close_tab(active_id, cx);
 
         self.status = "tab detached to new window".into();
         cx.notify();
     }
 
-    /// Detach a specific tab group (identified by group_id) to a new window.
-    /// Used when the user drags a tab outside the window boundary.
-    /// Extracts the first tab's session, closes it in this window, and opens
-    /// a new window that auto-connects to the same session.
+    /// Detach a complete tab group to a new window without recreating its
+    /// terminal or SFTP backends. Window creation and route handoff form the
+    /// prepare step; any failure restores the original group in place.
     pub(crate) fn detach_group_to_new_window(
         &mut self,
         group_id: &str,
         cx: &mut Context<Self>,
     ) {
-        let Some(group) = self.tab_groups.iter().find(|g| g.id == group_id) else {
-            return;
+        let source_owner_id = self.session_owner_id;
+        let transfer = match self.take_group_transfer(group_id) {
+            Ok(transfer) => transfer,
+            Err(message) => {
+                self.status = message.into();
+                cx.notify();
+                return;
+            }
         };
-        let tab_ids = group.pane_root.tab_ids();
-        let Some(first_tab_id) = tab_ids.first() else {
-            return;
-        };
-        let first_tab_id = first_tab_id.to_string();
-        let Some(tab) = self.tabs.iter().find(|t| t.id == first_tab_id) else {
-            return;
-        };
-        let session = tab.session.clone();
-        let is_local = tab.kind == TabKind::Local;
 
-        self.close_tab(first_tab_id, cx);
-
-        if is_local {
-            crate::app::startup::open_new_window(None, cx);
-        } else if let Some(session) = session {
-            crate::app::startup::open_new_window(Some(session), cx);
+        match crate::app::startup::open_new_window_with_group(
+            transfer,
+            source_owner_id,
+            self.session_store.clone(),
+            cx,
+        ) {
+            Ok(()) => {
+                self.status = "tab group detached to new window".into();
+            }
+            Err((message, transfer)) => {
+                self.restore_group_transfer(transfer, cx);
+                self.status = format!("failed to detach tab group: {message}").into();
+            }
         }
-        self.status = "tab detached to new window".into();
         cx.notify();
     }
 
@@ -1726,96 +1754,70 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Promote pending drag → active drag once the mouse moves past a threshold
-        if self.dragging_group_id.is_none() {
-            if let (Some(start), Some(group_id)) =
-                (self.tab_drag_start, self.pending_drag_group.as_ref())
-            {
-                let dx: f32 = (event.position.x - start.x).into();
-                let dy: f32 = (event.position.y - start.y).into();
-                if (dx * dx + dy * dy).sqrt() > 5.0 {
-                    self.dragging_group_id = Some(group_id.clone());
-                    self.pending_drag_group = None;
-                    cx.notify();
-                }
-            }
+        if self.tab_drag.promote_if_needed(event.position, 5.0) {
+            cx.notify();
+        }
+        if !self.tab_drag.is_dragging() {
+            return;
         }
 
-        // Update drop zone and outside-window indicator while dragging
-        if self.dragging_group_id.is_some() {
-            let new_zone = self.compute_drop_zone(event.position);
-            if new_zone != self.drop_zone {
-                self.drop_zone = new_zone;
+        let new_zone = self.compute_drop_zone(event.position);
+        if self.tab_drag.set_split_zone(new_zone) {
+            cx.notify();
+        }
+
+        if self.tab_drag.split_zone().is_some() {
+            self.clear_merge_target(cx);
+            if self.tab_drag.set_outside(false) {
                 cx.notify();
             }
+            return;
+        }
 
-            // While the cursor is inside the source's terminal area (an
-            // in-window split drop zone is active), we never target another
-            // window. Clear any stale merge target.
-            if self.drop_zone.is_some() {
-                self.clear_merge_target(cx);
-                if self.dragging_outside {
-                    self.dragging_outside = false;
+        let source_handle = window.window_handle();
+        let screen_pos = Self::screen_position(window, event.position);
+        let new_target = crate::app::find_window_at_screen_pos(&source_handle, screen_pos).map(
+            |(window_id, entity, target_bounds)| DragTarget {
+                window_id,
+                payload: entity,
+                zone: Self::compute_drop_zone_for_bounds(screen_pos, target_bounds),
+            },
+        );
+
+        if let TargetUpdate::Changed { previous } = self.tab_drag.set_merge_target(new_target) {
+            if let Some(previous) = previous {
+                previous.update(cx, |target, cx| {
+                    target.incoming_drop_zone = None;
                     cx.notify();
-                }
-                return;
+                });
             }
-
-            // No in-window drop zone. Now check whether the cursor's screen
-            // position is over ANOTHER independent window — if so, treat this
-            // as a cross-window merge instead of a detach-to-new-window.
-            let source_handle = window.window_handle();
-            let screen_pos = Self::screen_position(window, event.position);
-            let new_merge = crate::app::find_window_at_screen_pos(&source_handle, screen_pos).map(
-                |(entity, target_bounds)| {
-                    let zone = Self::compute_drop_zone_for_bounds(screen_pos, target_bounds);
-                    (entity, zone)
-                },
-            );
-
-            let changed = match (&self.merge_target, &new_merge) {
-                (None, None) => false,
-                (Some(_), None) | (None, Some(_)) => true,
-                (Some((_, a)), Some((_, b))) => a != b,
-            };
-
-            if changed {
-                // Clear the previous target's incoming_drop_zone.
-                self.clear_merge_target(cx);
-
-                if let Some((ref target_entity, zone)) = new_merge {
-                    // Set the new target's incoming_drop_zone so its overlay
-                    // shows where the dragged tab will land.
-                    let target_clone = target_entity.clone();
-                    target_clone.update(cx, |target, cx| {
-                        target.incoming_drop_zone = Some(zone);
-                        cx.notify();
-                    });
-                    self.merge_target = Some(new_merge.unwrap());
-                }
-                cx.notify();
+            if let Some(target) = self.tab_drag.merge_target() {
+                let entity = target.payload.clone();
+                let zone = target.zone;
+                entity.update(cx, |target, cx| {
+                    target.incoming_drop_zone = Some(zone);
+                    cx.notify();
+                });
             }
+            cx.notify();
+        }
 
-            // If a merge target is active, suppress the detach hint on the
-            // source window (the target window shows its own overlay).
-            let mut should_show_outside = false;
-            if self.merge_target.is_none() {
-                let viewport = window.viewport_size();
-                let edge_margin = px(24.);
-                let near_edge = event.position.x <= edge_margin
-                    || event.position.y <= edge_margin
-                    || event.position.x >= viewport.width - edge_margin
-                    || event.position.y >= viewport.height - edge_margin
-                    || event.position.x < px(0.)
-                    || event.position.y < px(0.)
-                    || event.position.x > viewport.width
-                    || event.position.y > viewport.height;
-                should_show_outside = near_edge && self.drop_zone.is_none();
-            }
-            if should_show_outside != self.dragging_outside {
-                self.dragging_outside = should_show_outside;
-                cx.notify();
-            }
+        let should_show_outside = if self.tab_drag.merge_target().is_none() {
+            let viewport = window.viewport_size();
+            let edge_margin = px(24.);
+            event.position.x <= edge_margin
+                || event.position.y <= edge_margin
+                || event.position.x >= viewport.width - edge_margin
+                || event.position.y >= viewport.height - edge_margin
+                || event.position.x < px(0.)
+                || event.position.y < px(0.)
+                || event.position.x > viewport.width
+                || event.position.y > viewport.height
+        } else {
+            false
+        };
+        if self.tab_drag.set_outside(should_show_outside) {
+            cx.notify();
         }
     }
 
@@ -1857,8 +1859,21 @@ impl Ashell {
 
     /// Clear the current cross-window merge target and reset the target
     /// window's `incoming_drop_zone`.
+    pub(crate) fn cancel_tab_drag(&mut self, cx: &mut Context<Self>) {
+        if let Some(target) = self.tab_drag.cancel() {
+            target.update(cx, |target, cx| {
+                target.incoming_drop_zone = None;
+                cx.notify();
+            });
+        }
+        cx.notify();
+    }
+
     fn clear_merge_target(&mut self, cx: &mut Context<Self>) {
-        if let Some((target, _)) = self.merge_target.take() {
+        if let TargetUpdate::Changed {
+            previous: Some(target),
+        } = self.tab_drag.set_merge_target(None)
+        {
             target.update(cx, |target, cx| {
                 target.incoming_drop_zone = None;
                 cx.notify();
@@ -1874,239 +1889,300 @@ impl Ashell {
     /// outside the source window, detaches the tab to a new window.
     pub(crate) fn on_tab_drag_mouse_up(
         &mut self,
-        event: &MouseUpEvent,
-        window: &mut Window,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let source_group_id = self.dragging_group_id.take();
-        let zone = self.drop_zone.take();
-        // Always consume the cross-window merge target on mouse_up. If we
-        // are about to merge, this also clears the target's
-        // `incoming_drop_zone` overlay.
-        let merge_target = self.merge_target.take();
-        if let Some((target_entity, _)) = &merge_target {
-            target_entity.update(cx, |target, cx| {
-                target.incoming_drop_zone = None;
-                cx.notify();
-            });
-        }
-        self.pending_drag_group = None;
-        self.tab_drag_start = None;
-        self.dragging_outside = false;
-
-        // Cross-window merge takes priority: if a merge target was set when
-        // the mouse was released, transfer the dragged tab into the target
-        // window as a split pane rather than detaching.
-        if let (Some(source_group_id), Some((target_entity, merge_zone))) =
-            (source_group_id.as_deref(), merge_target)
-        {
-            // Extract the dragged tab's session info from this (source)
-            // window before closing the source group. We reuse the same
-            // extraction logic as `detach_group_to_new_window`.
-            if let Some((session, is_local)) = self.extract_session_from_group(source_group_id) {
-                // Close the source group + tab in THIS window.
-                self.close_dragged_source_group(source_group_id, cx);
-
-                target_entity.update(cx, |target, cx| {
-                    target.receive_dragged_tab(session, is_local, merge_zone, cx);
+        match self.tab_drag.finish() {
+            DropIntent::Merge {
+                group_id,
+                target,
+                zone,
+            } => {
+                target.update(cx, |target, cx| {
+                    target.incoming_drop_zone = None;
+                    cx.notify();
                 });
-                self.status = "tab merged into another window".into();
+                let source_owner_id = self.session_owner_id;
+                match self.take_group_transfer(&group_id) {
+                    Ok(transfer) => {
+                        let result = target.update(cx, |target, cx| {
+                            target.receive_group_transfer(
+                                transfer,
+                                source_owner_id,
+                                zone,
+                                cx,
+                            )
+                        });
+                        match result {
+                            Ok(()) => {
+                                self.status = "tab group moved into another window".into();
+                            }
+                            Err((message, transfer)) => {
+                                self.restore_group_transfer(transfer, cx);
+                                self.status = format!("failed to move tab group: {message}").into();
+                            }
+                        }
+                    }
+                    Err(message) => {
+                        self.status = message.into();
+                    }
+                }
                 cx.notify();
-                return;
             }
-            // Fallback: if extraction failed, just clear drag state.
-            cx.notify();
-            return;
-        }
-
-        match (source_group_id, zone) {
-            (Some(source_group_id), Some(zone)) => {
+            DropIntent::Split { group_id, zone } => {
                 let direction = match zone {
                     DropZone::Left => "left",
                     DropZone::Right => "right",
                     DropZone::Up => "up",
                     DropZone::Down => "down",
                 };
-                self.move_group_to_split(&source_group_id, direction, cx);
+                self.move_group_to_split(&group_id, direction, cx);
             }
-            (Some(source_group_id), None) => {
-                // No drop zone — check if the mouse was released outside the
-                // window. If so, detach the tab group to a new window.
-                let viewport = window.viewport_size();
-                let margin = px(16.);
-                let outside = event.position.x < -margin
-                    || event.position.y < -margin
-                    || event.position.x > viewport.width + margin
-                    || event.position.y > viewport.height + margin;
-                if outside {
-                    self.detach_group_to_new_window(&source_group_id, cx);
-                } else {
-                    cx.notify();
-                }
+            DropIntent::Detach { group_id } => {
+                self.detach_group_to_new_window(&group_id, cx);
             }
-            _ => {
-                cx.notify();
-            }
+            DropIntent::None | DropIntent::Cancelled => cx.notify(),
         }
     }
 
-    /// Extract the first tab's `(session, is_local)` info from a drag
-    /// source group, without removing anything. Returns `None` if the
-    /// group can't be found or has no tabs. Used by the cross-window merge
-    /// path to gather what's needed to re-spawn the tab in the target
-    /// window before closing the source group.
-    fn extract_session_from_group(&self, group_id: &str) -> Option<(Option<Session>, bool)> {
-        let group = self.tab_groups.iter().find(|g| g.id == group_id)?;
-        let tab_ids = group.pane_root.tab_ids();
-        let first_tab_id = tab_ids.first()?.to_string();
-        let tab = self.tabs.iter().find(|t| t.id == first_tab_id)?;
-        Some((tab.session.clone(), tab.kind == TabKind::Local))
-    }
-
-    /// Close the source group (and its tabs) in THIS window after the
-    /// dragged tab has been handed off to another window for merging.
-    /// Reuses the existing `close_tab`/`handle_tab_close` path so all the
-    /// usual cleanup (sftp handle close, pane_root.remove_tab, next-active
-    /// selection, etc.) is done consistently.
-    fn close_dragged_source_group(&mut self, group_id: &str, cx: &mut Context<Self>) {
-        let first_tab_id = self
+    fn take_group_transfer(&mut self, group_id: &str) -> Result<GroupTransfer, String> {
+        let group_index = self
             .tab_groups
             .iter()
-            .find(|g| g.id == group_id)
-            .and_then(|g| g.pane_root.tab_ids().first().map(|s| s.to_string()));
-        if let Some(id) = first_tab_id {
-            self.close_tab(id, cx);
-        } else {
-            cx.notify();
+            .position(|group| group.id == group_id)
+            .ok_or_else(|| "cannot move: source group no longer exists".to_string())?;
+        let group = self.tab_groups[group_index].clone();
+        let tab_ids = group
+            .pane_root
+            .tab_ids()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if tab_ids.is_empty() || tab_ids.iter().any(String::is_empty) {
+            return Err("cannot move: source group has no terminal panes".to_string());
         }
+        let tab_id_set = tab_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+        if tab_id_set.len() != tab_ids.len() {
+            return Err("cannot move: source group contains duplicate terminal ids".to_string());
+        }
+        if tab_ids
+            .iter()
+            .any(|tab_id| !self.tabs.iter().any(|tab| tab.id == *tab_id))
+        {
+            return Err("cannot move: a source terminal no longer exists".to_string());
+        }
+
+        let was_active_group = self.active_group.as_deref() == Some(group_id);
+        let active_tab = self
+            .active_tab
+            .clone()
+            .filter(|tab_id| tab_id_set.contains(tab_id.as_str()));
+        let mut tabs = Vec::with_capacity(tab_ids.len());
+        let mut remaining_tabs = Vec::with_capacity(self.tabs.len() - tab_ids.len());
+        for (index, tab) in std::mem::take(&mut self.tabs).into_iter().enumerate() {
+            if tab_id_set.contains(tab.id.as_str()) {
+                tabs.push((index, tab));
+            } else {
+                remaining_tabs.push(tab);
+            }
+        }
+        self.tabs = remaining_tabs;
+
+        let mut sftp_handles = HashMap::new();
+        let handle_ids = self
+            .sftp_handles
+            .keys()
+            .filter(|id| id.as_str() == group_id || tab_id_set.contains(id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for handle_id in handle_ids {
+            if let Some(handle) = self.sftp_handles.remove(&handle_id) {
+                sftp_handles.insert(handle_id, handle);
+            }
+        }
+
+        self.tab_groups.remove(group_index);
+        let mut route_ids = tab_ids;
+        route_ids.extend(sftp_handles.keys().cloned());
+        route_ids.sort();
+        route_ids.dedup();
+
+        if was_active_group {
+            self.activate_after_group_extraction(group_index);
+        } else {
+            self.sync_system_tab_to_active_group();
+        }
+        Ok(GroupTransfer {
+            group,
+            group_index,
+            tabs,
+            sftp_handles,
+            route_ids,
+            active_tab,
+            was_active_group,
+        })
     }
 
-    /// Receive a tab dragged in from another window. Spawns a fresh
-    /// backend (local or SSH) for the dragged session and adds it to THIS
-    /// window as a split pane in the direction indicated by `zone`,
-    /// mirroring the structure of `split_current_pane`.
-    pub(crate) fn receive_dragged_tab(
+    fn activate_after_group_extraction(&mut self, removed_index: usize) {
+        if self.tab_groups.is_empty() {
+            self.pane_root = PaneLayout::Single(String::new());
+            self.focused_pane_path.clear();
+            self.active_tab = None;
+            self.active_group = None;
+            self.sync_system_tab_to_active_group();
+            return;
+        }
+
+        let next_index = removed_index.min(self.tab_groups.len() - 1);
+        let next_group = &self.tab_groups[next_index];
+        let next_group_id = next_group.id.clone();
+        let next_layout = next_group.pane_root.clone();
+        let next_tab = next_layout.tab_ids().first().copied().map(str::to_string);
+        self.active_group = Some(next_group_id);
+        self.pane_root = next_layout;
+        self.focused_pane_path.clear();
+        self.active_tab = next_tab.clone();
+        if let Some(tab_id) = next_tab {
+            self.focus_pane_with_id(tab_id);
+        }
+        self.sync_system_tab_to_active_group();
+    }
+
+    fn restore_group_transfer(
         &mut self,
-        session: Option<Session>,
-        is_local: bool,
-        zone: DropZone,
+        mut transfer: GroupTransfer,
         cx: &mut Context<Self>,
     ) {
-        let current_id = match self.pane_root.focused_tab_id(&self.focused_pane_path) {
-            Some(id) if !id.is_empty() => id.to_string(),
-            _ => {
-                // No target pane to split from — open as a new standalone
-                // group instead, so the merge still works.
-                if is_local {
-                    self.open_local(cx);
-                } else if let Some(session) = session {
-                    self.open_ssh_session(session, cx);
-                } else {
-                    cx.notify();
-                }
-                return;
-            }
-        };
-
-        let new_id = Uuid::new_v4().to_string();
-        let direction = match zone {
-            DropZone::Left => "left",
-            DropZone::Right => "right",
-            DropZone::Up => "up",
-            DropZone::Down => "down",
-        };
-
-        let mut tab = if is_local {
-            match local::spawn_local_terminal(
-                new_id.clone(),
-                DEFAULT_COLS,
-                DEFAULT_ROWS,
-                self.events_tx.clone(),
-            ) {
-                Ok(backend) => TerminalTab::new_local(
-                    new_id.clone(),
-                    "Local".into(),
-                    backend,
-                    self.events_tx.clone(),
-                ),
-                Err(err) => {
-                    self.status = format!("failed to merge: {err:#}").into();
-                    cx.notify();
-                    return;
+        let owner_id = self.session_owner_id;
+        self.session_store.update(cx, |store, _| {
+            if !store.move_event_routes(&transfer.route_ids, owner_id, owner_id) {
+                for route_id in &transfer.route_ids {
+                    store.register_event_route(route_id.clone(), owner_id);
                 }
             }
-        } else {
-            let Some(session) = session.as_ref() else {
-                self.status = "cannot merge: no session info".into();
-                cx.notify();
-                return;
-            };
-            let mut session = session.clone();
-            // Resolve managed key reference (same as open_ssh_session).
-            if let Some(mk_id) = &session.managed_key_id {
-                if let Some(mk) = self.config.get_managed_key(mk_id) {
-                    session.private_key_inline = mk.inline_content.clone();
-                    session.private_key_path.clear();
-                    if session.passphrase.is_empty() {
-                        session.passphrase = mk.passphrase.clone();
-                    }
-                }
-            }
-            let backend = ssh::spawn_ssh_terminal(
-                self.runtime.handle(),
-                new_id.clone(),
-                session.clone(),
-                DEFAULT_COLS,
-                DEFAULT_ROWS,
-                self.events_tx.clone(),
-            );
-            let sftp_handle = crate::sftp::spawn_sftp(
-                self.runtime.handle(),
-                new_id.clone(),
-                session.clone(),
-                self.events_tx.clone(),
-            );
-            self.sftp_handles.insert(new_id.clone(), sftp_handle);
-            TerminalTab::new_ssh(new_id.clone(), &session, backend, self.events_tx.clone())
-        };
-        tab.resize(DEFAULT_COLS, DEFAULT_ROWS);
-        self.tabs.push(tab);
+        });
 
-        let current_pane = PaneLayout::Single(current_id);
-        let new_pane = PaneLayout::Single(new_id.clone());
-
-        let split_layout = match direction {
-            "left" | "right" => {
-                let children = match direction {
-                    "left" => vec![new_pane, current_pane],
-                    _ => vec![current_pane, new_pane],
-                };
-                PaneLayout::Vertical(children, 0.5)
-            }
-            "up" | "down" => {
-                let children = match direction {
-                    "up" => vec![new_pane, current_pane],
-                    _ => vec![current_pane, new_pane],
-                };
-                PaneLayout::Horizontal(children, 0.5)
-            }
-            _ => return,
-        };
-
-        self.pane_root
-            .replace_at(&self.focused_pane_path, split_layout);
-        self.sync_pane_root_to_group();
-
-        let mut new_path = self.focused_pane_path.clone();
-        if direction == "right" || direction == "down" {
-            new_path.push(1);
-        } else {
-            new_path.push(0);
+        let group_index = transfer.group_index.min(self.tab_groups.len());
+        let group_id = transfer.group.id.clone();
+        let group_layout = transfer.group.pane_root.clone();
+        self.tab_groups.insert(group_index, transfer.group);
+        transfer.tabs.sort_by_key(|(index, _)| *index);
+        for (index, tab) in transfer.tabs {
+            self.tabs.insert(index.min(self.tabs.len()), tab);
         }
-        self.focused_pane_path = new_path;
-        self.active_tab = Some(new_id);
-        self.status = "tab merged from another window".into();
+        self.sftp_handles.extend(transfer.sftp_handles);
+
+        if transfer.was_active_group {
+            self.active_group = Some(group_id);
+            self.pane_root = group_layout;
+            self.focused_pane_path.clear();
+            self.active_tab = transfer
+                .active_tab
+                .or_else(|| self.pane_root.tab_ids().first().copied().map(str::to_string));
+            if let Some(tab_id) = self.active_tab.clone() {
+                self.focus_pane_with_id(tab_id);
+            }
+        }
+        self.sync_system_tab_to_active_group();
         cx.notify();
+    }
+
+    /// Receive an intact group from another window without recreating any
+    /// terminal or SFTP backend. The group remains a separate top-level tab
+    /// because `TabGroup` owns a single SFTP UI state.
+    pub(crate) fn receive_group_transfer(
+        &mut self,
+        transfer: GroupTransfer,
+        source_owner_id: crate::session::store::WindowOwnerId,
+        _zone: DropZone,
+        cx: &mut Context<Self>,
+    ) -> Result<(), (String, GroupTransfer)> {
+        let tab_ids = transfer
+            .tabs
+            .iter()
+            .map(|(_, tab)| tab.id.as_str())
+            .collect::<HashSet<_>>();
+        if tab_ids.len() != transfer.tabs.len()
+            || transfer
+                .group
+                .pane_root
+                .tab_ids()
+                .iter()
+                .any(|tab_id| !tab_ids.contains(*tab_id))
+        {
+            return Err((
+                "transfer payload does not match the group layout".to_string(),
+                transfer,
+            ));
+        }
+        if self
+            .tab_groups
+            .iter()
+            .any(|group| group.id == transfer.group.id)
+        {
+            return Err(("target already contains this group".to_string(), transfer));
+        }
+        if self.tabs.iter().any(|tab| tab_ids.contains(tab.id.as_str())) {
+            return Err((
+                "target already contains one of the transferred terminals".to_string(),
+                transfer,
+            ));
+        }
+        if transfer
+            .sftp_handles
+            .keys()
+            .any(|handle_id| self.sftp_handles.contains_key(handle_id))
+        {
+            return Err((
+                "target already contains one of the transferred SFTP handles".to_string(),
+                transfer,
+            ));
+        }
+
+        let target_owner_id = self.session_owner_id;
+        let routes_moved = self.session_store.update(cx, |store, _| {
+            store.move_event_routes(
+                &transfer.route_ids,
+                source_owner_id,
+                target_owner_id,
+            )
+        });
+        if !routes_moved {
+            return Err((
+                "backend event routes changed before the move could commit".to_string(),
+                transfer,
+            ));
+        }
+
+        let GroupTransfer {
+            group,
+            tabs,
+            sftp_handles,
+            active_tab,
+            ..
+        } = transfer;
+        let group_id = group.id.clone();
+        let group_layout = group.pane_root.clone();
+        let fallback_tab = group_layout
+            .tab_ids()
+            .first()
+            .copied()
+            .map(str::to_string);
+        self.tabs.extend(tabs.into_iter().map(|(_, tab)| tab));
+        self.sftp_handles.extend(sftp_handles);
+        self.tab_groups.push(group);
+        self.active_group = Some(group_id);
+        self.pane_root = group_layout;
+        self.focused_pane_path.clear();
+        self.active_tab = active_tab.or(fallback_tab);
+        if let Some(tab_id) = self.active_tab.clone() {
+            self.focus_pane_with_id(tab_id);
+        }
+        self.sync_system_tab_to_active_group();
+        self.status = "tab group moved from another window".into();
+        cx.notify();
+        Ok(())
     }
 
     /// Determine which drop zone the mouse is hovering over, based on the
@@ -2192,11 +2268,13 @@ impl Ashell {
             .find(|t| t.id == tab_id)
             .and_then(|t| t.session.clone());
         if let Some(session) = source_session {
+            let events = self.backend_events_sender(cx);
+            self.register_backend_route(tab_id.clone(), cx);
             let sftp_handle = crate::sftp::spawn_sftp(
                 self.runtime.handle(),
                 tab_id.clone(),
                 session,
-                self.events_tx.clone(),
+                events,
             );
             self.sftp_handles.insert(tab_id.clone(), sftp_handle);
         }

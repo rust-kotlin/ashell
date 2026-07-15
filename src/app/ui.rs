@@ -2173,8 +2173,7 @@ impl Ashell {
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(move |this, event: &MouseDownEvent, _, _| {
-                                                        this.pending_drag_group = Some(drag_gid.clone());
-                                                        this.tab_drag_start = Some(event.position);
+                                                        this.tab_drag.begin(drag_gid.clone(), event.position);
                                                     }),
                                                 )
                                                 .when(ix == selected, |this| {
@@ -2337,7 +2336,7 @@ impl Ashell {
             // Drop-zone overlay — shown while dragging a tab to split
             // (either an in-window drag, or an incoming cross-window drag).
             .when(
-                self.dragging_group_id.is_some() || self.incoming_drop_zone.is_some(),
+                self.tab_drag.is_dragging() || self.incoming_drop_zone.is_some(),
                 |el| el.child(self.render_drop_zone_overlay(cx)),
             )
     }
@@ -2345,7 +2344,7 @@ impl Ashell {
     /// Effective drop zone to highlight: prefers the in-window drag zone,
     /// falls back to the incoming cross-window drag zone.
     fn effective_drop_zone(&self) -> Option<DropZone> {
-        self.drop_zone.or(self.incoming_drop_zone)
+        self.tab_drag.split_zone().or(self.incoming_drop_zone)
     }
 
     fn render_drop_zone_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2426,7 +2425,7 @@ impl Ashell {
             // when the drag is not currently hovering over another window
             // (i.e. no merge target). When a merge target exists, the target
             // window shows its own drop zone overlay instead.
-            .when(self.dragging_outside && self.merge_target.is_none(), |this| {
+            .when(self.tab_drag.outside() && self.tab_drag.merge_target().is_none(), |this| {
                 this.child(
                     div()
                         .absolute()
@@ -2782,6 +2781,9 @@ impl Render for Ashell {
                 | gpui::WindowBounds::Windowed(b) => b,
             };
             crate::app::update_window_bounds(handle, screen_bounds);
+            if window.is_window_active() {
+                crate::app::mark_window_active(handle);
+            }
         }
 
         if self.show_transfers_dialog {
@@ -3022,8 +3024,8 @@ impl Render for Ashell {
                                         cx.listener(|this, _, _, _| {
                                             // Don't start window move if the user
                                             // might be initiating a tab drag
-                                            if this.pending_drag_group.is_none()
-                                                && this.dragging_group_id.is_none()
+                                            if !this.tab_drag.is_pending()
+                                                && !this.tab_drag.is_dragging()
                                             {
                                                 this.should_move_window = true;
                                             }

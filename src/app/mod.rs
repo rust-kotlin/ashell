@@ -5,6 +5,7 @@ pub mod keybinding_recorder;
 pub mod resizable;
 pub mod search;
 pub mod startup;
+pub mod tab_drag;
 pub mod theme;
 pub mod ui;
 
@@ -13,13 +14,17 @@ use std::{
     collections::HashMap,
     ops::Range,
     rc::Rc,
-    sync::{Arc, Mutex, OnceLock, mpsc},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
 use crate::app::resizable::ResizableState;
 use gpui::{
-    AnyWindowHandle, AppContext as _, Bounds, Context, Entity, FocusHandle, Pixels, Point,
+    AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Pixels, Point,
     SharedString, Size, UniformListScrollHandle, Window, point, px, size,
 };
 use gpui_component::{
@@ -73,9 +78,12 @@ pub(crate) struct WindowEntry {
     pub window_handle: AnyWindowHandle,
     pub entity: Entity<Ashell>,
     pub screen_bounds: Bounds<Pixels>,
+    pub activation_seq: u64,
 }
 
 static WINDOW_REGISTRY: OnceLock<Arc<Mutex<Vec<WindowEntry>>>> = OnceLock::new();
+static WINDOW_ACTIVATION_SEQ: AtomicU64 = AtomicU64::new(1);
+static SESSION_OWNER_SEQ: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn window_registry() -> Arc<Mutex<Vec<WindowEntry>>> {
     WINDOW_REGISTRY
@@ -94,15 +102,41 @@ pub(crate) fn register_window(window_handle: AnyWindowHandle, entity: Entity<Ash
             window_handle,
             entity,
             screen_bounds: Bounds::default(),
+            activation_seq: WINDOW_ACTIVATION_SEQ.fetch_add(1, Ordering::Relaxed),
         });
     }
 }
 
-/// Deregister a window when it closes.
-pub(crate) fn deregister_window(window_handle: AnyWindowHandle) {
+/// Deregister a window when it closes and remove stale drag references.
+pub(crate) fn deregister_window(window_handle: AnyWindowHandle, cx: &mut App) {
+    let remaining = {
+        let registry = window_registry();
+        let mut guard = registry.lock().unwrap();
+        guard.retain(|entry| entry.window_handle != window_handle);
+        guard
+            .iter()
+            .map(|entry| entry.entity.clone())
+            .collect::<Vec<_>>()
+    };
+
+    for entity in remaining {
+        entity.update(cx, |window, cx| {
+            window.tab_drag.clear_target_if(&window_handle);
+            window.incoming_drop_zone = None;
+            cx.notify();
+        });
+    }
+}
+
+pub(crate) fn mark_window_active(window_handle: AnyWindowHandle) {
     let registry = window_registry();
-    let mut guard = registry.lock().unwrap();
-    guard.retain(|e| e.window_handle != window_handle);
+    if let Ok(mut guard) = registry.lock()
+        && let Some(entry) = guard
+            .iter_mut()
+            .find(|entry| entry.window_handle == window_handle)
+    {
+        entry.activation_seq = WINDOW_ACTIVATION_SEQ.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Update the stored screen bounds for `window_handle`.
@@ -120,13 +154,22 @@ pub(crate) fn update_window_bounds(window_handle: AnyWindowHandle, bounds: Bound
 pub(crate) fn find_window_at_screen_pos(
     exclude: &AnyWindowHandle,
     screen_pos: Point<Pixels>,
-) -> Option<(Entity<Ashell>, Bounds<Pixels>)> {
+) -> Option<(AnyWindowHandle, Entity<Ashell>, Bounds<Pixels>)> {
     let registry = window_registry();
     let guard = registry.lock().unwrap();
     guard
         .iter()
-        .find(|e| &e.window_handle != exclude && e.screen_bounds.contains(&screen_pos))
-        .map(|e| (e.entity.clone(), e.screen_bounds))
+        .filter(|entry| {
+            &entry.window_handle != exclude && entry.screen_bounds.contains(&screen_pos)
+        })
+        .max_by_key(|entry| entry.activation_seq)
+        .map(|entry| {
+            (
+                entry.window_handle,
+                entry.entity.clone(),
+                entry.screen_bounds,
+            )
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -349,6 +392,8 @@ pub(crate) struct Ashell {
     pub(crate) terminal_zoom_accumulator: f32,
     pub(crate) ui_font_family: SharedString,
     pub(crate) terminal_font_family: SharedString,
+    pub(crate) session_store: Entity<crate::session::store::SessionStore>,
+    pub(crate) session_owner_id: crate::session::store::WindowOwnerId,
     pub(crate) tabs: Vec<TerminalTab>,
     pub(crate) active_tab: Option<String>,
     pub(crate) tab_groups: Vec<TabGroup>,
@@ -383,18 +428,7 @@ pub(crate) struct Ashell {
     pub(crate) dragging_splitter: Option<(Vec<usize>, usize)>, // (parent_path, child_index)
     pub(crate) drag_split_origin: Option<gpui::Point<Pixels>>,
     // Tab drag-to-split state
-    pub(crate) pending_drag_group: Option<String>,
-    pub(crate) tab_drag_start: Option<gpui::Point<Pixels>>,
-    pub(crate) dragging_group_id: Option<String>,
-    pub(crate) drop_zone: Option<DropZone>,
-    /// True while dragging a tab and the cursor is near/outside the window
-    /// edge, indicating that releasing will detach to a new window.
-    pub(crate) dragging_outside: bool,
-    /// When set, the user is dragging a tab from THIS window over ANOTHER
-    /// independent window. Holds the target window's entity + the drop zone
-    /// within that target. Releasing the mouse merges the dragged tab into
-    /// the target window as a split pane.
-    pub(crate) merge_target: Option<(Entity<Ashell>, DropZone)>,
+    pub(crate) tab_drag: tab_drag::TabDragState<AnyWindowHandle, Entity<Ashell>>,
     /// Drop zone shown on THIS window when a tab is being dragged over it
     /// from another window. Drives the incoming-drop overlay.
     pub(crate) incoming_drop_zone: Option<DropZone>,
@@ -488,6 +522,20 @@ pub(crate) struct TabContextMenuState {
 }
 
 impl Ashell {
+    pub(crate) fn backend_events_sender(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> mpsc::Sender<BackendEvent> {
+        self.session_store.read(cx).events_sender()
+    }
+
+    pub(crate) fn register_backend_route(&self, route_id: String, cx: &mut Context<Self>) {
+        let owner_id = self.session_owner_id;
+        self.session_store.update(cx, |store, _| {
+            store.register_event_route(route_id, owner_id);
+        });
+    }
+
     fn transfer_source_title(&self, tab_id: &str) -> String {
         self.tabs
             .iter()
@@ -508,7 +556,11 @@ impl Ashell {
             .unwrap_or_else(|| "Unknown".to_string())
     }
 
-    pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(
+        window: &mut Window,
+        session_store: Entity<crate::session::store::SessionStore>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let host_input = cx.new(|cx| InputState::new(window, cx).placeholder(t!("host")));
         let session_name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("name (optional)"));
@@ -761,6 +813,8 @@ impl Ashell {
             cursor_style: config.cursor_style(),
             ui_font_family,
             terminal_font_family,
+            session_store,
+            session_owner_id: SESSION_OWNER_SEQ.fetch_add(1, Ordering::Relaxed),
             tabs: Vec::new(),
             active_tab: None,
             tab_groups: Vec::new(),
@@ -808,12 +862,7 @@ impl Ashell {
             terminal_marked_text: None,
             dragging_splitter: None,
             drag_split_origin: None,
-            pending_drag_group: None,
-            tab_drag_start: None,
-            dragging_group_id: None,
-            drop_zone: None,
-            dragging_outside: false,
-            merge_target: None,
+            tab_drag: tab_drag::TabDragState::default(),
             incoming_drop_zone: None,
             sftp_panel_minimized: config.sftp_panel_minimized(),
             sidebar_collapsed: config.sidebar_collapsed(),
@@ -931,7 +980,7 @@ impl Ashell {
                     .await;
                 if this
                     .update(cx, |this, cx| {
-                        let changed = this.drain_backend_events();
+                        let changed = this.drain_backend_events(cx);
                         let system_sampled = this.sample_system_if_due();
                         this.sync_theme_if_due(cx);
                         let is_blinking = matches!(
@@ -966,10 +1015,19 @@ impl Ashell {
         .detach();
     }
 
-    pub(crate) fn drain_backend_events(&mut self) -> bool {
+    pub(crate) fn drain_backend_events(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         let mut transfers_changed = false;
+        let mut events = Vec::new();
         while let Ok(event) = self.events_rx.try_recv() {
+            events.push(event);
+        }
+        let owner_id = self.session_owner_id;
+        events.extend(
+            self.session_store
+                .update(cx, |store, _| store.drain_events_for(owner_id)),
+        );
+        for event in events {
             changed = true;
             match event {
                 BackendEvent::Output { tab_id, bytes } => {
@@ -1297,7 +1355,9 @@ impl Ashell {
             return;
         }
 
+        let events = self.backend_events_sender(cx);
         for (ix, tab_id, session) in retry_tabs {
+            self.register_backend_route(tab_id.clone(), cx);
             // Close old backend
             self.tabs[ix].send_backend(crate::terminal::BackendCommand::Close);
 
@@ -1308,7 +1368,7 @@ impl Ashell {
                 session.clone(),
                 self.tabs[ix].cols,
                 self.tabs[ix].rows,
-                self.events_tx.clone(),
+                events.clone(),
             );
 
             // Replace tab state
@@ -1335,11 +1395,12 @@ impl Ashell {
                     if let Some(old_handle) = self.sftp_handles.remove(&group_id) {
                         old_handle.close();
                     }
+                    self.register_backend_route(group_id.clone(), cx);
                     let sftp_handle = crate::sftp::spawn_sftp(
                         self.runtime.handle(),
                         group_id.clone(),
                         session,
-                        self.events_tx.clone(),
+                        events.clone(),
                     );
                     self.sftp_handles.insert(group_id.clone(), sftp_handle);
 

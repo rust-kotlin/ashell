@@ -1,8 +1,14 @@
-use gpui::{App, AppContext as _, Bounds, WindowOptions, point, px, size};
+use std::{cell::RefCell, rc::Rc};
+
+use gpui::{App, AppContext as _, Bounds, Entity, WindowOptions, point, px, size};
 use gpui_component::Root;
 
 use crate::Ashell;
-use crate::session::config::{ConfigStore, Session};
+use crate::session::{
+    GroupTransfer,
+    config::{ConfigStore, Session},
+    store::{SessionStore, WindowOwnerId},
+};
 
 pub(crate) fn bind_workspace_keys(cx: &mut gpui::App) {
     let config = ConfigStore::load().unwrap_or_else(|_| ConfigStore::in_memory());
@@ -229,16 +235,22 @@ pub(crate) fn open_main_window(cx: &mut App) {
     });
 
     let window_options = build_window_options(&config, cx, None);
-    open_window_with_options(window_options, None, cx);
+    let session_store = cx.new(|_| SessionStore::new());
+    open_window_with_options(window_options, None, session_store, cx);
 }
 
 /// Open a new window, optionally auto-connecting to a session.
-pub(crate) fn open_new_window(session: Option<Session>, cx: &mut App) {
+pub(crate) fn open_new_window(
+    session: Option<Session>,
+    session_store: Option<Entity<SessionStore>>,
+    cx: &mut App,
+) {
     let config = ConfigStore::load().unwrap_or_else(|_| ConfigStore::in_memory());
     // Offset new windows so they don't completely overlap
     let offset = Some((px(40.), px(40.)));
     let window_options = build_window_options(&config, cx, offset);
-    open_window_with_options(window_options, session, cx);
+    let session_store = session_store.unwrap_or_else(|| cx.new(|_| SessionStore::new()));
+    open_window_with_options(window_options, session, session_store, cx);
 }
 
 fn build_window_options(
@@ -319,22 +331,87 @@ fn build_window_options(
 fn open_window_with_options(
     window_options: WindowOptions,
     session: Option<Session>,
+    session_store: Entity<SessionStore>,
     cx: &mut App,
 ) {
+    open_window_with_initializer(
+        window_options,
+        session_store,
+        move |view, cx| {
+            if let Some(session) = session {
+                view.update(cx, |this, cx| this.open_ssh_session(session, cx));
+            }
+        },
+        cx,
+    )
+    .expect("failed to open window");
+}
+
+pub(crate) fn open_new_window_with_group(
+    transfer: GroupTransfer,
+    source_owner_id: WindowOwnerId,
+    session_store: Entity<SessionStore>,
+    cx: &mut App,
+) -> Result<(), (String, GroupTransfer)> {
+    let config = ConfigStore::load().unwrap_or_else(|_| ConfigStore::in_memory());
+    let window_options = build_window_options(&config, cx, Some((px(40.), px(40.))));
+    let pending = Rc::new(RefCell::new(Some(transfer)));
+    let failure = Rc::new(RefCell::new(None));
+    let pending_for_window = pending.clone();
+    let failure_for_window = failure.clone();
+
+    let opened = open_window_with_initializer(
+        window_options,
+        session_store,
+        move |view, cx| {
+            let Some(transfer) = pending_for_window.borrow_mut().take() else {
+                return;
+            };
+            if let Err((message, transfer)) = view.update(cx, |this, cx| {
+                this.receive_group_transfer(
+                    transfer,
+                    source_owner_id,
+                    crate::DropZone::Right,
+                    cx,
+                )
+            }) {
+                *failure_for_window.borrow_mut() = Some(message);
+                *pending_for_window.borrow_mut() = Some(transfer);
+            }
+        },
+        cx,
+    );
+
+    let message = failure.borrow_mut().take().or_else(|| opened.err());
+    let remaining = pending.borrow_mut().take();
+    match (message, remaining) {
+        (None, None) => Ok(()),
+        (Some(message), Some(transfer)) => Err((message, transfer)),
+        (None, Some(transfer)) => Err((
+            "new window did not accept the transferred tab group".to_string(),
+            transfer,
+        )),
+        (Some(message), None) => {
+            tracing::warn!("[ui] window reported an error after accepting transfer: {message}");
+            Ok(())
+        }
+    }
+}
+
+fn open_window_with_initializer(
+    window_options: WindowOptions,
+    session_store: Entity<SessionStore>,
+    initialize: impl FnOnce(Entity<Ashell>, &mut App) + 'static,
+    cx: &mut App,
+) -> Result<(), String> {
     cx.open_window(window_options, |window, cx| {
         window.activate_window();
         window.set_window_title("ashell");
         gpui_component::Theme::sync_system_appearance(Some(window), cx);
-        let view = cx.new(|cx| Ashell::new(window, cx));
+        let view = cx.new(|cx| Ashell::new(window, session_store.clone(), cx));
 
-        // Register this window in the cross-window registry so other
-        // windows can find it when merging a dragged tab into it.
         crate::app::register_window(window.window_handle(), view.clone());
-
-        // Auto-connect if a session was provided
-        if let Some(ref session) = session {
-            view.update(cx, |this, cx| this.open_ssh_session(session.clone(), cx));
-        }
+        initialize(view.clone(), cx);
 
         tracing::info!("[ui] application window opened");
         let focus_handle = view.read(cx).focus_handle.clone();
@@ -348,17 +425,17 @@ fn open_window_with_options(
                 return true;
             }
             view_clone.update(cx, |this, cx| {
+                this.cancel_tab_drag(cx);
                 this.save_layout_state(window, cx);
                 this.cleanup_on_window_close();
                 cx.notify();
             });
-            // Remove from the cross-window registry so other windows stop
-            // considering this one as a merge target.
-            crate::app::deregister_window(handle);
+            crate::app::deregister_window(handle, cx);
             true
         });
 
         cx.new(|cx| Root::new(view, window, cx))
     })
-    .expect("failed to open window");
+    .map(|_| ())
+    .map_err(|error| format!("failed to open window: {error:?}"))
 }

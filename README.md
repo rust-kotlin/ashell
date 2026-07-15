@@ -2,7 +2,7 @@
 
 # ashell
 
-![Preview](preview.png)
+Preview
 
 `ashell` 是一款现代化的、基于 GPUI Component 构建的 Rust 桌面终端客户端。
 
@@ -11,6 +11,7 @@
 ## 🚀 v0.4 版本重要升级
 
 v0.4 在 v0.3 打下的基础上，重点带来了更完整的工作区操作能力和更顺手的日常体验：
+
 - ✨ **键位管理功能**：支持在设置中可视化查看和修改常用快捷键，并提供冲突提示。
 - ✨ **设置页优化**：设置页的布局和交互更加紧凑顺手，整体信息层级更清晰。
 - ✨ **Tab 内多 Pane 与类 tmux 体验**：一个 tab 内现在可以管理多个 pane，支持分屏、聚焦和切换，提供更接近 tmux 的工作流。
@@ -111,6 +112,7 @@ sudo dpkg -i target/debian/ashell_0.4.9-1_amd64.deb
 ```
 
 安装后可通过应用菜单或命令行 `ashell` 启动。`.deb` 包包含以下内容：
+
 - `/usr/bin/ashell` — 主程序
 - `/usr/share/applications/ashell.desktop` — 桌面入口
 - `/usr/share/icons/hicolor/256x256/apps/ashell.png` — 应用图标

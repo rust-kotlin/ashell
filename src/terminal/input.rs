@@ -370,7 +370,7 @@ impl Ashell {
         cx: &mut Context<Self>,
     ) {
         // Skip terminal mouse handling during tab drag-to-split
-        if self.dragging_group_id.is_some() || self.pending_drag_group.is_some() {
+        if self.tab_drag.is_dragging() || self.tab_drag.is_pending() {
             return;
         }
 
@@ -478,7 +478,7 @@ impl Ashell {
         cx: &mut Context<Self>,
     ) {
         // Skip during tab drag — root handler takes care of it
-        if self.dragging_group_id.is_some() || self.pending_drag_group.is_some() {
+        if self.tab_drag.is_dragging() || self.tab_drag.is_pending() {
             return;
         }
 
