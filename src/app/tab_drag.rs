@@ -1,4 +1,4 @@
-use gpui::{Bounds, Pixels, Point};
+use gpui::{Bounds, Pixels, Point, Size, px};
 
 #[derive(Clone)]
 pub(crate) struct DragTarget<I, T> {
@@ -173,6 +173,22 @@ impl<I: PartialEq, T> TabDragState<I, T> {
     }
 }
 
+pub(crate) fn should_offer_detach(
+    group_count: usize,
+    cursor: Point<Pixels>,
+    viewport_size: Size<Pixels>,
+    tab_bar_bounds: Option<Bounds<Pixels>>,
+    has_merge_target: bool,
+) -> bool {
+    let inside_source_window = cursor.x >= px(0.)
+        && cursor.y >= px(0.)
+        && cursor.x < viewport_size.width
+        && cursor.y < viewport_size.height;
+    let inside_tab_bar = tab_bar_bounds.is_some_and(|bounds| bounds.contains(&cursor));
+
+    group_count > 1 && inside_source_window && !inside_tab_bar && !has_merge_target
+}
+
 pub(crate) fn reorder_index_at_x(
     dragged_group_id: &str,
     cursor_x: Pixels,
@@ -201,7 +217,10 @@ pub(crate) fn reorder_index_at_x(
 mod tests {
     use gpui::{point, px, size, Bounds};
 
-    use super::{reorder_index_at_x, DragTarget, DropIntent, TabDragState, TargetUpdate};
+    use super::{
+        DragTarget, DropIntent, TabDragState, TargetUpdate, reorder_index_at_x,
+        should_offer_detach,
+    };
 
     #[test]
     fn drag_starts_only_after_threshold() {
@@ -346,6 +365,68 @@ mod tests {
 
         state.cancel();
         assert!(matches!(state.finish(), DropIntent::None));
+    }
+
+    #[test]
+    fn detach_is_offered_only_inside_source_window_with_multiple_groups() {
+        let viewport = size(px(800.), px(600.));
+        let tab_bar = Bounds::new(point(px(0.), px(0.)), size(px(800.), px(40.)));
+
+        assert!(should_offer_detach(
+            2,
+            point(px(300.), px(300.)),
+            viewport,
+            Some(tab_bar),
+            false,
+        ));
+        assert!(!should_offer_detach(
+            1,
+            point(px(300.), px(300.)),
+            viewport,
+            Some(tab_bar),
+            false,
+        ));
+        assert!(!should_offer_detach(
+            2,
+            point(px(900.), px(300.)),
+            viewport,
+            Some(tab_bar),
+            false,
+        ));
+        assert!(!should_offer_detach(
+            2,
+            point(px(300.), px(20.)),
+            viewport,
+            Some(tab_bar),
+            false,
+        ));
+        assert!(!should_offer_detach(
+            2,
+            point(px(300.), px(300.)),
+            viewport,
+            Some(tab_bar),
+            true,
+        ));
+    }
+
+    #[test]
+    fn single_group_can_still_merge() {
+        let mut state = TabDragState::<u8, &'static str>::default();
+        state.begin("group-a".into(), point(px(0.), px(0.)));
+        state.promote_if_needed(point(px(10.), px(0.)), 5.0);
+        state.set_outside(false);
+        state.set_merge_target(Some(DragTarget {
+            window_id: 2,
+            payload: "window-b",
+        }));
+
+        assert!(matches!(
+            state.finish(),
+            DropIntent::Merge {
+                group_id,
+                target: "window-b",
+            } if group_id == "group-a"
+        ));
     }
 
     #[test]

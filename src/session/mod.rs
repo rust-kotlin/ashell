@@ -19,7 +19,7 @@ use crate::{
     app::{
         IncomingTabDrag,
         constants::{DEFAULT_COLS, DEFAULT_ROWS},
-        tab_drag::{DragTarget, DropIntent, TargetUpdate, reorder_index_at_x},
+        tab_drag::{DragTarget, DropIntent, TargetUpdate, reorder_index_at_x, should_offer_detach},
     },
     backend::{local, ssh},
     terminal::{BackendCommand, RenderSnapshot, TabKind, TerminalTab},
@@ -1762,41 +1762,11 @@ impl Ashell {
         let source_handle = window.window_handle();
         let source_entity = cx.entity();
         let screen_pos = Self::screen_position(window, event.position);
-        let new_target = crate::app::find_window_at_screen_pos(&source_handle, screen_pos).map(
-            |(window_id, entity, _)| DragTarget {
-                window_id,
-                payload: (window_id, entity),
-            },
-        );
+        self.update_tab_drag_merge_target(source_handle, source_entity, screen_pos, cx);
 
-        if let TargetUpdate::Changed { previous } = self.tab_drag.set_merge_target(new_target) {
-            if let Some((_, previous)) = previous {
-                previous.update(cx, |target, cx| {
-                    target.incoming_tab_drag = None;
-                    cx.notify();
-                });
-            }
-            if let Some(target) = self.tab_drag.merge_target() {
-                let (_, entity) = target.payload.clone();
-                let incoming = IncomingTabDrag {
-                    source_window: source_handle,
-                    source: source_entity.clone(),
-                    group_id: self
-                        .tab_drag
-                        .dragging_group()
-                        .expect("dragging state must contain a group")
-                        .to_string(),
-                };
-                entity.update(cx, |target, cx| {
-                    target.incoming_tab_drag = Some(incoming);
-                    cx.notify();
-                });
-            }
-            cx.notify();
-        }
-
-        let (reorder_index, should_detach) = if self.tab_drag.merge_target().is_some() {
-            (None, false)
+        let has_merge_target = self.tab_drag.merge_target().is_some();
+        let reorder_index = if has_merge_target {
+            None
         } else if self
             .tab_bar_bounds
             .as_ref()
@@ -1816,19 +1786,112 @@ impl Ashell {
                 .tab_drag
                 .dragging_group()
                 .expect("dragging state must contain a group");
-            (
-                reorder_index_at_x(dragged_group, event.position.x, &ordered_bounds),
-                false,
-            )
+            reorder_index_at_x(dragged_group, event.position.x, &ordered_bounds)
         } else {
-            (None, true)
+            None
         };
+        let should_detach = should_offer_detach(
+            self.tab_groups.len(),
+            event.position,
+            window.viewport_size(),
+            self.tab_bar_bounds,
+            has_merge_target,
+        );
 
         let reorder_changed = self.tab_drag.set_reorder_index(reorder_index);
         let detach_changed = self.tab_drag.set_outside(should_detach);
         if reorder_changed || detach_changed {
             cx.notify();
         }
+    }
+
+    fn update_tab_drag_merge_target(
+        &mut self,
+        source_handle: AnyWindowHandle,
+        source_entity: Entity<Ashell>,
+        screen_pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let new_target = crate::app::find_window_at_screen_pos(&source_handle, screen_pos).map(
+            |(window_id, entity, _)| DragTarget {
+                window_id,
+                payload: (window_id, entity),
+            },
+        );
+
+        if let TargetUpdate::Changed { previous } = self.tab_drag.set_merge_target(new_target) {
+            if let Some((_, previous)) = previous {
+                previous.update(cx, |target, cx| {
+                    target.incoming_tab_drag = None;
+                    cx.notify();
+                });
+            }
+            if let Some(target) = self.tab_drag.merge_target() {
+                let (_, entity) = target.payload.clone();
+                let incoming = IncomingTabDrag {
+                    source_window: source_handle,
+                    source: source_entity,
+                    group_id: self
+                        .tab_drag
+                        .dragging_group()
+                        .expect("dragging state must contain a group")
+                        .to_string(),
+                };
+                entity.update(cx, |target, cx| {
+                    target.incoming_tab_drag = Some(incoming);
+                    cx.notify();
+                });
+            }
+            cx.notify();
+        }
+    }
+
+    fn prepare_tab_drag_release(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.tab_drag.is_dragging() {
+            return;
+        }
+
+        let source_handle = window.window_handle();
+        let screen_pos = Self::screen_position(window, event.position);
+        self.update_tab_drag_merge_target(source_handle, cx.entity(), screen_pos, cx);
+
+        let has_merge_target = self.tab_drag.merge_target().is_some();
+        let reorder_index = if !has_merge_target
+            && self
+                .tab_bar_bounds
+                .as_ref()
+                .is_some_and(|bounds| bounds.contains(&event.position))
+        {
+            let ordered_bounds = self
+                .tab_groups
+                .iter()
+                .filter_map(|group| {
+                    self.tab_group_bounds
+                        .get(&group.id)
+                        .copied()
+                        .map(|bounds| (group.id.clone(), bounds))
+                })
+                .collect::<Vec<_>>();
+            self.tab_drag.dragging_group().and_then(|group_id| {
+                reorder_index_at_x(group_id, event.position.x, &ordered_bounds)
+            })
+        } else {
+            None
+        };
+        let should_detach = should_offer_detach(
+            self.tab_groups.len(),
+            event.position,
+            window.viewport_size(),
+            self.tab_bar_bounds,
+            has_merge_target,
+        );
+        self.tab_drag.set_reorder_index(reorder_index);
+        self.tab_drag.set_outside(should_detach);
     }
 
     /// Convert a window-local cursor position to a screen-space position by
@@ -1857,7 +1920,7 @@ impl Ashell {
     /// detaching it to a new window, or cancelling a neutral release.
     pub(crate) fn on_tab_drag_mouse_up(
         &mut self,
-        _event: &MouseUpEvent,
+        event: &MouseUpEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1882,6 +1945,7 @@ impl Ashell {
             return;
         }
 
+        self.prepare_tab_drag_release(event, window, cx);
         match self.tab_drag.finish() {
             DropIntent::Reorder { group_id, index } => {
                 self.reorder_tab_group(&group_id, index, window, cx);
@@ -1911,12 +1975,22 @@ impl Ashell {
         target: Entity<Ashell>,
         cx: &mut Context<Self>,
     ) {
-        if let Some((_, previous_target)) = self.tab_drag.cancel() {
-            previous_target.update(cx, |target, cx| {
+        let intent = self.tab_drag.finish();
+        let valid_merge = matches!(
+            intent,
+            DropIntent::Merge {
+                group_id: active_group_id,
+                target: (active_target_window, _),
+            } if active_group_id == group_id && active_target_window == target_window
+        );
+        if !valid_merge {
+            target.update(cx, |target, cx| {
                 target.incoming_tab_drag = None;
                 cx.notify();
             });
+            return;
         }
+
         if self.commit_group_merge(group_id, target_window, target, cx)
             && self.tab_groups.is_empty()
         {
