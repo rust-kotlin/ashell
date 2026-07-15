@@ -81,6 +81,13 @@ pub(crate) struct WindowEntry {
     pub activation_seq: u64,
 }
 
+#[derive(Clone)]
+pub(crate) struct IncomingTabDrag {
+    pub(crate) source_window: AnyWindowHandle,
+    pub(crate) source: Entity<Ashell>,
+    pub(crate) group_id: String,
+}
+
 static WINDOW_REGISTRY: OnceLock<Arc<Mutex<Vec<WindowEntry>>>> = OnceLock::new();
 static WINDOW_ACTIVATION_SEQ: AtomicU64 = AtomicU64::new(1);
 static SESSION_OWNER_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -122,7 +129,13 @@ pub(crate) fn deregister_window(window_handle: AnyWindowHandle, cx: &mut App) {
     for entity in remaining {
         entity.update(cx, |window, cx| {
             window.tab_drag.clear_target_if(&window_handle);
-            window.incoming_drop_zone = None;
+            if window
+                .incoming_tab_drag
+                .as_ref()
+                .is_some_and(|drag| drag.source_window == window_handle)
+            {
+                window.incoming_tab_drag = None;
+            }
             cx.notify();
         });
     }
@@ -424,14 +437,15 @@ pub(crate) struct Ashell {
     pub(crate) focused_pane_path: Vec<usize>,
     pub(crate) terminal_panel_bounds: Option<Bounds<Pixels>>,
     pub(crate) terminal_bounds: HashMap<String, Bounds<Pixels>>,
+    pub(crate) tab_bar_bounds: Option<Bounds<Pixels>>,
+    pub(crate) tab_group_bounds: HashMap<String, Bounds<Pixels>>,
     pub(crate) terminal_selecting: bool,
     pub(crate) dragging_splitter: Option<(Vec<usize>, usize)>, // (parent_path, child_index)
     pub(crate) drag_split_origin: Option<gpui::Point<Pixels>>,
-    // Tab drag-to-split state
-    pub(crate) tab_drag: tab_drag::TabDragState<AnyWindowHandle, Entity<Ashell>>,
-    /// Drop zone shown on THIS window when a tab is being dragged over it
-    /// from another window. Drives the incoming-drop overlay.
-    pub(crate) incoming_drop_zone: Option<DropZone>,
+    // Tab drag state
+    pub(crate) tab_drag: tab_drag::TabDragState<AnyWindowHandle, (AnyWindowHandle, Entity<Ashell>)>,
+    /// Source drag currently hovering over this window.
+    pub(crate) incoming_tab_drag: Option<IncomingTabDrag>,
     pub(crate) terminal_marked_text: Option<String>,
     pub(crate) sftp_panel_minimized: bool,
     pub(crate) sidebar_collapsed: bool,
@@ -483,14 +497,6 @@ pub(crate) struct HoveredUrl {
     pub(crate) url: String,
     pub(crate) tab_id: String,
     pub(crate) cells: Vec<(usize, usize)>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DropZone {
-    Left,
-    Right,
-    Up,
-    Down,
 }
 
 #[derive(Clone)]
@@ -858,12 +864,14 @@ impl Ashell {
             show_transfers_dialog: false,
             system_status: None,
             terminal_bounds: HashMap::new(),
+            tab_bar_bounds: None,
+            tab_group_bounds: HashMap::new(),
             terminal_selecting: false,
             terminal_marked_text: None,
             dragging_splitter: None,
             drag_split_origin: None,
             tab_drag: tab_drag::TabDragState::default(),
-            incoming_drop_zone: None,
+            incoming_tab_drag: None,
             sftp_panel_minimized: config.sftp_panel_minimized(),
             sidebar_collapsed: config.sidebar_collapsed(),
             collapsed_saved_scroll_handle: gpui::ScrollHandle::new(),

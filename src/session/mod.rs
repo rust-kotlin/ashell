@@ -6,8 +6,7 @@ pub mod store;
 use std::collections::{HashMap, HashSet};
 
 use gpui::{
-    AppContext as _, Bounds, Context, Entity, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Window, px,
+    AppContext as _, AnyWindowHandle, Context, Entity, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Window, px,
 };
 use gpui_component::{Theme, WindowExt as _, input::InputState};
 use rust_i18n::t;
@@ -16,10 +15,11 @@ use uuid::Uuid;
 use self::config::{AuthMethod, ManagedKey, Session};
 
 use crate::{
-    Ashell, DropZone, PaneLayout, SelectorEntry, TabGroup,
+    Ashell, PaneLayout, SelectorEntry, TabGroup,
     app::{
+        IncomingTabDrag,
         constants::{DEFAULT_COLS, DEFAULT_ROWS},
-        tab_drag::{DragTarget, DropIntent, TargetUpdate},
+        tab_drag::{DragTarget, DropIntent, TargetUpdate, reorder_index_at_x},
     },
     backend::{local, ssh},
     terminal::{BackendCommand, RenderSnapshot, TabKind, TerminalTab},
@@ -1741,13 +1741,11 @@ impl Ashell {
         cx.notify();
     }
 
-    // ─── Tab drag-to-split ───────────────────────────────────────────
+    // ─── Tab drag, reorder, detach and merge ──────────────────────────
 
-    /// Called on every mouse_move at the root level. Detects drag start
-    /// (threshold exceeded) and updates the current drop zone. Also tracks
-    /// whether the cursor is near/outside the window edge to indicate that
-    /// releasing will detach the tab to a new window, OR — if the cursor is
-    /// over another independent window — sets up a cross-window merge.
+    /// Called on every root-level mouse move. Once the drag threshold is
+    /// exceeded, the tab bar reorders within this window, any other source
+    /// position detaches, and a hit on another window takes merge priority.
     pub(crate) fn on_tab_drag_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -1761,62 +1759,74 @@ impl Ashell {
             return;
         }
 
-        let new_zone = self.compute_drop_zone(event.position);
-        if self.tab_drag.set_split_zone(new_zone) {
-            cx.notify();
-        }
-
-        if self.tab_drag.split_zone().is_some() {
-            self.clear_merge_target(cx);
-            if self.tab_drag.set_outside(false) {
-                cx.notify();
-            }
-            return;
-        }
-
         let source_handle = window.window_handle();
+        let source_entity = cx.entity();
         let screen_pos = Self::screen_position(window, event.position);
         let new_target = crate::app::find_window_at_screen_pos(&source_handle, screen_pos).map(
-            |(window_id, entity, target_bounds)| DragTarget {
+            |(window_id, entity, _)| DragTarget {
                 window_id,
-                payload: entity,
-                zone: Self::compute_drop_zone_for_bounds(screen_pos, target_bounds),
+                payload: (window_id, entity),
             },
         );
 
         if let TargetUpdate::Changed { previous } = self.tab_drag.set_merge_target(new_target) {
-            if let Some(previous) = previous {
+            if let Some((_, previous)) = previous {
                 previous.update(cx, |target, cx| {
-                    target.incoming_drop_zone = None;
+                    target.incoming_tab_drag = None;
                     cx.notify();
                 });
             }
             if let Some(target) = self.tab_drag.merge_target() {
-                let entity = target.payload.clone();
-                let zone = target.zone;
+                let (_, entity) = target.payload.clone();
+                let incoming = IncomingTabDrag {
+                    source_window: source_handle,
+                    source: source_entity.clone(),
+                    group_id: self
+                        .tab_drag
+                        .dragging_group()
+                        .expect("dragging state must contain a group")
+                        .to_string(),
+                };
                 entity.update(cx, |target, cx| {
-                    target.incoming_drop_zone = Some(zone);
+                    target.incoming_tab_drag = Some(incoming);
                     cx.notify();
                 });
             }
             cx.notify();
         }
 
-        let should_show_outside = if self.tab_drag.merge_target().is_none() {
-            let viewport = window.viewport_size();
-            let edge_margin = px(24.);
-            event.position.x <= edge_margin
-                || event.position.y <= edge_margin
-                || event.position.x >= viewport.width - edge_margin
-                || event.position.y >= viewport.height - edge_margin
-                || event.position.x < px(0.)
-                || event.position.y < px(0.)
-                || event.position.x > viewport.width
-                || event.position.y > viewport.height
+        let (reorder_index, should_detach) = if self.tab_drag.merge_target().is_some() {
+            (None, false)
+        } else if self
+            .tab_bar_bounds
+            .as_ref()
+            .is_some_and(|bounds| bounds.contains(&event.position))
+        {
+            let ordered_bounds = self
+                .tab_groups
+                .iter()
+                .filter_map(|group| {
+                    self.tab_group_bounds
+                        .get(&group.id)
+                        .copied()
+                        .map(|bounds| (group.id.clone(), bounds))
+                })
+                .collect::<Vec<_>>();
+            let dragged_group = self
+                .tab_drag
+                .dragging_group()
+                .expect("dragging state must contain a group");
+            (
+                reorder_index_at_x(dragged_group, event.position.x, &ordered_bounds),
+                false,
+            )
         } else {
-            false
+            (None, true)
         };
-        if self.tab_drag.set_outside(should_show_outside) {
+
+        let reorder_changed = self.tab_drag.set_reorder_index(reorder_index);
+        let detach_changed = self.tab_drag.set_outside(should_detach);
+        if reorder_changed || detach_changed {
             cx.notify();
         }
     }
@@ -1832,118 +1842,160 @@ impl Ashell {
         Point::new(origin.x + local.x, origin.y + local.y)
     }
 
-    /// Compute the drop zone (Left/Right/Up/Down) within `target_bounds` for
-    /// a cursor at absolute `screen_pos`. Used for cross-window merges where
-    /// we don't have the target's terminal panel bounds, only its window
-    /// bounds.
-    fn compute_drop_zone_for_bounds(
-        screen_pos: Point<Pixels>,
-        target_bounds: Bounds<Pixels>,
-    ) -> DropZone {
-        let center_x = target_bounds.origin.x + target_bounds.size.width / 2.0;
-        let center_y = target_bounds.origin.y + target_bounds.size.height / 2.0;
-        let dx = screen_pos.x - center_x;
-        let dy = screen_pos.y - center_y;
-        if dx.abs() > dy.abs() {
-            if dx < px(0.) {
-                DropZone::Left
-            } else {
-                DropZone::Right
-            }
-        } else if dy < px(0.) {
-            DropZone::Up
-        } else {
-            DropZone::Down
-        }
-    }
-
-    /// Clear the current cross-window merge target and reset the target
-    /// window's `incoming_drop_zone`.
+    /// Cancel a tab drag and clear the target window's incoming indicator.
     pub(crate) fn cancel_tab_drag(&mut self, cx: &mut Context<Self>) {
-        if let Some(target) = self.tab_drag.cancel() {
+        if let Some((_, target)) = self.tab_drag.cancel() {
             target.update(cx, |target, cx| {
-                target.incoming_drop_zone = None;
+                target.incoming_tab_drag = None;
                 cx.notify();
             });
         }
         cx.notify();
     }
 
-    fn clear_merge_target(&mut self, cx: &mut Context<Self>) {
-        if let TargetUpdate::Changed {
-            previous: Some(target),
-        } = self.tab_drag.set_merge_target(None)
-        {
-            target.update(cx, |target, cx| {
-                target.incoming_drop_zone = None;
-                cx.notify();
-            });
-        }
-    }
-
-    /// Called on mouse_up at the root level. If a drag is active and a
-    /// valid drop zone is set, moves the source group's tab into the
-    /// current group as a split pane. If no drop zone is set and the mouse
-    /// was released over ANOTHER independent window, merges the dragged tab
-    /// into that target window as a split pane. Otherwise, if released
-    /// outside the source window, detaches the tab to a new window.
+    /// Finish a tab drag by moving the group to another existing window,
+    /// detaching it to a new window, or cancelling a neutral release.
     pub(crate) fn on_tab_drag_mouse_up(
         &mut self,
         _event: &MouseUpEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(incoming) = self.incoming_tab_drag.take() {
+            let source_window = incoming.source_window;
+            let source = incoming.source;
+            let group_id = incoming.group_id;
+            let target = cx.entity();
+            let target_window = window.window_handle();
+            window.defer(cx, move |_window, cx| {
+                let _ = source.update(cx, |source, cx| {
+                    source.finish_tab_drag_on_target(
+                        group_id,
+                        source_window,
+                        target_window,
+                        target,
+                        cx,
+                    );
+                });
+            });
+            cx.notify();
+            return;
+        }
+
         match self.tab_drag.finish() {
+            DropIntent::Reorder { group_id, index } => {
+                self.reorder_tab_group(&group_id, index, window, cx);
+            }
             DropIntent::Merge {
                 group_id,
-                target,
-                zone,
+                target: (target_window, target),
             } => {
-                target.update(cx, |target, cx| {
-                    target.incoming_drop_zone = None;
-                    cx.notify();
-                });
-                let source_owner_id = self.session_owner_id;
-                match self.take_group_transfer(&group_id) {
-                    Ok(transfer) => {
-                        let result = target.update(cx, |target, cx| {
-                            target.receive_group_transfer(
-                                transfer,
-                                source_owner_id,
-                                zone,
-                                cx,
-                            )
-                        });
-                        match result {
-                            Ok(()) => {
-                                self.status = "tab group moved into another window".into();
-                            }
-                            Err((message, transfer)) => {
-                                self.restore_group_transfer(transfer, cx);
-                                self.status = format!("failed to move tab group: {message}").into();
-                            }
-                        }
-                    }
-                    Err(message) => {
-                        self.status = message.into();
-                    }
+                if self.commit_group_merge(group_id, target_window, target, cx)
+                    && self.tab_groups.is_empty()
+                {
+                    window.remove_window();
                 }
-                cx.notify();
-            }
-            DropIntent::Split { group_id, zone } => {
-                let direction = match zone {
-                    DropZone::Left => "left",
-                    DropZone::Right => "right",
-                    DropZone::Up => "up",
-                    DropZone::Down => "down",
-                };
-                self.move_group_to_split(&group_id, direction, cx);
             }
             DropIntent::Detach { group_id } => {
                 self.detach_group_to_new_window(&group_id, cx);
             }
             DropIntent::None | DropIntent::Cancelled => cx.notify(),
         }
+    }
+
+    fn finish_tab_drag_on_target(
+        &mut self,
+        group_id: String,
+        source_window: AnyWindowHandle,
+        target_window: AnyWindowHandle,
+        target: Entity<Ashell>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_, previous_target)) = self.tab_drag.cancel() {
+            previous_target.update(cx, |target, cx| {
+                target.incoming_tab_drag = None;
+                cx.notify();
+            });
+        }
+        if self.commit_group_merge(group_id, target_window, target, cx)
+            && self.tab_groups.is_empty()
+        {
+            let _ = source_window.update(cx, |_, window, _| {
+                window.remove_window();
+            });
+        }
+    }
+
+    fn commit_group_merge(
+        &mut self,
+        group_id: String,
+        target_window: AnyWindowHandle,
+        target: Entity<Ashell>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        target.update(cx, |target, cx| {
+            target.incoming_tab_drag = None;
+            cx.notify();
+        });
+        let source_owner_id = self.session_owner_id;
+        let merged = match self.take_group_transfer(&group_id) {
+            Ok(transfer) => {
+                let result = target.update(cx, |target, cx| {
+                    target.receive_group_transfer(transfer, source_owner_id, cx)
+                });
+                match result {
+                    Ok(()) => {
+                        let focus_handle = target.read(cx).focus_handle.clone();
+                        let _ = target_window.update(cx, |_, window, cx| {
+                            window.activate_window();
+                            window.focus(&focus_handle, cx);
+                        });
+                        self.status = "tab group moved into another window".into();
+                        true
+                    }
+                    Err((message, transfer)) => {
+                        self.restore_group_transfer(transfer, cx);
+                        self.status = format!("failed to move tab group: {message}").into();
+                        false
+                    }
+                }
+            }
+            Err(message) => {
+                self.status = message.into();
+                false
+            }
+        };
+        cx.notify();
+        merged
+    }
+
+    fn reorder_tab_group(
+        &mut self,
+        group_id: &str,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current_index) = self
+            .tab_groups
+            .iter()
+            .position(|group| group.id == group_id)
+        else {
+            self.status = "cannot reorder: source group no longer exists".into();
+            cx.notify();
+            return;
+        };
+
+        let group = self.tab_groups.remove(current_index);
+        let target_index = index.min(self.tab_groups.len());
+        let group_id = group.id.clone();
+        self.tab_groups.insert(target_index, group);
+        self.activate_group(group_id, window, cx);
+        self.tabs_scroll_handle.scroll_to_item(target_index);
+        self.status = "tab group reordered".into();
+        window.activate_window();
+        self.focus_handle.focus(window, cx);
+        cx.notify();
     }
 
     fn take_group_transfer(&mut self, group_id: &str) -> Result<GroupTransfer, String> {
@@ -2095,7 +2147,6 @@ impl Ashell {
         &mut self,
         transfer: GroupTransfer,
         source_owner_id: crate::session::store::WindowOwnerId,
-        _zone: DropZone,
         cx: &mut Context<Self>,
     ) -> Result<(), (String, GroupTransfer)> {
         let tab_ids = transfer
@@ -2183,138 +2234,5 @@ impl Ashell {
         self.status = "tab group moved from another window".into();
         cx.notify();
         Ok(())
-    }
-
-    /// Determine which drop zone the mouse is hovering over, based on the
-    /// terminal panel bounds. Returns `None` when the mouse is outside the
-    /// terminal area.
-    fn compute_drop_zone(&self, position: Point<Pixels>) -> Option<DropZone> {
-        let bounds = self.terminal_panel_bounds?;
-        if !bounds.contains(&position) {
-            return None;
-        }
-        let center_x = bounds.origin.x + bounds.size.width / 2.0;
-        let center_y = bounds.origin.y + bounds.size.height / 2.0;
-        let dx = position.x - center_x;
-        let dy = position.y - center_y;
-        if dx.abs() > dy.abs() {
-            if dx < px(0.) {
-                Some(DropZone::Left)
-            } else {
-                Some(DropZone::Right)
-            }
-        } else if dy < px(0.) {
-            Some(DropZone::Up)
-        } else {
-            Some(DropZone::Down)
-        }
-    }
-
-    /// Move the first (and only) tab from *source_group_id* into the
-    /// currently active group as a new split pane in *direction*.
-    pub(crate) fn move_group_to_split(
-        &mut self,
-        source_group_id: &str,
-        direction: &str,
-        cx: &mut Context<Self>,
-    ) {
-        // Don't move onto self
-        if self.active_group.as_deref() == Some(source_group_id) {
-            return;
-        }
-
-        // Find source group
-        let source_ix = match self.tab_groups.iter().position(|g| g.id == source_group_id) {
-            Some(ix) => ix,
-            None => return,
-        };
-
-        // Only support moving single-pane groups for now
-        let source_tab_ids: Vec<String> = self.tab_groups[source_ix]
-            .pane_root
-            .tab_ids()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        if source_tab_ids.is_empty() {
-            return;
-        }
-        if source_tab_ids.len() > 1 {
-            self.status = "cannot drag a group with multiple panes".into();
-            cx.notify();
-            return;
-        }
-
-        let tab_id = source_tab_ids[0].clone();
-
-        // Current focused tab in the target group — this is what we split from
-        let current_id = match self.pane_root.focused_tab_id(&self.focused_pane_path) {
-            Some(id) if !id.is_empty() => id.to_string(),
-            _ => return,
-        };
-
-        // Remove the source group entirely (it has only one tab)
-        self.tab_groups.remove(source_ix);
-
-        // Close the source group's SFTP handle (keyed by group id) and
-        // re-spawn a fresh one keyed by the tab id, following the same
-        // pattern as `split_current_pane`.
-        if let Some(old_handle) = self.sftp_handles.remove(source_group_id) {
-            old_handle.close();
-        }
-        let source_session = self
-            .tabs
-            .iter()
-            .find(|t| t.id == tab_id)
-            .and_then(|t| t.session.clone());
-        if let Some(session) = source_session {
-            let events = self.backend_events_sender(cx);
-            self.register_backend_route(tab_id.clone(), cx);
-            let sftp_handle = crate::sftp::spawn_sftp(
-                self.runtime.handle(),
-                tab_id.clone(),
-                session,
-                events,
-            );
-            self.sftp_handles.insert(tab_id.clone(), sftp_handle);
-        }
-
-        // Build the split layout (same structure as split_current_pane)
-        let current_pane = PaneLayout::Single(current_id);
-        let new_pane = PaneLayout::Single(tab_id.clone());
-
-        let split_layout = match direction {
-            "left" | "right" => {
-                let children = match direction {
-                    "left" => vec![new_pane, current_pane],
-                    _ => vec![current_pane, new_pane],
-                };
-                PaneLayout::Vertical(children, 0.5)
-            }
-            "up" | "down" => {
-                let children = match direction {
-                    "up" => vec![new_pane, current_pane],
-                    _ => vec![current_pane, new_pane],
-                };
-                PaneLayout::Horizontal(children, 0.5)
-            }
-            _ => return,
-        };
-
-        self.pane_root
-            .replace_at(&self.focused_pane_path, split_layout);
-        self.sync_pane_root_to_group();
-
-        // Focus the newly moved pane
-        let mut new_path = self.focused_pane_path.clone();
-        if direction == "right" || direction == "down" {
-            new_path.push(1);
-        } else {
-            new_path.push(0);
-        }
-        self.focused_pane_path = new_path;
-        self.active_tab = Some(tab_id);
-        self.status = "tab dragged to split".into();
-        cx.notify();
     }
 }

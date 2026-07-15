@@ -21,9 +21,7 @@ pub(crate) use app::keybinding_recorder::{
     SplitPaneLeft, SplitPaneRight, SplitPaneUp, ToggleSftpZoom, ToggleSidebar, Copy, Paste,
 };
 
-pub(crate) use app::{
-    Ashell, DropZone, PaneLayout, SelectorEntry, SftpContextMenuState, TabGroup,
-};
+pub(crate) use app::{Ashell, PaneLayout, SelectorEntry, SftpContextMenuState, TabGroup};
 
 fn main() {
     app::startup::sync_macos_launch_environment();

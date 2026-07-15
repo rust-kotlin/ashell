@@ -1,12 +1,11 @@
+use crate::app::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui::{
-    Context, ElementId, Focusable as _, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement as _, PathBuilder, Pixels, Render,
-    StatefulInteractiveElement as _, Styled as _, Window, canvas, div, hsla, point,
-    prelude::FluentBuilder as _, px, relative, rems, uniform_list,
+    canvas, div, hsla, point, prelude::FluentBuilder as _, px, relative, rems, uniform_list,
+    Context, DispatchPhase, ElementId, Focusable as _, FontWeight, Hsla,
+    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, PathBuilder, Pixels, Render,
+    StatefulInteractiveElement as _, Styled as _, Window,
 };
 use gpui_component::{
-    ActiveTheme, Disableable as _, ElementExt, Icon, IconName, InteractiveElementExt as _, Root,
-    Sizable as _, Size,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -15,19 +14,19 @@ use gpui_component::{
     progress::Progress,
     scroll::{ScrollableElement as _, Scrollbar, ScrollbarShow},
     tab::{Tab, TabBar},
-    v_flex,
+    v_flex, ActiveTheme, Disableable as _, ElementExt, Icon, IconName, InteractiveElementExt as _,
+    Root, Sizable as _, Size,
 };
-use crate::app::resizable::{h_resizable, resizable_panel, v_resizable};
 use rust_i18n::t;
 
 use crate::{
-    Ashell, DropZone, PaneLayout,
     app::constants::{COLLAPSED_SIDEBAR_WIDTH, SIDEBAR_WIDTH, TERMINAL_KEY_CONTEXT},
     app::TabContextMenuState,
     sftp::format_mtime,
     sftp::ops::is_editable_text_file,
     system::format_bytes,
     terminal::{self, TabKind, TerminalTab},
+    Ashell, PaneLayout,
 };
 
 impl Ashell {
@@ -1985,7 +1984,7 @@ impl Ashell {
     ) -> impl IntoElement {
         let is_macos = cfg!(target_os = "macos");
         let is_fullscreen = window.is_fullscreen();
-        
+
         let is_active = cx.active_window() == Some(window.window_handle());
 
         h_flex()
@@ -2000,9 +1999,17 @@ impl Ashell {
                         .id("window-close")
                         .size(px(12.))
                         .rounded_full()
-                        .bg(if is_active { hsla(3.0 / 360.0, 1.0, 0.67, 1.0) } else { hsla(0.0, 0.0, 0.8, 1.0) }) // Red or Inactive Grey
-                        .group_hover("window-controls", |s| s.bg(hsla(3.0 / 360.0, 1.0, 0.67, 1.0)))
-                        .when(!is_macos, |this| this.window_control_area(gpui::WindowControlArea::Close))
+                        .bg(if is_active {
+                            hsla(3.0 / 360.0, 1.0, 0.67, 1.0)
+                        } else {
+                            hsla(0.0, 0.0, 0.8, 1.0)
+                        }) // Red or Inactive Grey
+                        .group_hover("window-controls", |s| {
+                            s.bg(hsla(3.0 / 360.0, 1.0, 0.67, 1.0))
+                        })
+                        .when(!is_macos, |this| {
+                            this.window_control_area(gpui::WindowControlArea::Close)
+                        })
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.save_layout_state(window, cx);
                             window.remove_window();
@@ -2021,7 +2028,7 @@ impl Ashell {
                                 .text_color(hsla(3.0 / 360.0, 1.0, 0.15, 0.7))
                                 .opacity(0.0)
                                 .group_hover("window-controls", |s| s.opacity(1.0))
-                                .child("✕")
+                                .child("✕"),
                         ),
                 )
                 .child(
@@ -2029,9 +2036,17 @@ impl Ashell {
                         .id("window-minimize")
                         .size(px(12.))
                         .rounded_full()
-                        .bg(if is_active { hsla(39.0 / 360.0, 1.0, 0.59, 1.0) } else { hsla(0.0, 0.0, 0.8, 1.0) }) // Yellow or Inactive Grey
-                        .group_hover("window-controls", |s| s.bg(hsla(39.0 / 360.0, 1.0, 0.59, 1.0)))
-                        .when(!is_macos, |this| this.window_control_area(gpui::WindowControlArea::Min))
+                        .bg(if is_active {
+                            hsla(39.0 / 360.0, 1.0, 0.59, 1.0)
+                        } else {
+                            hsla(0.0, 0.0, 0.8, 1.0)
+                        }) // Yellow or Inactive Grey
+                        .group_hover("window-controls", |s| {
+                            s.bg(hsla(39.0 / 360.0, 1.0, 0.59, 1.0))
+                        })
+                        .when(!is_macos, |this| {
+                            this.window_control_area(gpui::WindowControlArea::Min)
+                        })
                         .on_click(|_, window, _| window.minimize_window())
                         .hover(|s| s.bg(hsla(39.0 / 360.0, 1.0, 0.49, 1.0)))
                         .active(|s| s.bg(hsla(39.0 / 360.0, 1.0, 0.39, 1.0)))
@@ -2047,7 +2062,7 @@ impl Ashell {
                                 .text_color(hsla(39.0 / 360.0, 1.0, 0.15, 0.8))
                                 .opacity(0.0)
                                 .group_hover("window-controls", |s| s.opacity(1.0))
-                                .child("−")
+                                .child("−"),
                         ),
                 )
                 .child(
@@ -2055,9 +2070,17 @@ impl Ashell {
                         .id("window-maximize")
                         .size(px(12.))
                         .rounded_full()
-                        .bg(if is_active { hsla(127.0 / 360.0, 0.68, 0.47, 1.0) } else { hsla(0.0, 0.0, 0.8, 1.0) }) // Green or Inactive Grey
-                        .group_hover("window-controls", |s| s.bg(hsla(127.0 / 360.0, 0.68, 0.47, 1.0)))
-                        .when(!is_macos, |this| this.window_control_area(gpui::WindowControlArea::Max))
+                        .bg(if is_active {
+                            hsla(127.0 / 360.0, 0.68, 0.47, 1.0)
+                        } else {
+                            hsla(0.0, 0.0, 0.8, 1.0)
+                        }) // Green or Inactive Grey
+                        .group_hover("window-controls", |s| {
+                            s.bg(hsla(127.0 / 360.0, 0.68, 0.47, 1.0))
+                        })
+                        .when(!is_macos, |this| {
+                            this.window_control_area(gpui::WindowControlArea::Max)
+                        })
                         .on_click(|_, window, _| {
                             if window.is_fullscreen() {
                                 window.toggle_fullscreen();
@@ -2082,7 +2105,7 @@ impl Ashell {
                                 .text_color(hsla(127.0 / 360.0, 1.0, 0.15, 0.8))
                                 .opacity(0.0)
                                 .group_hover("window-controls", |s| s.opacity(1.0))
-                                .child("+")
+                                .child("+"),
                         ),
                 )
             })
@@ -2092,6 +2115,7 @@ impl Ashell {
     }
 
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
         let active_tab_index = self
             .active_tab
             .as_ref()
@@ -2128,6 +2152,14 @@ impl Ashell {
                     .flex_1()
                     .min_w(px(0.))
                     .h_full()
+                    .on_prepaint({
+                        let view = view.clone();
+                        move |bounds, _window, cx| {
+                            let _ = view.update(cx, |this, _| {
+                                this.tab_bar_bounds = Some(bounds);
+                            });
+                        }
+                    })
                     .when(is_integrated, |this| {
                         this.window_control_area(gpui::WindowControlArea::Drag)
                     })
@@ -2165,7 +2197,15 @@ impl Ashell {
                                         .unwrap_or(cx.theme().success);
                                     let drag_gid = gid.clone();
                                     let context_gid = gid.clone();
+                                    let bounds_gid = gid.clone();
+                                    let bounds_view = view.clone();
                                     Tab::new()
+                                        .on_prepaint(move |bounds, _window, cx| {
+                                            let _ = bounds_view.update(cx, |this, _| {
+                                                this.tab_group_bounds
+                                                    .insert(bounds_gid.clone(), bounds);
+                                            });
+                                        })
                                         .min_w(px(80.))
                                         .prefix(div().w(px(5.)).h(px(32.)).bg(dot_color))
                                         .child(
@@ -2333,25 +2373,19 @@ impl Ashell {
             .when(self.search_active, |el| {
                 el.child(self.render_search_bar(window, cx))
             })
-            // Drop-zone overlay — shown while dragging a tab to split
-            // (either an in-window drag, or an incoming cross-window drag).
+            // Only show feedback for an actionable destination. Moving through
+            // the window center is a neutral state and should not dim the UI.
             .when(
-                self.tab_drag.is_dragging() || self.incoming_drop_zone.is_some(),
-                |el| el.child(self.render_drop_zone_overlay(cx)),
+                self.tab_drag.outside() || self.incoming_tab_drag.is_some(),
+                |el| el.child(self.render_tab_drag_overlay(cx)),
             )
     }
 
-    /// Effective drop zone to highlight: prefers the in-window drag zone,
-    /// falls back to the incoming cross-window drag zone.
-    fn effective_drop_zone(&self) -> Option<DropZone> {
-        self.tab_drag.split_zone().or(self.incoming_drop_zone)
-    }
-
-    fn render_drop_zone_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let accent = cx.theme().accent;
-        let highlight_bg = accent.opacity(0.25);
-        let dim_bg = hsla(0., 0., 0., 0.35);
-        let zone = self.effective_drop_zone();
+    fn render_tab_drag_overlay(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let scrim = hsla(220. / 360., 0.25, 0.08, 0.28);
+        let card_bg = hsla(217. / 360., 0.88, 0.40, 0.98);
+        let card_border = hsla(199. / 360., 0.95, 0.72, 1.0);
+        let card_text = hsla(0., 0., 1.0, 1.0);
 
         div()
             .absolute()
@@ -2359,73 +2393,47 @@ impl Ashell {
             .left_0()
             .right_0()
             .bottom_0()
-            .bg(dim_bg)
-            // Left zone
-            .child(
-                div()
-                    .absolute()
-                    .top(px(4.))
-                    .left(px(4.))
-                    .bottom(px(4.))
-                    .w(px(100.))
-                    .rounded_lg()
-                    .when(zone == Some(DropZone::Left), |this| {
-                        this.bg(highlight_bg)
-                            .border_2()
-                            .border_color(accent)
-                    }),
+            .bg(scrim)
+            .when(
+                self.tab_drag.outside() && self.tab_drag.merge_target().is_none(),
+                |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .px(px(20.))
+                                    .py(px(12.))
+                                    .rounded_lg()
+                                    .border_2()
+                                    .border_color(card_border)
+                                    .bg(card_bg)
+                                    .shadow_lg()
+                                    .text_color(card_text)
+                                    .child(
+                                        Icon::new(IconName::ExternalLink)
+                                            .with_size(Size::Small)
+                                            .text_color(card_text),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(t!("drag_detach_hint").to_string()),
+                                    ),
+                            ),
+                    )
+                },
             )
-            // Right zone
-            .child(
-                div()
-                    .absolute()
-                    .top(px(4.))
-                    .right(px(4.))
-                    .bottom(px(4.))
-                    .w(px(100.))
-                    .rounded_lg()
-                    .when(zone == Some(DropZone::Right), |this| {
-                        this.bg(highlight_bg)
-                            .border_2()
-                            .border_color(accent)
-                    }),
-            )
-            // Up zone
-            .child(
-                div()
-                    .absolute()
-                    .top(px(4.))
-                    .left(px(4.))
-                    .right(px(4.))
-                    .h(px(60.))
-                    .rounded_lg()
-                    .when(zone == Some(DropZone::Up), |this| {
-                        this.bg(highlight_bg)
-                            .border_2()
-                            .border_color(accent)
-                    }),
-            )
-            // Down zone
-            .child(
-                div()
-                    .absolute()
-                    .bottom(px(4.))
-                    .left(px(4.))
-                    .right(px(4.))
-                    .h(px(60.))
-                    .rounded_lg()
-                    .when(zone == Some(DropZone::Down), |this| {
-                        this.bg(highlight_bg)
-                            .border_2()
-                            .border_color(accent)
-                    }),
-            )
-            // "Detach to new window" hint — shown when the cursor is near
-            // or outside the source window edge during a tab drag, but ONLY
-            // when the drag is not currently hovering over another window
-            // (i.e. no merge target). When a merge target exists, the target
-            // window shows its own drop zone overlay instead.
-            .when(self.tab_drag.outside() && self.tab_drag.merge_target().is_none(), |this| {
+            .when(self.incoming_tab_drag.is_some(), |this| {
                 this.child(
                     div()
                         .absolute()
@@ -2437,39 +2445,27 @@ impl Ashell {
                         .items_center()
                         .justify_center()
                         .child(
-                            div()
-                                .px(px(16.))
-                                .py(px(10.))
+                            h_flex()
+                                .gap_2()
+                                .px(px(20.))
+                                .py(px(12.))
                                 .rounded_lg()
-                                .bg(accent.opacity(0.9))
-                                .text_color(hsla(0., 0., 100., 0.95))
-                                .text_sm()
-                                .child(t!("drag_detach_hint").to_string()),
-                        ),
-                )
-            })
-            // "Merge into this window" hint — shown on the target window
-            // while a tab from another window is being dragged over it.
-            .when(self.incoming_drop_zone.is_some(), |this| {
-                this.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .bottom_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            div()
-                                .px(px(16.))
-                                .py(px(10.))
-                                .rounded_lg()
-                                .bg(accent.opacity(0.9))
-                                .text_color(hsla(0., 0., 100., 0.95))
-                                .text_sm()
-                                .child(t!("drag_merge_hint").to_string()),
+                                .border_2()
+                                .border_color(card_border)
+                                .bg(card_bg)
+                                .shadow_lg()
+                                .text_color(card_text)
+                                .child(
+                                    Icon::new(IconName::ArrowDown)
+                                        .with_size(Size::Small)
+                                        .text_color(card_text),
+                                )
+                                .child(
+                                    div()
+                                        .text_base()
+                                        .font_weight(FontWeight::BOLD)
+                                        .child(t!("drag_merge_hint").to_string()),
+                                ),
                         ),
                 )
             })
@@ -2506,7 +2502,10 @@ impl Ashell {
                 let font_size = px(this.terminal_font_size);
                 let line_height = px(this.terminal_line_height());
                 let cell_width = px(this.terminal_cell_width());
-                let is_url_hovered = this.hovered_url.as_ref().map_or(false, |hu| hu.tab_id == *tab_id);
+                let is_url_hovered = this
+                    .hovered_url
+                    .as_ref()
+                    .map_or(false, |hu| hu.tab_id == *tab_id);
                 let mut el = div()
                     .size_full()
                     .overflow_hidden()
@@ -2547,44 +2546,38 @@ impl Ashell {
                     .and_then(|tab| tab.disconnected_reason.clone());
                 if let Some(reason) = disconnected_reason {
                     let tab_id_for_reconnect = tab_id.clone();
-                    el = div()
-                        .size_full()
-                        .relative()
-                        .child(el)
-                        .child(
-                            div()
-                                .absolute()
-                                .bottom_0()
-                                .left_0()
-                                .right_0()
+                    el = div().size_full().relative().child(el).child(
+                        div().absolute().bottom_0().left_0().right_0().child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .py_1()
+                                .bg(cx.theme().danger.opacity(0.15))
                                 .child(
-                                    h_flex()
-                                        .w_full()
-                                        .items_center()
-                                        .gap_2()
-                                        .px_3()
-                                        .py_1()
-                                        .bg(cx.theme().danger.opacity(0.15))
+                                    div()
+                                        .text_size(rems(0.85))
+                                        .text_color(cx.theme().danger)
                                         .child(
-                                            div()
-                                                .text_size(rems(0.85))
-                                                .text_color(cx.theme().danger)
-                                                .child(t!("session_disconnected", "reason" = reason).to_string()),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(rems(0.85))
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(format!("— {}", t!("press_enter_to_reconnect"))),
-                                        )
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.retry_disconnected_tab(&tab_id_for_reconnect, cx);
-                                            }),
+                                            t!("session_disconnected", "reason" = reason)
+                                                .to_string(),
                                         ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(rems(0.85))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!("— {}", t!("press_enter_to_reconnect"))),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.retry_disconnected_tab(&tab_id_for_reconnect, cx);
+                                    }),
                                 ),
-                        );
+                        ),
+                    );
                 }
                 let indicator_color = this
                     .tabs
@@ -2693,7 +2686,11 @@ impl Ashell {
                         items.push(
                             div()
                                 .flex_grow(if children.len() == 2 {
-                                    if i == 0 { *ratio } else { 1.0 - *ratio }
+                                    if i == 0 {
+                                        *ratio
+                                    } else {
+                                        1.0 - *ratio
+                                    }
                                 } else {
                                     1.0
                                 })
@@ -2743,7 +2740,11 @@ impl Ashell {
                     items.push(
                         div()
                             .flex_grow(if children.len() == 2 {
-                                if i == 0 { *ratio } else { 1.0 - *ratio }
+                                if i == 0 {
+                                    *ratio
+                                } else {
+                                    1.0 - *ratio
+                                }
                             } else {
                                 1.0
                             })
@@ -2769,6 +2770,17 @@ impl Render for Ashell {
             self.active_tab = self.tabs.first().map(|tab| tab.id.clone());
         }
         self.sync_sftp_path_input(window, cx);
+
+        let view = cx.entity();
+        window.on_mouse_event(
+            move |event: &MouseUpEvent, phase, window, cx| {
+                if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                    let _ = view.update(cx, |this, cx| {
+                        this.on_tab_drag_mouse_up(event, window, cx);
+                    });
+                }
+            },
+        );
 
         // Refresh this window's screen-space bounds in the cross-window
         // registry so other windows can hit-test against it during a
@@ -2937,9 +2949,10 @@ impl Render for Ashell {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .font_family(self.ui_font_family.clone())
-            // Global tab-drag handlers (fire after child handlers due to bubbling)
+            // Global tab-drag movement handler. Mouse release is registered at
+            // window level so it also fires while Windows mouse capture reports
+            // a cursor position outside the source window.
             .on_mouse_move(cx.listener(Self::on_tab_drag_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_tab_drag_mouse_up))
             .on_action(cx.listener(|this, _: &crate::OpenSettings, window, cx| this.show_settings_dialog(window, cx)))
             .on_action(cx.listener(|this, _: &crate::OpenSession, window, cx| this.show_selector_dialog(window, cx)))
             .on_action(cx.listener(|this, _: &crate::OpenTransfers, window, cx| this.show_transfers_dialog(window, cx)))

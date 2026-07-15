@@ -368,12 +368,7 @@ pub(crate) fn open_new_window_with_group(
                 return;
             };
             if let Err((message, transfer)) = view.update(cx, |this, cx| {
-                this.receive_group_transfer(
-                    transfer,
-                    source_owner_id,
-                    crate::DropZone::Right,
-                    cx,
-                )
+                this.receive_group_transfer(transfer, source_owner_id, cx)
             }) {
                 *failure_for_window.borrow_mut() = Some(message);
                 *pending_for_window.borrow_mut() = Some(transfer);

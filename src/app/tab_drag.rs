@@ -1,17 +1,14 @@
-use gpui::{Pixels, Point};
-
-use super::DropZone;
+use gpui::{Bounds, Pixels, Point};
 
 #[derive(Clone)]
 pub(crate) struct DragTarget<I, T> {
     pub(crate) window_id: I,
     pub(crate) payload: T,
-    pub(crate) zone: DropZone,
 }
 
 impl<I: PartialEq, T> DragTarget<I, T> {
     fn same_destination(&self, other: &Self) -> bool {
-        self.window_id == other.window_id && self.zone == other.zone
+        self.window_id == other.window_id
     }
 }
 
@@ -23,44 +20,16 @@ pub(crate) enum TargetUpdate<T> {
 pub(crate) enum DropIntent<T> {
     None,
     Cancelled,
-    Split {
-        group_id: String,
-        zone: DropZone,
-    },
-    Merge {
-        group_id: String,
-        target: T,
-        zone: DropZone,
-    },
-    Detach {
-        group_id: String,
-    },
-}
-
-#[cfg(test)]
-pub(crate) fn validate_reconnect_group(tab_count: usize) -> Result<(), &'static str> {
-    match tab_count {
-        1 => Ok(()),
-        0 => Err("cannot move an empty group"),
-        _ => Err("cannot move a group with multiple panes yet"),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn commit_after_prepare<T, E>(
-    prepare: impl FnOnce() -> Result<T, E>,
-    commit: impl FnOnce(T),
-) -> Result<(), E> {
-    let prepared = prepare()?;
-    commit(prepared);
-    Ok(())
+    Reorder { group_id: String, index: usize },
+    Merge { group_id: String, target: T },
+    Detach { group_id: String },
 }
 
 pub(crate) struct TabDragState<I, T> {
     pending_group: Option<String>,
     start: Option<Point<Pixels>>,
     dragging_group: Option<String>,
-    split_zone: Option<DropZone>,
+    reorder_index: Option<usize>,
     outside: bool,
     merge_target: Option<DragTarget<I, T>>,
 }
@@ -71,7 +40,7 @@ impl<I, T> Default for TabDragState<I, T> {
             pending_group: None,
             start: None,
             dragging_group: None,
-            split_zone: None,
+            reorder_index: None,
             outside: false,
             merge_target: None,
         }
@@ -106,20 +75,12 @@ impl<I: PartialEq, T> TabDragState<I, T> {
         self.dragging_group.is_some()
     }
 
+    pub(crate) fn dragging_group(&self) -> Option<&str> {
+        self.dragging_group.as_deref()
+    }
+
     pub(crate) fn is_pending(&self) -> bool {
         self.pending_group.is_some()
-    }
-
-    pub(crate) fn split_zone(&self) -> Option<DropZone> {
-        self.split_zone
-    }
-
-    pub(crate) fn set_split_zone(&mut self, zone: Option<DropZone>) -> bool {
-        if self.split_zone == zone {
-            return false;
-        }
-        self.split_zone = zone;
-        true
     }
 
     pub(crate) fn merge_target(&self) -> Option<&DragTarget<I, T>> {
@@ -138,6 +99,14 @@ impl<I: PartialEq, T> TabDragState<I, T> {
         let previous = self.merge_target.take().map(|target| target.payload);
         self.merge_target = target;
         TargetUpdate::Changed { previous }
+    }
+
+    pub(crate) fn set_reorder_index(&mut self, index: Option<usize>) -> bool {
+        if self.reorder_index == index {
+            return false;
+        }
+        self.reorder_index = index;
+        true
     }
 
     pub(crate) fn outside(&self) -> bool {
@@ -159,7 +128,7 @@ impl<I: PartialEq, T> TabDragState<I, T> {
             return DropIntent::None;
         };
         let target = self.merge_target.take();
-        let split_zone = self.split_zone.take();
+        let reorder_index = self.reorder_index;
         let outside = self.outside;
         self.reset_without_target();
 
@@ -167,11 +136,10 @@ impl<I: PartialEq, T> TabDragState<I, T> {
             return DropIntent::Merge {
                 group_id,
                 target: target.payload,
-                zone: target.zone,
             };
         }
-        if let Some(zone) = split_zone {
-            return DropIntent::Split { group_id, zone };
+        if let Some(index) = reorder_index {
+            return DropIntent::Reorder { group_id, index };
         }
         if outside {
             return DropIntent::Detach { group_id };
@@ -200,22 +168,40 @@ impl<I: PartialEq, T> TabDragState<I, T> {
         self.pending_group = None;
         self.start = None;
         self.dragging_group = None;
-        self.split_zone = None;
+        self.reorder_index = None;
         self.outside = false;
     }
 }
 
+pub(crate) fn reorder_index_at_x(
+    dragged_group_id: &str,
+    cursor_x: Pixels,
+    ordered_bounds: &[(String, Bounds<Pixels>)],
+) -> Option<usize> {
+    if !ordered_bounds
+        .iter()
+        .any(|(group_id, _)| group_id == dragged_group_id)
+    {
+        return None;
+    }
+
+    let remaining = ordered_bounds
+        .iter()
+        .filter(|(group_id, _)| group_id != dragged_group_id)
+        .collect::<Vec<_>>();
+    Some(
+        remaining
+            .iter()
+            .position(|(_, bounds)| cursor_x < bounds.origin.x + bounds.size.width / 2.0)
+            .unwrap_or(remaining.len()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
+    use gpui::{point, px, size, Bounds};
 
-    use gpui::{point, px};
-
-    use super::{
-        DragTarget, DropIntent, TabDragState, TargetUpdate, commit_after_prepare,
-        validate_reconnect_group,
-    };
-    use crate::DropZone;
+    use super::{reorder_index_at_x, DragTarget, DropIntent, TabDragState, TargetUpdate};
 
     #[test]
     fn drag_starts_only_after_threshold() {
@@ -228,17 +214,15 @@ mod tests {
     }
 
     #[test]
-    fn same_zone_in_different_window_changes_target() {
+    fn different_window_changes_target() {
         let mut state = TabDragState::<u8, &'static str>::default();
         let first = DragTarget {
             window_id: 1,
             payload: "window-b",
-            zone: DropZone::Left,
         };
         let second = DragTarget {
             window_id: 2,
             payload: "window-c",
-            zone: DropZone::Left,
         };
 
         assert!(matches!(
@@ -255,15 +239,13 @@ mod tests {
     }
 
     #[test]
-    fn merge_has_priority_and_finish_resets_state() {
+    fn merge_finish_resets_state() {
         let mut state = TabDragState::<u8, &'static str>::default();
         state.begin("group-a".into(), point(px(0.), px(0.)));
         state.promote_if_needed(point(px(10.), px(0.)), 5.0);
-        state.set_split_zone(Some(DropZone::Right));
         state.set_merge_target(Some(DragTarget {
             window_id: 2,
             payload: "window-c",
-            zone: DropZone::Down,
         }));
 
         assert!(matches!(
@@ -271,57 +253,11 @@ mod tests {
             DropIntent::Merge {
                 group_id,
                 target: "window-c",
-                zone: DropZone::Down,
             } if group_id == "group-a"
         ));
         assert!(!state.is_dragging());
         assert!(state.merge_target().is_none());
         assert!(!state.outside());
-    }
-
-    #[test]
-    fn failed_prepare_keeps_source() {
-        let commits = Rc::new(Cell::new(0));
-        let commit_counter = commits.clone();
-
-        let result = commit_after_prepare(
-            || Err::<(), _>("target failed"),
-            move |_| commit_counter.set(commit_counter.get() + 1),
-        );
-
-        assert_eq!(result, Err("target failed"));
-        assert_eq!(commits.get(), 0);
-    }
-
-    #[test]
-    fn successful_prepare_commits_source_once() {
-        let commits = Rc::new(Cell::new(0));
-        let commit_counter = commits.clone();
-
-        let result = commit_after_prepare(
-            || Ok::<_, &'static str>("prepared target"),
-            move |prepared| {
-                assert_eq!(prepared, "prepared target");
-                commit_counter.set(commit_counter.get() + 1);
-            },
-        );
-
-        assert_eq!(result, Ok(()));
-        assert_eq!(commits.get(), 1);
-    }
-
-    #[test]
-    fn compound_group_is_rejected_before_source_commit() {
-        let commits = Rc::new(Cell::new(0));
-        let commit_counter = commits.clone();
-
-        let result = commit_after_prepare(
-            || validate_reconnect_group(2),
-            move |_| commit_counter.set(commit_counter.get() + 1),
-        );
-
-        assert_eq!(result, Err("cannot move a group with multiple panes yet"));
-        assert_eq!(commits.get(), 0);
     }
 
     #[test]
@@ -331,6 +267,85 @@ mod tests {
         state.promote_if_needed(point(px(10.), px(0.)), 5.0);
 
         assert!(matches!(state.finish(), DropIntent::Cancelled));
+    }
+
+    #[test]
+    fn tab_bar_release_reorders_group() {
+        let mut state = TabDragState::<u8, ()>::default();
+        state.begin("group-c".into(), point(px(0.), px(0.)));
+        state.promote_if_needed(point(px(10.), px(0.)), 5.0);
+        state.set_reorder_index(Some(0));
+        state.set_outside(true);
+
+        assert!(matches!(
+            state.finish(),
+            DropIntent::Reorder { group_id, index: 0 } if group_id == "group-c"
+        ));
+    }
+
+    #[test]
+    fn merge_takes_priority_over_reorder_and_detach() {
+        let mut state = TabDragState::<u8, &'static str>::default();
+        state.begin("group-a".into(), point(px(0.), px(0.)));
+        state.promote_if_needed(point(px(10.), px(0.)), 5.0);
+        state.set_reorder_index(Some(1));
+        state.set_outside(true);
+        state.set_merge_target(Some(DragTarget {
+            window_id: 2,
+            payload: "window-b",
+        }));
+
+        assert!(matches!(
+            state.finish(),
+            DropIntent::Merge {
+                group_id,
+                target: "window-b",
+            } if group_id == "group-a"
+        ));
+    }
+
+    #[test]
+    fn cursor_position_computes_left_and_right_reorder_indices() {
+        let bounds = vec![
+            (
+                "group-a".to_string(),
+                Bounds::new(point(px(0.), px(0.)), size(px(100.), px(32.))),
+            ),
+            (
+                "group-b".to_string(),
+                Bounds::new(point(px(100.), px(0.)), size(px(100.), px(32.))),
+            ),
+            (
+                "group-c".to_string(),
+                Bounds::new(point(px(200.), px(0.)), size(px(100.), px(32.))),
+            ),
+        ];
+
+        assert_eq!(reorder_index_at_x("group-c", px(20.), &bounds), Some(0));
+        assert_eq!(reorder_index_at_x("group-a", px(280.), &bounds), Some(2));
+        assert_eq!(reorder_index_at_x("missing", px(20.), &bounds), None);
+    }
+
+    #[test]
+    fn completed_drag_cannot_commit_twice() {
+        let mut state = TabDragState::<u8, ()>::default();
+        state.begin("group-a".into(), point(px(0.), px(0.)));
+        state.promote_if_needed(point(px(10.), px(0.)), 5.0);
+        state.set_outside(true);
+
+        assert!(matches!(state.finish(), DropIntent::Detach { .. }));
+        assert!(matches!(state.finish(), DropIntent::None));
+    }
+
+    #[test]
+    fn cancelling_reorder_keeps_finish_inert() {
+        let mut state = TabDragState::<u8, ()>::default();
+        state.begin("group-b".into(), point(px(0.), px(0.)));
+        state.promote_if_needed(point(px(10.), px(0.)), 5.0);
+        state.set_reorder_index(Some(0));
+
+        state.cancel();
+        assert!(matches!(state.finish(), DropIntent::None));
     }
 
     #[test]
