@@ -8,9 +8,10 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme, Disableable as _, ElementExt, Icon, IconName, InteractiveElementExt as _, Root,
-    Sizable as _, Size,
+    Sizable as _, Size, WindowExt as _,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
+    dialog::Dialog,
     h_flex,
     input::Input,
     menu::{ContextMenuExt as _, PopupMenuItem},
@@ -2861,6 +2862,95 @@ impl Render for Ashell {
                     });
                     self.sftp_editor = Some(editor);
                 }
+            }
+        }
+        // 处理编辑器的关闭确认请求(有未保存修改时弹框)
+        if let Some(editor) = &self.sftp_editor {
+            let (close_tab, close_all, filename) = {
+                let e = editor.read(cx);
+                (
+                    e.pending_close_tab,
+                    e.pending_close_all,
+                    e.pending_close_filename(),
+                )
+            };
+            if let Some(_idx) = close_tab {
+                // 立即清除请求,避免每帧重复弹框
+                editor.update(cx, |e, cx| {
+                    e.pending_close_tab = None;
+                    cx.notify();
+                });
+                let view = cx.entity();
+                let fname = filename.unwrap_or_default();
+                window.open_dialog(cx, move |dialog: Dialog, _window, _| {
+                    dialog
+                        .title(t!("editor_close_confirm_title").to_string())
+                        .w(px(440.))
+                        .keyboard(false)
+                        .on_ok({
+                            let view = view.clone();
+                            move |_, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    if let Some(editor) = &this.sftp_editor {
+                                        editor.update(cx, |e, cx| {
+                                            e.confirm_close_tab(cx);
+                                        });
+                                    }
+                                });
+                                window.close_dialog(cx);
+                                true
+                            }
+                        })
+                        .content({
+                            let fname = fname.clone();
+                            move |content, _window, _cx| {
+                                content.child(
+                                    div()
+                                        .p_4()
+                                        .text_sm()
+                                        .child(t!(
+                                            "editor_close_confirm_desc",
+                                            name = fname.as_str()
+                                        )
+                                        .to_string()),
+                                )
+                            }
+                        })
+                });
+            } else if close_all {
+                editor.update(cx, |e, cx| {
+                    e.pending_close_all = false;
+                    cx.notify();
+                });
+                let view = cx.entity();
+                window.open_dialog(cx, move |dialog: Dialog, _window, _| {
+                    dialog
+                        .title(t!("editor_close_all_confirm_title").to_string())
+                        .w(px(440.))
+                        .keyboard(false)
+                        .on_ok({
+                            let view = view.clone();
+                            move |_, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    if let Some(editor) = &this.sftp_editor {
+                                        editor.update(cx, |e, cx| {
+                                            e.confirm_close_all(cx);
+                                        });
+                                    }
+                                });
+                                window.close_dialog(cx);
+                                true
+                            }
+                        })
+                        .content(move |content, _window, _cx| {
+                            content.child(
+                                div()
+                                    .p_4()
+                                    .text_sm()
+                                    .child(t!("editor_close_all_confirm_desc").to_string()),
+                            )
+                        })
+                });
             }
         }
         if self

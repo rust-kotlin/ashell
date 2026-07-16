@@ -70,6 +70,11 @@ pub enum BackendEvent {
         tab_id: String,
         remote_path: String,
     },
+    /// 内存中的文件内容上传失败(供内置编辑器恢复 saving/dirty 状态)。
+    SftpContentUploadFailed {
+        tab_id: String,
+        remote_path: String,
+    },
     RemoteSystem {
         tab_id: String,
         snapshot: SystemSnapshot,

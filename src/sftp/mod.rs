@@ -780,6 +780,10 @@ async fn run_sftp(
                             });
                         }
                         Err(err) => {
+                            let _ = events_clone.send(BackendEvent::SftpContentUploadFailed {
+                                tab_id: tab_id_clone.clone(),
+                                remote_path: remote_path.clone(),
+                            });
                             let _ = events_clone.send(BackendEvent::SftpStatus {
                                 tab_id: tab_id_clone,
                                 text: format!("Upload failed: {err:#}"),

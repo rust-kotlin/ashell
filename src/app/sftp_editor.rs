@@ -65,6 +65,8 @@ struct EditorTab {
     dirty: bool,
     /// 正在上传中。
     saving: bool,
+    /// 保存发起时的 dirty 快照,用于上传成功后判断是否在保存期间又有新编辑。
+    dirty_at_save_start: bool,
 }
 
 impl EditorTab {
@@ -107,6 +109,7 @@ impl EditorTab {
             input,
             dirty: false,
             saving: false,
+            dirty_at_save_start: false,
         }
     }
 }
@@ -118,7 +121,17 @@ pub struct SftpEditor {
     active_idx: usize,
     /// 请求关闭整个编辑器(由 Ashell 在 render 后检测并清除)。
     pub should_close: bool,
+    /// 待确认的关闭请求:Some(idx) 表示用户想关闭该 tab 但它有未保存修改,
+    /// 需 Ashell 弹确认框;确认后调用 confirm_close_tab,取消调用 cancel_close_tab。
+    pub pending_close_tab: Option<usize>,
+    /// 待确认的"关闭整个编辑器"请求(Esc)。若有 dirty tab 则需 Ashell 弹框确认。
+    pub pending_close_all: bool,
+    /// tab 数量达到上限时的提示文本(空字符串表示无提示)。
+    pub capacity_notice: String,
 }
+
+/// 单个编辑器窗口最多同时打开的 tab 数量,防止内存爆炸。
+const MAX_TABS: usize = 20;
 
 impl SftpEditor {
     /// 创建编辑器并打开第一个文件。
@@ -135,29 +148,41 @@ impl SftpEditor {
             tabs: vec![tab],
             active_idx: 0,
             should_close: false,
+            pending_close_tab: None,
+            pending_close_all: false,
+            capacity_notice: String::new(),
         }
     }
 
     /// 打开一个文件到新 tab。若该路径已存在,则切换到对应 tab 不重复打开。
-    /// 返回该 tab 的索引。
+    /// 达到 MAX_TABS 上限时不打开,而是设置 capacity_notice 提示。
+    /// 返回该 tab 的索引(已存在或新建);达到上限返回 None。
     pub fn open_file(
         &mut self,
         remote_path: String,
         content: String,
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
-    ) -> usize {
+    ) -> Option<usize> {
         // 已存在则切换
         if let Some(idx) = self.tabs.iter().position(|t| t.remote_path == remote_path) {
             self.active_idx = idx;
             cx.notify();
-            return idx;
+            return Some(idx);
+        }
+        // 达到上限 → 提示,不打开
+        if self.tabs.len() >= MAX_TABS {
+            self.capacity_notice =
+                t!("editor_capacity_reached", max = MAX_TABS).to_string();
+            cx.notify();
+            return None;
         }
         let tab = EditorTab::new(remote_path, content, window, cx);
         self.tabs.push(tab);
         self.active_idx = self.tabs.len() - 1;
+        self.capacity_notice.clear();
         cx.notify();
-        self.active_idx
+        Some(self.active_idx)
     }
 
     /// 是否已打开指定路径的文件。
@@ -184,6 +209,8 @@ impl SftpEditor {
     }
 
     /// Ctrl+S:保存当前激活 tab,读取其内容并上传。
+    /// 注意:此处不清 dirty,等上传成功事件回来再清(mark_uploaded)。
+    /// 失败时由 mark_upload_failed 恢复 dirty。避免上传失败却误标已保存。
     pub fn save_active(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) {
         let Some(tab) = self.tabs.get_mut(self.active_idx) else {
             return;
@@ -194,39 +221,70 @@ impl SftpEditor {
         let content = tab.input.read(cx).text().to_string();
         let path = tab.remote_path.clone();
         tab.saving = true;
-        tab.dirty = false;
+        tab.dirty_at_save_start = tab.dirty;
         self.sftp.upload_file_content(path, content);
         cx.notify();
     }
 
-    /// 收到上传完成事件后,按 remote_path 标记对应 tab。
+    /// 收到上传完成事件后,按 remote_path 标记对应 tab 已上传(成功才清 dirty)。
     pub fn mark_uploaded(&mut self, remote_path: &str, cx: &mut gpui::Context<Self>) {
         for tab in &mut self.tabs {
             if tab.remote_path == remote_path {
                 tab.saving = false;
+                tab.dirty = false;
             }
         }
         cx.notify();
     }
 
-    /// 关闭当前激活 tab。若关闭后无 tab,则标记整个编辑器关闭。
+    /// 收到上传失败事件后,按 remote_path 恢复 tab 状态:
+    /// saving=false,dirty 恢复为保存发起时的值(内容其实未保存)。
+    pub fn mark_upload_failed(&mut self, remote_path: &str, cx: &mut gpui::Context<Self>) {
+        for tab in &mut self.tabs {
+            if tab.remote_path == remote_path {
+                tab.saving = false;
+                tab.dirty = true;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 关闭当前激活 tab。若有未保存修改则请求确认(设置 pending_close_tab),
+    /// 由 Ashell 弹框;无修改则直接关闭。
     fn close_active(&mut self, cx: &mut gpui::Context<Self>) {
         if self.tabs.is_empty() {
             self.should_close = true;
             cx.notify();
             return;
         }
-        self.tabs.remove(self.active_idx);
-        if self.tabs.is_empty() {
-            self.should_close = true;
-        } else if self.active_idx >= self.tabs.len() {
-            self.active_idx = self.tabs.len() - 1;
-        }
-        cx.notify();
+        self.request_close_tab(self.active_idx, cx);
     }
 
     /// 关闭指定索引的 tab(点击 tab 上的 x)。
     fn close_tab(&mut self, idx: usize, cx: &mut gpui::Context<Self>) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        self.request_close_tab(idx, cx);
+    }
+
+    /// 请求关闭某 tab:有未保存修改则暂存待确认,无修改则直接关闭。
+    fn request_close_tab(&mut self, idx: usize, cx: &mut gpui::Context<Self>) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let dirty = self.tabs[idx].dirty;
+        if dirty {
+            // 有未保存修改 → 暂存,等 Ashell 弹确认框
+            self.pending_close_tab = Some(idx);
+            cx.notify();
+        } else {
+            self.do_close_tab(idx, cx);
+        }
+    }
+
+    /// 真正执行关闭(删除 tab 并修正索引)。无确认逻辑。
+    fn do_close_tab(&mut self, idx: usize, cx: &mut gpui::Context<Self>) {
         if idx >= self.tabs.len() {
             return;
         }
@@ -241,7 +299,35 @@ impl SftpEditor {
         cx.notify();
     }
 
+    /// Ashell 确认框点"确定"后调用:真正关闭 pending 的 tab。
+    pub fn confirm_close_tab(&mut self, cx: &mut gpui::Context<Self>) {
+        if let Some(idx) = self.pending_close_tab.take() {
+            self.do_close_tab(idx, cx);
+        }
+    }
+
+    /// 待确认关闭的 tab 的文件名(供确认框文案使用)。
+    pub fn pending_close_filename(&self) -> Option<String> {
+        self.pending_close_tab
+            .and_then(|idx| self.tabs.get(idx))
+            .map(|t| base_name(&t.remote_path).to_string())
+    }
+
     fn close_all(&mut self, cx: &mut gpui::Context<Self>) {
+        // 若有未保存修改的 tab,先请求确认(由 Ashell 弹框);否则直接关闭。
+        let has_dirty = self.tabs.iter().any(|t| t.dirty);
+        if has_dirty {
+            self.pending_close_all = true;
+            cx.notify();
+        } else {
+            self.should_close = true;
+            cx.notify();
+        }
+    }
+
+    /// Ashell 确认框点"确定"后调用:关闭整个编辑器。
+    pub fn confirm_close_all(&mut self, cx: &mut gpui::Context<Self>) {
+        self.pending_close_all = false;
         self.should_close = true;
         cx.notify();
     }
@@ -307,6 +393,7 @@ impl Render for SftpEditor {
         let saving = active.map(|t| t.saving).unwrap_or(false);
         let active_idx = self.active_idx;
         let tab_count = self.tabs.len();
+        let capacity_notice = self.capacity_notice.clone();
 
         // tab 栏数据快照
         let tab_snapshots: Vec<(String, bool, bool)> = self
@@ -455,6 +542,14 @@ impl Render for SftpEditor {
                                     })
                                     .child(status_text),
                             )
+                            .when(!capacity_notice.is_empty(), |this| {
+                                this.child(
+                                    gpui::div()
+                                        .text_xs()
+                                        .text_color(theme.warning)
+                                        .child(capacity_notice),
+                                )
+                            })
                             .child(
                                 Button::new("save-btn")
                                     .primary()

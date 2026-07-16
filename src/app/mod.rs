@@ -1202,10 +1202,21 @@ impl Ashell {
                     tab_id: _,
                     remote_path,
                 } => {
-                    // 上传完成 → 按 remote_path 标记对应 tab 已上传
+                    // 上传完成 → 按 remote_path 标记对应 tab 已上传(成功才清 dirty)
                     if let Some(editor) = &self.sftp_editor {
                         editor.update(cx, |e, cx| {
                             e.mark_uploaded(&remote_path, cx);
+                        });
+                    }
+                }
+                BackendEvent::SftpContentUploadFailed {
+                    tab_id: _,
+                    remote_path,
+                } => {
+                    // 上传失败 → 恢复 saving=false 且 dirty=true(内容其实未保存)
+                    if let Some(editor) = &self.sftp_editor {
+                        editor.update(cx, |e, cx| {
+                            e.mark_upload_failed(&remote_path, cx);
                         });
                     }
                 }
