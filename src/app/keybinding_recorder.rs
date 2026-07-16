@@ -140,12 +140,20 @@ pub(crate) const WORKSPACE_ACTIONS: &[WorkspaceAction] = &[
     WorkspaceAction {
         id: "Copy",
         label_key: "settings_copy",
-        default_suffix: if cfg!(target_os = "macos") { "c" } else { "shift-c" },
+        default_suffix: if cfg!(target_os = "macos") {
+            "c"
+        } else {
+            "shift-c"
+        },
     },
     WorkspaceAction {
         id: "Paste",
         label_key: "settings_paste",
-        default_suffix: if cfg!(target_os = "macos") { "v" } else { "shift-v" },
+        default_suffix: if cfg!(target_os = "macos") {
+            "v"
+        } else {
+            "shift-v"
+        },
     },
 ];
 
@@ -317,7 +325,17 @@ impl KeybindingsPage {
         let groups = [
             (
                 "settings_group_keybind_general",
-                vec!["OpenSettings", "OpenSession", "OpenTransfers", "NewSsh", "NewWindow", "DetachTabToWindow", "OpenSearch", "Copy", "Paste"],
+                vec![
+                    "OpenSettings",
+                    "OpenSession",
+                    "OpenTransfers",
+                    "NewSsh",
+                    "NewWindow",
+                    "DetachTabToWindow",
+                    "OpenSearch",
+                    "Copy",
+                    "Paste",
+                ],
             ),
             (
                 "settings_group_keybind_zoom",

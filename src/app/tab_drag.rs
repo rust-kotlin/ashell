@@ -186,10 +186,7 @@ pub(crate) fn should_close_empty_source<I: PartialEq>(
     merge_succeeded && source_is_empty && source_window != target_window
 }
 
-pub(crate) fn cursor_inside_viewport(
-    cursor: Point<Pixels>,
-    viewport_size: Size<Pixels>,
-) -> bool {
+pub(crate) fn cursor_inside_viewport(cursor: Point<Pixels>, viewport_size: Size<Pixels>) -> bool {
     cursor.x >= px(0.)
         && cursor.y >= px(0.)
         && cursor.x < viewport_size.width
@@ -235,7 +232,7 @@ pub(crate) fn reorder_index_at_x(
 
 #[cfg(test)]
 mod tests {
-    use gpui::{point, px, size, Bounds};
+    use gpui::{Bounds, point, px, size};
 
     use super::{
         DragTarget, DropIntent, TabDragState, TargetUpdate, cursor_inside_viewport,
@@ -399,18 +396,9 @@ mod tests {
     fn viewport_hit_test_rejects_positions_outside_source_window() {
         let viewport = size(px(800.), px(600.));
 
-        assert!(cursor_inside_viewport(
-            point(px(400.), px(300.)),
-            viewport
-        ));
-        assert!(!cursor_inside_viewport(
-            point(px(801.), px(300.)),
-            viewport
-        ));
-        assert!(!cursor_inside_viewport(
-            point(px(-1.), px(300.)),
-            viewport
-        ));
+        assert!(cursor_inside_viewport(point(px(400.), px(300.)), viewport));
+        assert!(!cursor_inside_viewport(point(px(801.), px(300.)), viewport));
+        assert!(!cursor_inside_viewport(point(px(-1.), px(300.)), viewport));
     }
 
     #[test]

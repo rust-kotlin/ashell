@@ -322,7 +322,9 @@ async fn connect_and_authenticate(
                             break;
                         }
                         Ok(false) => {
-                            tracing::debug!("[ssh] public key auth failed with algorithm, trying next");
+                            tracing::debug!(
+                                "[ssh] public key auth failed with algorithm, trying next"
+                            );
                             continue;
                         }
                         Err(e) => {
@@ -344,8 +346,7 @@ async fn connect_and_authenticate(
                 success
             } else {
                 let success =
-                    authenticate_with_default_keys(&mut handle, &session.user, passphrase)
-                        .await?;
+                    authenticate_with_default_keys(&mut handle, &session.user, passphrase).await?;
                 if !success {
                     return Err(anyhow::anyhow!(
                         "public key authentication failed for {}@{}:{} - no valid default key found in ~/.ssh/",
@@ -417,8 +418,7 @@ async fn connect_and_authenticate(
                     ),
                 });
                 let success =
-                    authenticate_with_default_keys(&mut handle, &session.user, passphrase)
-                        .await?;
+                    authenticate_with_default_keys(&mut handle, &session.user, passphrase).await?;
                 if !success {
                     return Err(anyhow::anyhow!(
                         "ssh-config authentication failed for {}@{}:{} - no valid default key found",

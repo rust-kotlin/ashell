@@ -1,7 +1,7 @@
 pub mod custom_blocks;
 pub mod element;
-pub mod input;
 pub mod highlight;
+pub mod input;
 
 use std::sync::mpsc::Sender;
 
@@ -116,6 +116,7 @@ impl BackendTx {
 pub struct TerminalTab {
     pub id: String,
     pub title: String,
+    pub dynamic_title: String,
     pub kind: TabKind,
     pub status: String,
     pub connected: bool,
@@ -134,7 +135,12 @@ pub struct TerminalTab {
     pub rows: u16,
     pub backend: std::sync::Arc<std::sync::Mutex<BackendTx>>,
     pub scroll_pixel_y: f32,
-    pub(crate) highlight_cache: std::cell::RefCell<Option<(Vec<RenderCell>, std::collections::HashMap<(i32, i32), gpui::Hsla>)>>,
+    pub(crate) highlight_cache: std::cell::RefCell<
+        Option<(
+            Vec<RenderCell>,
+            std::collections::HashMap<(i32, i32), gpui::Hsla>,
+        )>,
+    >,
 }
 
 #[derive(Clone, Copy)]
@@ -233,7 +239,8 @@ impl TerminalTab {
         let shared_backend = std::sync::Arc::new(std::sync::Mutex::new(backend));
         Self {
             id: id.clone(),
-            title,
+            title: title.clone(),
+            dynamic_title: title,
             kind,
             status,
             connected: matches!(kind, TabKind::Local),
@@ -242,7 +249,7 @@ impl TerminalTab {
             backend_initialized: true,
             session: None,
             processor: Processor::new(),
-            term: new_term(100, 30, shared_backend.clone(), id, events),
+            term: new_term(100, 30, shared_backend.clone(), id, events.clone()),
             cols: 100,
             rows: 30,
             backend: shared_backend,
@@ -312,7 +319,7 @@ impl TerminalTab {
         self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
-    pub fn render_snapshot(&self) -> RenderSnapshot {
+    pub fn render_snapshot(&self, keyword_highlight: bool) -> RenderSnapshot {
         let rows = self.rows;
         let cols = self.cols;
         let content = self.term.renderable_content();
@@ -341,14 +348,14 @@ impl TerminalTab {
             });
         }
 
-        // 读取进程级缓存的关键词高亮开关（避免每帧磁盘读 ConfigStore::load()）
-        let is_enabled = crate::session::config::ConfigStore::keyword_highlight_cached();
+        // Get highlights from cache or recompute, only if keyword_highlight is enabled.
+        let is_enabled = keyword_highlight;
 
         let highlights = if is_enabled {
             let mut cache = self.highlight_cache.borrow_mut();
-            let cache_valid = cache.as_ref().is_some_and(|(cached_cells, _)| {
-                cached_cells == &cells
-            });
+            let cache_valid = cache
+                .as_ref()
+                .is_some_and(|(cached_cells, _)| cached_cells == &cells);
             if cache_valid {
                 cache.as_ref().unwrap().1.clone()
             } else {
@@ -509,7 +516,10 @@ fn viewport_selection_from_range(
     } = selection.as_ref().copied()?;
 
     let top_point = viewport_to_point(display_offset, Point::new(0, Column(0)));
-    let bottom_point = viewport_to_point(display_offset, Point::new(rows.saturating_sub(1), Column(0)));
+    let bottom_point = viewport_to_point(
+        display_offset,
+        Point::new(rows.saturating_sub(1), Column(0)),
+    );
 
     let top_line = top_point.line;
     let bottom_line = bottom_point.line;
@@ -527,7 +537,10 @@ fn viewport_selection_from_range(
     } else if end.line > bottom_line {
         Point::new(rows.saturating_sub(1), Column(cols.saturating_sub(1)))
     } else {
-        point_to_viewport(display_offset, end).unwrap_or(Point::new(rows.saturating_sub(1), Column(cols.saturating_sub(1))))
+        point_to_viewport(display_offset, end).unwrap_or(Point::new(
+            rows.saturating_sub(1),
+            Column(cols.saturating_sub(1)),
+        ))
     };
 
     Some(ViewportSelection {

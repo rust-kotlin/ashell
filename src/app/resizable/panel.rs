@@ -4,17 +4,15 @@ use std::{
 };
 
 use gpui::{
-    Along, AnyElement, App, Axis, Bounds, Context, Element, ElementId, Empty, Entity,
-    EventEmitter, InteractiveElement as _, IntoElement, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Render, RenderOnce, Style, StyleRefinement, Styled, Window, div,
-    prelude::FluentBuilder, AppContext as _, IsZero as _,
+    Along, AnyElement, App, AppContext as _, Axis, Bounds, Context, Element, ElementId, Empty,
+    Entity, EventEmitter, InteractiveElement as _, IntoElement, IsZero as _, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Render, RenderOnce, Style, StyleRefinement, Styled,
+    Window, div, prelude::FluentBuilder,
 };
 
-use gpui_component::{
-    AxisExt, ElementExt, h_flex, v_flex, StyledExt,
-};
+use gpui_component::{AxisExt, ElementExt, StyledExt, h_flex, v_flex};
 
-use super::{ResizableState, resizable_panel, resize_handle, PANEL_MIN_SIZE, ResizablePanelEvent};
+use super::{PANEL_MIN_SIZE, ResizablePanelEvent, ResizableState, resizable_panel, resize_handle};
 
 #[derive(Clone)]
 pub(crate) struct DragPanel;
@@ -305,16 +303,13 @@ impl RenderOnce for ResizablePanel {
                 let handle = if self.locked {
                     handle
                 } else {
-                    handle.on_drag(
-                        DragPanel,
-                        move |drag_panel, _, _, cx| {
-                            cx.stop_propagation();
-                            state.update(cx, |state, _| {
-                                state.resizing_panel_ix = Some(ix);
-                            });
-                            cx.new(|_| drag_panel.deref().clone())
-                        },
-                    )
+                    handle.on_drag(DragPanel, move |drag_panel, _, _, cx| {
+                        cx.stop_propagation();
+                        state.update(cx, |state, _| {
+                            state.resizing_panel_ix = Some(ix);
+                        });
+                        cx.new(|_| drag_panel.deref().clone())
+                    })
                 };
                 this.child(handle)
             })

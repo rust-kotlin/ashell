@@ -17,7 +17,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) static USING_SYSTEM_MAPLE: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn load_fonts(cx: &mut App) -> Result<()> {
-    let has_system_maple = cx.text_system().all_font_names().contains(&"Maple Mono NF CN".to_string());
+    let has_system_maple = cx
+        .text_system()
+        .all_font_names()
+        .contains(&"Maple Mono NF CN".to_string());
     if has_system_maple {
         USING_SYSTEM_MAPLE.store(true, Ordering::Relaxed);
     } else {

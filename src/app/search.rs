@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
 use gpui::{
-    Context, Focusable as _, Hsla, IntoElement, InteractiveElement as _, MouseButton,
+    Context, Focusable as _, Hsla, InteractiveElement as _, IntoElement, MouseButton,
     ParentElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px, rems,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
-    h_flex, input::Input,
+    h_flex,
+    input::Input,
 };
 use rust_i18n::t;
 
@@ -214,7 +215,7 @@ impl Ashell {
         };
 
         if let Some(tab) = tab {
-            let snapshot = tab.render_snapshot();
+            let snapshot = tab.render_snapshot(false);
             let display_offset = snapshot.display_offset as i32;
             let rows = snapshot.rows as i32;
 
@@ -274,7 +275,7 @@ impl Ashell {
         let Some(tab) = tab else {
             return None;
         };
-        let snapshot = tab.render_snapshot();
+        let snapshot = tab.render_snapshot(false);
         let display_offset = snapshot.display_offset as i32;
         let rows = snapshot.rows as i32;
 
@@ -323,23 +324,19 @@ impl Ashell {
     }
 
     /// Render the search button (used in the tab bar).
-    pub(crate) fn render_search_button(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> impl gpui::IntoElement {
+    pub(crate) fn render_search_button(&self, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         // Wrap in a div so .hover() doesn't conflict with Button's internal hover.
-        div()
-            .child(
-                Button::new("search-btn")
-                    .ghost()
-                    .small()
-                    .rounded(px(999.))
-                    .icon(IconName::Search)
-                    .tooltip(t!("search").to_string())
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_search(window, cx);
-                    })),
-            )
+        div().child(
+            Button::new("search-btn")
+                .ghost()
+                .small()
+                .rounded(px(999.))
+                .icon(IconName::Search)
+                .tooltip(t!("search").to_string())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_search(window, cx);
+                })),
+        )
     }
 
     /// Render the expanded search bar overlay (when search is active).
@@ -369,10 +366,13 @@ impl Ashell {
                     this.search_bar_bounds = Some(bounds);
                 });
             })
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                this.refocus_search_input(window, cx);
-                cx.stop_propagation();
-            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.refocus_search_input(window, cx);
+                    cx.stop_propagation();
+                }),
+            )
             .child(
                 h_flex()
                     .gap_1()
@@ -385,13 +385,15 @@ impl Ashell {
                     .child(
                         div()
                             .w(px(200.))
-                            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                                if event.keystroke.key.as_str() == "escape" {
-                                    this.close_search(window, cx);
-                                    window.prevent_default();
-                                    cx.stop_propagation();
-                                }
-                            }))
+                            .on_key_down(cx.listener(
+                                |this, event: &gpui::KeyDownEvent, window, cx| {
+                                    if event.keystroke.key.as_str() == "escape" {
+                                        this.close_search(window, cx);
+                                        window.prevent_default();
+                                        cx.stop_propagation();
+                                    }
+                                },
+                            ))
                             .child(Input::new(&self.search_input).small()),
                     )
                     .when(!current_display.is_empty(), |this| {

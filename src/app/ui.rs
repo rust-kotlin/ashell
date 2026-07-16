@@ -1,12 +1,13 @@
 use crate::app::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui::{
-    canvas, div, hsla, point, prelude::FluentBuilder as _, px, relative, rems, uniform_list,
-    Context, DispatchPhase, ElementId, Focusable as _, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement as _, PathBuilder, Pixels, Render,
-    StatefulInteractiveElement as _, Styled as _, Window,
+    Context, DispatchPhase, ElementId, Focusable as _, FontWeight, Hsla, InteractiveElement as _,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
+    PathBuilder, Pixels, Render, StatefulInteractiveElement as _, Styled as _, Window, canvas, div,
+    hsla, point, prelude::FluentBuilder as _, px, relative, rems, uniform_list,
 };
 use gpui_component::{
+    ActiveTheme, Disableable as _, ElementExt, Icon, IconName, InteractiveElementExt as _, Root,
+    Sizable as _, Size,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -15,19 +16,18 @@ use gpui_component::{
     progress::Progress,
     scroll::{ScrollableElement as _, Scrollbar, ScrollbarShow},
     tab::{Tab, TabBar},
-    v_flex, ActiveTheme, Disableable as _, ElementExt, Icon, IconName, InteractiveElementExt as _,
-    Root, Sizable as _, Size,
+    v_flex,
 };
 use rust_i18n::t;
 
 use crate::{
-    app::constants::{COLLAPSED_SIDEBAR_WIDTH, SIDEBAR_WIDTH, TERMINAL_KEY_CONTEXT},
+    Ashell, PaneLayout,
     app::TabContextMenuState,
+    app::constants::{COLLAPSED_SIDEBAR_WIDTH, SIDEBAR_WIDTH, TERMINAL_KEY_CONTEXT},
     sftp::format_mtime,
     sftp::ops::is_editable_text_file,
     system::format_bytes,
-    terminal::{self, TabKind, TerminalTab},
-    Ashell, PaneLayout,
+    terminal::{self, TabKind},
 };
 
 impl Ashell {
@@ -198,6 +198,17 @@ impl Ashell {
             .when_some(active_sftp.clone(), |this, sftp| {
                 let selected_entries = sftp.selected_entries.clone();
                 this.child(
+                    Button::new("sftp-sync-cwd")
+                        .ghost()
+                        .small()
+                        .icon(IconName::SquareTerminal)
+                        .label(t!("sync_cwd").to_string())
+                        .tooltip(t!("sync_cwd_tooltip").to_string())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.sync_cwd_from_terminal(window, cx);
+                        })),
+                )
+                .child(
                     Button::new("sftp-refresh")
                         .ghost()
                         .small()
@@ -2483,41 +2494,42 @@ impl Ashell {
             .when(
                 self.incoming_tab_drag.is_some() || self.tab_drag.merge_target().is_some(),
                 |this| {
-                this.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .bottom_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .px(px(20.))
-                                .py(px(12.))
-                                .rounded_lg()
-                                .border_2()
-                                .border_color(card_border)
-                                .bg(card_bg)
-                                .shadow_lg()
-                                .text_color(card_text)
-                                .child(
-                                    Icon::new(IconName::ArrowDown)
-                                        .with_size(Size::Small)
-                                        .text_color(card_text),
-                                )
-                                .child(
-                                    div()
-                                        .text_base()
-                                        .font_weight(FontWeight::BOLD)
-                                        .child(t!("drag_merge_hint").to_string()),
-                                ),
-                        ),
-                )
-            })
+                    this.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .px(px(20.))
+                                    .py(px(12.))
+                                    .rounded_lg()
+                                    .border_2()
+                                    .border_color(card_border)
+                                    .bg(card_bg)
+                                    .shadow_lg()
+                                    .text_color(card_text)
+                                    .child(
+                                        Icon::new(IconName::ArrowDown)
+                                            .with_size(Size::Small)
+                                            .text_color(card_text),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(t!("drag_merge_hint").to_string()),
+                                    ),
+                            ),
+                    )
+                },
+            )
     }
 
     fn render_pane_tree(
@@ -2532,11 +2544,12 @@ impl Ashell {
                     return this.render_home_page(cx).into_any_element();
                 }
                 let is_focused = path == this.focused_pane_path.as_slice();
+                let keyword_highlight = this.config.keyword_highlight();
                 let snapshot = this
                     .tabs
                     .iter()
                     .find(|t| &t.id == tab_id)
-                    .map(TerminalTab::render_snapshot);
+                    .map(|t| t.render_snapshot(keyword_highlight));
                 let Some(snapshot) = snapshot else {
                     return div().into_any_element();
                 };
@@ -2735,11 +2748,7 @@ impl Ashell {
                         items.push(
                             div()
                                 .flex_grow(if children.len() == 2 {
-                                    if i == 0 {
-                                        *ratio
-                                    } else {
-                                        1.0 - *ratio
-                                    }
+                                    if i == 0 { *ratio } else { 1.0 - *ratio }
                                 } else {
                                     1.0
                                 })
@@ -2789,11 +2798,7 @@ impl Ashell {
                     items.push(
                         div()
                             .flex_grow(if children.len() == 2 {
-                                if i == 0 {
-                                    *ratio
-                                } else {
-                                    1.0 - *ratio
-                                }
+                                if i == 0 { *ratio } else { 1.0 - *ratio }
                             } else {
                                 1.0
                             })
@@ -2822,24 +2827,20 @@ impl Render for Ashell {
 
         let view = cx.entity();
         let move_view = view.clone();
-        window.on_mouse_event(
-            move |event: &MouseMoveEvent, phase, window, cx| {
-                if phase == DispatchPhase::Capture {
-                    let _ = move_view.update(cx, |this, cx| {
-                        this.on_tab_drag_mouse_move(event, window, cx);
-                    });
-                }
-            },
-        );
-        window.on_mouse_event(
-            move |event: &MouseUpEvent, phase, window, cx| {
-                if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
-                    let _ = view.update(cx, |this, cx| {
-                        this.on_tab_drag_mouse_up(event, window, cx);
-                    });
-                }
-            },
-        );
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+            if phase == DispatchPhase::Capture {
+                let _ = move_view.update(cx, |this, cx| {
+                    this.on_tab_drag_mouse_move(event, window, cx);
+                });
+            }
+        });
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+            if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                let _ = view.update(cx, |this, cx| {
+                    this.on_tab_drag_mouse_up(event, window, cx);
+                });
+            }
+        });
 
         // Refresh this window's screen-space bounds in the cross-window
         // registry so other windows can hit-test against it during a

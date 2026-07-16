@@ -1,9 +1,9 @@
 use std::{cell::Cell, rc::Rc};
 
 use gpui::{
-    div, prelude::FluentBuilder as _, px, AnyElement, App, Axis, Element, ElementId, Entity,
-    GlobalElementId, InteractiveElement, IntoElement, MouseDownEvent, MouseUpEvent,
-    ParentElement as _, Pixels, Point, Render, StatefulInteractiveElement, Styled as _, Window,
+    AnyElement, App, Axis, Element, ElementId, Entity, GlobalElementId, InteractiveElement,
+    IntoElement, MouseDownEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render,
+    StatefulInteractiveElement, Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 
 use gpui_component::{ActiveTheme as _, AxisExt as _, dock::DockPlacement};
@@ -126,14 +126,13 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
                     )
                 })
                 .map(|this| match self.placement {
-                    Some(DockPlacement::Left) => {
-                        this.when(has_drag, |this| this.cursor_col_resize())
-                            .top_0()
-                            .right(px(1.))
-                            .h_full()
-                            .w(HANDLE_SIZE)
-                            .pl(HANDLE_PADDING)
-                    }
+                    Some(DockPlacement::Left) => this
+                        .when(has_drag, |this| this.cursor_col_resize())
+                        .top_0()
+                        .right(px(1.))
+                        .h_full()
+                        .w(HANDLE_SIZE)
+                        .pl(HANDLE_PADDING),
                     _ => this
                         .when(axis.is_horizontal(), |this| {
                             this.when(has_drag, |this| this.cursor_col_resize())

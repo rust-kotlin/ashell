@@ -887,8 +887,7 @@ async fn connect_and_authenticate(
                 let passphrase = session.passphrase.trim();
                 let passphrase = (!passphrase.is_empty()).then_some(passphrase);
                 let success =
-                    authenticate_with_default_keys(&mut handle, &session.user, passphrase)
-                        .await?;
+                    authenticate_with_default_keys(&mut handle, &session.user, passphrase).await?;
                 if !success {
                     return Err(anyhow!(
                         "public key authentication failed for {}@{}:{} - no valid default key found in ~/.ssh/",
@@ -941,8 +940,7 @@ async fn connect_and_authenticate(
                 let passphrase = session.passphrase.trim();
                 let passphrase = (!passphrase.is_empty()).then_some(passphrase);
                 let success =
-                    authenticate_with_default_keys(&mut handle, &session.user, passphrase)
-                        .await?;
+                    authenticate_with_default_keys(&mut handle, &session.user, passphrase).await?;
                 if !success {
                     return Err(anyhow!(
                         "ssh-config authentication failed for {}@{}:{} - no valid default key found",

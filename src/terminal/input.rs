@@ -392,7 +392,12 @@ impl Ashell {
         if let Some((row, col, _side)) = self.terminal_grid_point_and_side(event.position) {
             if let Some(snapshot) = self.active_snapshot() {
                 if let Some(active_id) = &self.active_tab {
-                    if let Some((url, url_cells)) = crate::terminal::highlight::find_url_at_cell(&snapshot.cells, snapshot.rows, row, col) {
+                    if let Some((url, url_cells)) = crate::terminal::highlight::find_url_at_cell(
+                        &snapshot.cells,
+                        snapshot.rows,
+                        row,
+                        col,
+                    ) {
                         hovered_url = Some(crate::app::HoveredUrl {
                             url,
                             tab_id: active_id.clone(),
@@ -402,7 +407,7 @@ impl Ashell {
                 }
             }
         }
-        
+
         if self.hovered_url != hovered_url || self.cmd_ctrl_pressed != cmd_ctrl_pressed {
             self.hovered_url = hovered_url;
             self.cmd_ctrl_pressed = cmd_ctrl_pressed;

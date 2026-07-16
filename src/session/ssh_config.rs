@@ -177,4 +177,3 @@ mod tests {
         assert_eq!(entries[1].hostname, "5.6.7.8");
     }
 }
-

@@ -1,10 +1,14 @@
-use std::{
-    fs, path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result};
+use argon2::Argon2;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use chacha20poly1305::{
+    XChaCha20Poly1305, XNonce,
+    aead::{Aead, KeyInit},
+};
 use directories::BaseDirs;
+use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -361,14 +365,6 @@ pub struct ConfigStore {
     cache: ConfigFile,
 }
 
-/// 进程级缓存：关键词高亮是否启用。
-///
-/// 此前 `TerminalTab::render_snapshot()` 每帧都会调用 `ConfigStore::load()`
-/// 从磁盘读取配置文件来判断是否启用关键词高亮——活动终端每帧 2-4 次磁盘 I/O。
-/// 改为在此原子变量中缓存，仅在 `load()` / `set_keyword_highlight()` 时更新，
-/// 渲染路径通过 [`ConfigStore::keyword_highlight_cached`] 零成本读取。
-static KEYWORD_HIGHLIGHT_CACHED: AtomicBool = AtomicBool::new(false);
-
 impl ConfigStore {
     pub fn load() -> Result<Self> {
         let path = Self::config_path()?;
@@ -391,26 +387,33 @@ impl ConfigStore {
         }
 
         let mut cache = if path.exists() {
-            let raw = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            match serde_json::from_str::<ConfigFile>(&raw) {
+            let raw_bytes =
+                fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+            let hardware_uuid = get_hardware_uuid();
+            match decrypt_config(&raw_bytes, &hardware_uuid) {
                 Ok(cache) => cache,
-                Err(err) => {
-                    let backup_path = path.with_extension("json.bak");
-                    if let Err(backup_err) = fs::write(&backup_path, raw.as_bytes()) {
-                        tracing::warn!(
-                            "failed to parse config {}; backup to {} also failed: {backup_err:#}; parse error: {err:#}",
-                            path.display(),
-                            backup_path.display(),
-                        );
-                    } else {
-                        tracing::warn!(
-                            "failed to parse config {}; backed up the original to {} and loaded defaults: {err:#}",
-                            path.display(),
-                            backup_path.display(),
-                        );
+                Err(decrypt_err) => {
+                    // Fallback to plain text JSON if decryption/parsing failed
+                    match serde_json::from_slice::<ConfigFile>(&raw_bytes) {
+                        Ok(cache) => cache,
+                        Err(json_err) => {
+                            let backup_path = path.with_extension("json.bak");
+                            if let Err(backup_err) = fs::write(&backup_path, &raw_bytes) {
+                                tracing::warn!(
+                                    "failed to parse config {} (decrypt err: {decrypt_err:#}, json err: {json_err:#}); backup to {} also failed: {backup_err:#}",
+                                    path.display(),
+                                    backup_path.display(),
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "failed to parse config {} (decrypt err: {decrypt_err:#}, json err: {json_err:#}); backed up the original to {} and loaded defaults",
+                                    path.display(),
+                                    backup_path.display(),
+                                );
+                            }
+                            ConfigFile::default()
+                        }
                     }
-                    ConfigFile::default()
                 }
             }
         } else {
@@ -420,8 +423,6 @@ impl ConfigStore {
         if cache.sync_device_id.is_empty() {
             cache.sync_device_id = Uuid::new_v4().to_string();
         }
-        // 同步进程级缓存，避免渲染路径每帧磁盘读
-        KEYWORD_HIGHLIGHT_CACHED.store(cache.keyword_highlight, Ordering::Relaxed);
         Ok(Self { path, cache })
     }
 
@@ -680,14 +681,8 @@ impl ConfigStore {
         self.cache.keyword_highlight
     }
 
-    /// 读取进程级缓存的关键词高亮开关，供渲染热路径使用（零分配、零磁盘 I/O）。
-    pub fn keyword_highlight_cached() -> bool {
-        KEYWORD_HIGHLIGHT_CACHED.load(Ordering::Relaxed)
-    }
-
     pub fn set_keyword_highlight(&mut self, val: bool) {
         self.cache.keyword_highlight = val;
-        KEYWORD_HIGHLIGHT_CACHED.store(val, Ordering::Relaxed);
     }
 
     pub fn terminal_font_family(&self) -> &str {
@@ -820,12 +815,7 @@ impl ConfigStore {
     }
 
     pub fn upsert_managed_key(&mut self, key: ManagedKey) {
-        if let Some(existing) = self
-            .cache
-            .managed_keys
-            .iter_mut()
-            .find(|k| k.id == key.id)
-        {
+        if let Some(existing) = self.cache.managed_keys.iter_mut().find(|k| k.id == key.id) {
             *existing = key;
         } else {
             self.cache.managed_keys.push(key);
@@ -846,8 +836,9 @@ impl ConfigStore {
         if self.path.as_os_str().is_empty() {
             return Ok(());
         }
-        let raw = serde_json::to_string_pretty(&self.cache)?;
-        fs::write(&self.path, raw)
+        let hardware_uuid = get_hardware_uuid();
+        let encrypted_bytes = encrypt_config(&self.cache, &hardware_uuid)?;
+        fs::write(&self.path, encrypted_bytes)
             .with_context(|| format!("failed to write {}", self.path.display()))?;
 
         #[cfg(unix)]
@@ -886,118 +877,126 @@ pub struct EnvProxy {
 pub static ENV_PROXY: OnceLock<Option<EnvProxy>> = OnceLock::new();
 
 pub async fn connect_proxy(session: &Session) -> Result<Box<dyn ProxyStream>> {
-    let target_host = &session.host;
+    let target_host = session.host.clone();
     let target_port = session.port;
+    let session = session.clone();
 
-    let config = ConfigStore::load().unwrap_or_else(|_| ConfigStore::in_memory());
-    let (proxy_type, proxy_host, proxy_port, proxy_user, proxy_password) = {
-        if !session.proxy_type.is_empty() && session.proxy_type != "none" {
-            (
-                session.proxy_type.clone(),
-                session.proxy_host.clone(),
-                session.proxy_port,
-                session.proxy_user.clone(),
-                session.proxy_password.clone(),
-            )
-        } else if config.cache.read_env_proxy
-            && ENV_PROXY.get().and_then(|opt| opt.as_ref()).is_some()
-        {
-            let env_p = ENV_PROXY.get().and_then(|opt| opt.as_ref()).unwrap();
-            (
-                env_p.proxy_type.clone(),
-                env_p.host.clone(),
-                env_p.port,
-                env_p.user.clone(),
-                env_p.pass.clone(),
-            )
-        } else if config.cache.use_proxy {
-            (
-                config.cache.global_proxy_type.clone(),
-                config.cache.global_proxy_host.clone(),
-                config.cache.global_proxy_port,
-                config.cache.global_proxy_user.clone(),
-                config.cache.global_proxy_password.clone(),
-            )
-        } else {
-            (
-                "none".to_string(),
-                String::new(),
-                None,
-                String::new(),
-                String::new(),
-            )
+    let connect_fut = async move {
+        let target_host = &target_host;
+        let config = ConfigStore::load().unwrap_or_else(|_| ConfigStore::in_memory());
+        let (proxy_type, proxy_host, proxy_port, proxy_user, proxy_password) = {
+            if !session.proxy_type.is_empty() && session.proxy_type != "none" {
+                (
+                    session.proxy_type.clone(),
+                    session.proxy_host.clone(),
+                    session.proxy_port,
+                    session.proxy_user.clone(),
+                    session.proxy_password.clone(),
+                )
+            } else if config.cache.read_env_proxy
+                && ENV_PROXY.get().and_then(|opt| opt.as_ref()).is_some()
+            {
+                let env_p = ENV_PROXY.get().and_then(|opt| opt.as_ref()).unwrap();
+                (
+                    env_p.proxy_type.clone(),
+                    env_p.host.clone(),
+                    env_p.port,
+                    env_p.user.clone(),
+                    env_p.pass.clone(),
+                )
+            } else if config.cache.use_proxy {
+                (
+                    config.cache.global_proxy_type.clone(),
+                    config.cache.global_proxy_host.clone(),
+                    config.cache.global_proxy_port,
+                    config.cache.global_proxy_user.clone(),
+                    config.cache.global_proxy_password.clone(),
+                )
+            } else {
+                (
+                    "none".to_string(),
+                    String::new(),
+                    None,
+                    String::new(),
+                    String::new(),
+                )
+            }
+        };
+
+        if proxy_type != "none" && (proxy_host.is_empty() || proxy_port.is_none()) {
+            let addr = format!("{}:{}", target_host, target_port);
+            let stream = tokio::net::TcpStream::connect(&addr).await?;
+            return Ok(Box::new(stream) as Box<dyn ProxyStream>);
+        }
+
+        match proxy_type.as_str() {
+            "socks5" | "socks5h" => {
+                let proxy_port = proxy_port.unwrap_or(1080);
+                let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
+
+                if !proxy_user.is_empty() {
+                    let stream = tokio_socks::tcp::Socks5Stream::connect_with_password(
+                        proxy_addr.as_str(),
+                        (target_host.as_str(), target_port),
+                        &proxy_user,
+                        &proxy_password,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("SOCKS5 proxy connection failed: {}", e))?;
+                    Ok(Box::new(stream) as Box<dyn ProxyStream>)
+                } else {
+                    let stream = tokio_socks::tcp::Socks5Stream::connect(
+                        proxy_addr.as_str(),
+                        (target_host.as_str(), target_port),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("SOCKS5 proxy connection failed: {}", e))?;
+                    Ok(Box::new(stream) as Box<dyn ProxyStream>)
+                }
+            }
+            "http" => {
+                let proxy_port = proxy_port.unwrap_or(8080);
+                let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
+
+                use tokio::io::AsyncWriteExt;
+                let mut stream = tokio::net::TcpStream::connect(&proxy_addr)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("HTTP proxy connection failed: {}", e))?;
+
+                let mut request = format!(
+                    "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n",
+                    target_host, target_port, target_host, target_port
+                );
+                if !proxy_user.is_empty() {
+                    use base64::Engine as _;
+                    let auth = format!("{}:{}", proxy_user, proxy_password);
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(auth);
+                    request.push_str(&format!("Proxy-Authorization: Basic {}\r\n", encoded));
+                }
+                request.push_str("\r\n");
+
+                stream.write_all(request.as_bytes()).await?;
+
+                let mut response = [0u8; 1024];
+                let n = tokio::io::AsyncReadExt::read(&mut stream, &mut response).await?;
+                let resp_str = String::from_utf8_lossy(&response[..n]);
+                if !resp_str.contains("200") && !resp_str.contains("established") {
+                    return Err(anyhow::anyhow!("HTTP proxy CONNECT failed: {}", resp_str));
+                }
+
+                Ok(Box::new(stream) as Box<dyn ProxyStream>)
+            }
+            _ => {
+                let addr = format!("{}:{}", target_host, target_port);
+                let stream = tokio::net::TcpStream::connect(&addr).await?;
+                Ok(Box::new(stream) as Box<dyn ProxyStream>)
+            }
         }
     };
 
-    if proxy_type != "none" && (proxy_host.is_empty() || proxy_port.is_none()) {
-        let addr = format!("{}:{}", target_host, target_port);
-        let stream = tokio::net::TcpStream::connect(&addr).await?;
-        return Ok(Box::new(stream));
-    }
-
-    match proxy_type.as_str() {
-        "socks5" | "socks5h" => {
-            let proxy_port = proxy_port.unwrap_or(1080);
-            let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
-
-            if !proxy_user.is_empty() {
-                let stream = tokio_socks::tcp::Socks5Stream::connect_with_password(
-                    proxy_addr.as_str(),
-                    (target_host.as_str(), target_port),
-                    &proxy_user,
-                    &proxy_password,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("SOCKS5 proxy connection failed: {}", e))?;
-                Ok(Box::new(stream))
-            } else {
-                let stream = tokio_socks::tcp::Socks5Stream::connect(
-                    proxy_addr.as_str(),
-                    (target_host.as_str(), target_port),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("SOCKS5 proxy connection failed: {}", e))?;
-                Ok(Box::new(stream))
-            }
-        }
-        "http" => {
-            let proxy_port = proxy_port.unwrap_or(8080);
-            let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
-
-            use tokio::io::AsyncWriteExt;
-            let mut stream = tokio::net::TcpStream::connect(&proxy_addr)
-                .await
-                .map_err(|e| anyhow::anyhow!("HTTP proxy connection failed: {}", e))?;
-
-            let mut request = format!(
-                "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n",
-                target_host, target_port, target_host, target_port
-            );
-            if !proxy_user.is_empty() {
-                use base64::Engine as _;
-                let auth = format!("{}:{}", proxy_user, proxy_password);
-                let encoded = base64::engine::general_purpose::STANDARD.encode(auth);
-                request.push_str(&format!("Proxy-Authorization: Basic {}\r\n", encoded));
-            }
-            request.push_str("\r\n");
-
-            stream.write_all(request.as_bytes()).await?;
-
-            let mut response = [0u8; 1024];
-            let n = tokio::io::AsyncReadExt::read(&mut stream, &mut response).await?;
-            let resp_str = String::from_utf8_lossy(&response[..n]);
-            if !resp_str.contains("200") && !resp_str.contains("established") {
-                return Err(anyhow::anyhow!("HTTP proxy CONNECT failed: {}", resp_str));
-            }
-
-            Ok(Box::new(stream))
-        }
-        _ => {
-            let addr = format!("{}:{}", target_host, target_port);
-            let stream = tokio::net::TcpStream::connect(&addr).await?;
-            Ok(Box::new(stream))
-        }
-    }
+    tokio::time::timeout(std::time::Duration::from_secs(16), connect_fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("connection timed out after 16 seconds"))?
 }
 
 pub fn active_proxy(session: &Session) -> Option<(String, String, Option<u16>)> {
@@ -1045,5 +1044,191 @@ pub fn active_proxy(session: &Session) -> Option<(String, String, Option<u16>)> 
         Some((proxy_type, proxy_host, proxy_port))
     } else {
         None
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EncryptedConfigEnvelope {
+    format_version: u32,
+    kdf: String,
+    cipher: String,
+    salt: String,
+    nonce: String,
+    payload: String,
+}
+
+fn get_hardware_uuid() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("ioreg")
+            .args(&["-rd1", "-c", "IOPlatformExpertDevice"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if line.contains("IOPlatformUUID") {
+                    if let Some(uuid) = line.split('"').nth(3) {
+                        let uuid = uuid.trim().to_string();
+                        if !uuid.is_empty() {
+                            return uuid;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(uuid) = std::fs::read_to_string("/sys/class/dmi/id/product_uuid") {
+            let uuid = uuid.trim().to_string();
+            if !uuid.is_empty() {
+                return uuid;
+            }
+        }
+        if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
+            let id = id.trim().to_string();
+            if !id.is_empty() {
+                return id;
+            }
+        }
+        if let Ok(id) = std::fs::read_to_string("/var/lib/dbus/machine-id") {
+            let id = id.trim().to_string();
+            if !id.is_empty() {
+                return id;
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(output) = std::process::Command::new("reg")
+            .args(&[
+                "query",
+                "HKLM\\SOFTWARE\\Microsoft\\Cryptography",
+                "/v",
+                "MachineGuid",
+            ])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if line.contains("MachineGuid") {
+                    if let Some(guid) = line.split_whitespace().last() {
+                        let guid = guid.trim().to_string();
+                        if !guid.is_empty() {
+                            return guid;
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(output) = std::process::Command::new("wmic")
+            .args(&["csproduct", "get", "uuid"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let lines: Vec<&str> = stdout.lines().collect();
+            if lines.len() >= 2 {
+                let uuid = lines[1].trim().to_string();
+                if !uuid.is_empty() {
+                    return uuid;
+                }
+            }
+        }
+    }
+
+    "ashell-default-hardware-uuid-fallback".to_string()
+}
+
+fn encrypt_config(config: &ConfigFile, password: &str) -> Result<Vec<u8>> {
+    let mut salt = [0u8; 16];
+    let mut nonce = [0u8; 24];
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut nonce);
+
+    let mut key = [0u8; 32];
+    Argon2::default()
+        .hash_password_into(password.as_bytes(), &salt, &mut key)
+        .map_err(|err| anyhow::anyhow!("derive encryption key: {err}"))?;
+
+    let plaintext = serde_json::to_vec(config).context("serialize config")?;
+    let ciphertext = XChaCha20Poly1305::new((&key).into())
+        .encrypt(XNonce::from_slice(&nonce), plaintext.as_ref())
+        .map_err(|_| anyhow::anyhow!("encrypt config payload"))?;
+
+    serde_json::to_vec_pretty(&EncryptedConfigEnvelope {
+        format_version: 1,
+        kdf: "argon2id".to_string(),
+        cipher: "xchacha20poly1305".to_string(),
+        salt: STANDARD.encode(salt),
+        nonce: STANDARD.encode(nonce),
+        payload: STANDARD.encode(ciphertext),
+    })
+    .context("serialize encrypted config envelope")
+}
+
+fn decrypt_config(raw: &[u8], password: &str) -> Result<ConfigFile> {
+    let envelope: EncryptedConfigEnvelope =
+        serde_json::from_slice(raw).context("parse encrypted config envelope")?;
+    if envelope.format_version != 1
+        || envelope.kdf != "argon2id"
+        || envelope.cipher != "xchacha20poly1305"
+    {
+        return Err(anyhow::anyhow!("unsupported encrypted config format"));
+    }
+    let salt = STANDARD
+        .decode(envelope.salt)
+        .context("decode config salt")?;
+    let nonce = STANDARD
+        .decode(envelope.nonce)
+        .context("decode config nonce")?;
+    if nonce.len() != 24 {
+        return Err(anyhow::anyhow!("invalid config nonce"));
+    }
+    let ciphertext = STANDARD
+        .decode(envelope.payload)
+        .context("decode encrypted config payload")?;
+
+    let mut key = [0u8; 32];
+    Argon2::default()
+        .hash_password_into(password.as_bytes(), &salt, &mut key)
+        .map_err(|err| anyhow::anyhow!("derive encryption key: {err}"))?;
+
+    let plaintext = XChaCha20Poly1305::new((&key).into())
+        .decrypt(XNonce::from_slice(&nonce), ciphertext.as_ref())
+        .map_err(|_| {
+            anyhow::anyhow!("cannot decrypt config; hardware UUID mismatch or corrupted data")
+        })?;
+
+    serde_json::from_slice(&plaintext).context("parse decrypted config")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_hardware_uuid() {
+        let uuid = get_hardware_uuid();
+        assert!(!uuid.is_empty());
+    }
+
+    #[test]
+    fn test_config_encryption_roundtrip() {
+        let config = ConfigFile::default();
+        let password = "test-password-123";
+        let encrypted = encrypt_config(&config, password).unwrap();
+
+        // Ensure it doesn't contain plain text fields of default config
+        let encrypted_str = String::from_utf8_lossy(&encrypted);
+        assert!(!encrypted_str.contains("Maple Mono NF CN"));
+        assert!(encrypted_str.contains("argon2id"));
+
+        let decrypted = decrypt_config(&encrypted, password).unwrap();
+        assert_eq!(decrypted.terminal_font_family, config.terminal_font_family);
+
+        // Decrypt with wrong password should fail
+        assert!(decrypt_config(&encrypted, "wrong-password").is_err());
     }
 }

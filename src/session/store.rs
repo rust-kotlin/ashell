@@ -78,13 +78,10 @@ impl SessionStore {
     }
 
     pub(crate) fn release(&mut self, session_id: &str, owner_id: WindowOwnerId) -> bool {
-        let should_close = self
-            .references
-            .get_mut(session_id)
-            .is_some_and(|owners| {
-                owners.remove(&owner_id);
-                owners.is_empty()
-            });
+        let should_close = self.references.get_mut(session_id).is_some_and(|owners| {
+            owners.remove(&owner_id);
+            owners.is_empty()
+        });
         if !should_close {
             return false;
         }

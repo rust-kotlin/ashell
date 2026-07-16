@@ -6,7 +6,8 @@ pub mod store;
 use std::collections::{HashMap, HashSet};
 
 use gpui::{
-    AppContext as _, AnyWindowHandle, Context, Entity, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Window, px,
+    AnyWindowHandle, AppContext as _, Context, Entity, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Window, px,
 };
 use gpui_component::{Theme, WindowExt as _, input::InputState};
 use rust_i18n::t;
@@ -42,12 +43,7 @@ impl Ashell {
     pub(crate) fn open_local(&mut self, cx: &mut Context<Self>) {
         let id = Uuid::new_v4().to_string();
         let events = self.backend_events_sender(cx);
-        match local::spawn_local_terminal(
-            id.clone(),
-            DEFAULT_COLS,
-            DEFAULT_ROWS,
-            events.clone(),
-        ) {
+        match local::spawn_local_terminal(id.clone(), DEFAULT_COLS, DEFAULT_ROWS, events.clone()) {
             Ok(backend) => {
                 let title = if cfg!(windows) { "PowerShell" } else { "Local" }.to_string();
                 let mut tab = TerminalTab::new_local(id.clone(), title, backend, events);
@@ -217,9 +213,9 @@ impl Ashell {
         self.ssh_auth_method = session.auth;
         // Restore managed key selection or custom path mode.
         self.managed_key_selected = session.managed_key_id.clone();
-        self.using_custom_key_path =
-            session.auth == AuthMethod::Key && session.managed_key_id.is_none()
-                && !session.private_key_path.is_empty();
+        self.using_custom_key_path = session.auth == AuthMethod::Key
+            && session.managed_key_id.is_none()
+            && !session.private_key_path.is_empty();
         Self::set_input_value(&self.session_name_input, session.name.clone(), window, cx);
         Self::set_input_value(&self.host_input, session.host.clone(), window, cx);
         Self::set_input_value(&self.port_input, session.port.to_string(), window, cx);
@@ -392,7 +388,13 @@ impl Ashell {
         new_name: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(key) = self.config.managed_keys().iter().find(|k| k.id == key_id).cloned() else {
+        let Some(key) = self
+            .config
+            .managed_keys()
+            .iter()
+            .find(|k| k.id == key_id)
+            .cloned()
+        else {
             return;
         };
         let mut updated = key;
@@ -795,12 +797,8 @@ impl Ashell {
         }
         cx.notify();
         self.register_backend_route(group_id.clone(), cx);
-        let sftp_handle = crate::sftp::spawn_sftp(
-            self.runtime.handle(),
-            group_id.clone(),
-            session,
-            events,
-        );
+        let sftp_handle =
+            crate::sftp::spawn_sftp(self.runtime.handle(), group_id.clone(), session, events);
         self.sftp_handles.insert(group_id.clone(), sftp_handle);
         self.active_tab = Some(id.clone());
         self.pending_sftp_path_sync = Some("/".into());
@@ -976,6 +974,13 @@ impl Ashell {
     }
 
     pub(crate) fn handle_tab_close(&mut self, id: String) {
+        if self
+            .connection_progress
+            .as_ref()
+            .map_or(false, |p| p.tab_id == id)
+        {
+            self.connection_progress = None;
+        }
         let group_ix = self
             .tab_groups
             .iter()
@@ -1196,7 +1201,7 @@ impl Ashell {
         self.active_tab
             .as_ref()
             .and_then(|id| self.tabs.iter().find(|t| &t.id == id))
-            .map(TerminalTab::render_snapshot)
+            .map(|t| t.render_snapshot(self.config.keyword_highlight()))
     }
 
     pub(crate) fn active_kind(&self) -> Option<TabKind> {
@@ -1712,11 +1717,7 @@ impl Ashell {
     /// Detach a complete tab group to a new window without recreating its
     /// terminal or SFTP backends. Window creation and route handoff form the
     /// prepare step; any failure restores the original group in place.
-    pub(crate) fn detach_group_to_new_window(
-        &mut self,
-        group_id: &str,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn detach_group_to_new_window(&mut self, group_id: &str, cx: &mut Context<Self>) {
         let source_owner_id = self.session_owner_id;
         let transfer = match self.take_group_transfer(group_id) {
             Ok(transfer) => transfer,
@@ -1870,7 +1871,8 @@ impl Ashell {
 
         let source_handle = window.window_handle();
         let screen_pos = Self::screen_position(window, event.position);
-        let actual_target_window = if cursor_inside_viewport(event.position, window.viewport_size()) {
+        let actual_target_window = if cursor_inside_viewport(event.position, window.viewport_size())
+        {
             None
         } else {
             crate::app::find_window_at_screen_pos(&source_handle, screen_pos)
@@ -2232,11 +2234,7 @@ impl Ashell {
         self.sync_system_tab_to_active_group();
     }
 
-    fn restore_group_transfer(
-        &mut self,
-        mut transfer: GroupTransfer,
-        cx: &mut Context<Self>,
-    ) {
+    fn restore_group_transfer(&mut self, mut transfer: GroupTransfer, cx: &mut Context<Self>) {
         let owner_id = self.session_owner_id;
         self.session_store.update(cx, |store, _| {
             if !store.move_event_routes(&transfer.route_ids, owner_id, owner_id) {
@@ -2260,9 +2258,13 @@ impl Ashell {
             self.active_group = Some(group_id);
             self.pane_root = group_layout;
             self.focused_pane_path.clear();
-            self.active_tab = transfer
-                .active_tab
-                .or_else(|| self.pane_root.tab_ids().first().copied().map(str::to_string));
+            self.active_tab = transfer.active_tab.or_else(|| {
+                self.pane_root
+                    .tab_ids()
+                    .first()
+                    .copied()
+                    .map(str::to_string)
+            });
             if let Some(tab_id) = self.active_tab.clone() {
                 self.focus_pane_with_id(tab_id);
             }
@@ -2305,7 +2307,11 @@ impl Ashell {
         {
             return Err(("target already contains this group".to_string(), transfer));
         }
-        if self.tabs.iter().any(|tab| tab_ids.contains(tab.id.as_str())) {
+        if self
+            .tabs
+            .iter()
+            .any(|tab| tab_ids.contains(tab.id.as_str()))
+        {
             return Err((
                 "target already contains one of the transferred terminals".to_string(),
                 transfer,
@@ -2324,11 +2330,7 @@ impl Ashell {
 
         let target_owner_id = self.session_owner_id;
         let routes_moved = self.session_store.update(cx, |store, _| {
-            store.move_event_routes(
-                &transfer.route_ids,
-                source_owner_id,
-                target_owner_id,
-            )
+            store.move_event_routes(&transfer.route_ids, source_owner_id, target_owner_id)
         });
         if !routes_moved {
             return Err((
@@ -2346,11 +2348,7 @@ impl Ashell {
         } = transfer;
         let group_id = group.id.clone();
         let group_layout = group.pane_root.clone();
-        let fallback_tab = group_layout
-            .tab_ids()
-            .first()
-            .copied()
-            .map(str::to_string);
+        let fallback_tab = group_layout.tab_ids().first().copied().map(str::to_string);
         self.tabs.extend(tabs.into_iter().map(|(_, tab)| tab));
         self.sftp_handles.extend(sftp_handles);
         self.tab_groups.push(group);
