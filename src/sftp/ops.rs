@@ -48,6 +48,15 @@ impl Ashell {
             .and_then(|id| self.sftp_handles.get(id))
     }
 
+    /// 双击文本文件时调用:下载文件内容到内存,打开内置编辑器。
+    pub(crate) fn open_file_in_editor(&mut self, remote_path: String, cx: &mut Context<Self>) {
+        if let Some(handle) = self.active_sftp_handle() {
+            tracing::info!("[sftp] opening in-memory editor: '{}'", remote_path);
+            handle.download_file_content(remote_path);
+            cx.notify();
+        }
+    }
+
     pub(crate) fn navigate_sftp(&mut self, path: String, cx: &mut Context<Self>) {
         if let Some(handle) = self.active_sftp_handle() {
             tracing::info!("[sftp] navigating to directory: '{}'", path);

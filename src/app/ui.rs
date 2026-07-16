@@ -1,9 +1,10 @@
 use crate::app::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui::{
-    Context, DispatchPhase, ElementId, Focusable as _, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
-    PathBuilder, Pixels, Render, StatefulInteractiveElement as _, Styled as _, Window, canvas, div,
-    hsla, point, prelude::FluentBuilder as _, px, relative, rems, uniform_list,
+    AppContext as _, Context, DispatchPhase, ElementId, Focusable as _, FontWeight, Hsla,
+    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement as _, PathBuilder, Pixels, Render, StatefulInteractiveElement as _,
+    Styled as _, Window, canvas, div, hsla, point, prelude::FluentBuilder as _, px, relative, rems,
+    uniform_list,
 };
 use gpui_component::{
     ActiveTheme, Disableable as _, ElementExt, Icon, IconName, InteractiveElementExt as _, Root,
@@ -616,12 +617,19 @@ impl Ashell {
                                                     MouseButton::Left,
                                                     window.listener_for(&view, {
                                                         let entry = entry.clone();
-                                                        move |this, _, _, cx| {
+                                                        move |this, event: &MouseDownEvent, _, cx| {
                                                             this.dismiss_sftp_context_menu(cx);
                                                             this.select_sftp_entry(
                                                                 entry.clone(),
                                                                 cx,
                                                             );
+                                                            // 双击非目录文件 → 内置编辑器
+                                                            if event.click_count >= 2 && !entry.is_dir {
+                                                                this.open_file_in_editor(
+                                                                    entry.full_path.clone(),
+                                                                    cx,
+                                                                );
+                                                            }
                                                         }
                                                     }),
                                                 )
@@ -2816,6 +2824,21 @@ impl Ashell {
 
 impl Render for Ashell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 检查 SftpEditor 是否请求关闭
+        if let Some(editor) = &self.sftp_editor {
+            if editor.read(cx).should_close {
+                self.sftp_editor = None;
+            }
+        }
+        // 若有待打开的编辑请求,在此处(有 window)构造 SftpEditor
+        if let Some((remote_path, content, handle)) = self.pending_edit.take() {
+            let editor = cx.new(|cx| {
+                crate::app::sftp_editor::SftpEditor::new(
+                    remote_path, content, handle, window, cx,
+                )
+            });
+            self.sftp_editor = Some(editor);
+        }
         if self
             .active_tab
             .as_ref()
@@ -3127,6 +3150,10 @@ impl Render for Ashell {
             )
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_sheet_layer(window, cx))
+            // SFTP 内置编辑器 overlay
+            .when_some(self.sftp_editor.clone(), |this, editor| {
+                this.child(editor.clone())
+            })
             .when_some(self.sftp_context_menu.clone(), |this, menu| {
                 let label = if menu.is_dir {
                     t!("download_folder").to_string()

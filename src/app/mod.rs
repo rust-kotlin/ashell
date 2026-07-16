@@ -4,6 +4,7 @@ pub mod dialogs;
 pub mod keybinding_recorder;
 pub mod resizable;
 pub mod search;
+pub mod sftp_editor;
 pub mod ssh_key_import;
 pub mod startup;
 pub mod tab_drag;
@@ -475,6 +476,12 @@ pub(crate) struct Ashell {
     pub(crate) connection_progress: Option<ConnectionProgress>,
     pub(crate) pending_sftp_path_sync: Option<String>,
     pub(crate) sftp_context_menu: Option<SftpContextMenuState>,
+    /// 内置 SFTP 编辑器 overlay。双击文本文件时创建,关闭时设为 None。
+    pub(crate) sftp_editor: Option<Entity<sftp_editor::SftpEditor>>,
+    /// 待打开的编辑请求(下载内容后创建 SftpEditor)。
+    /// drain_backend_events 在无 window 的异步泵中执行,无法直接构造
+    /// SftpEditor(其构造需要 &mut Window),因此先暂存,在 render 中创建。
+    pub(crate) pending_edit: Option<(String, String, crate::sftp::SftpHandle)>,
     pub(crate) tab_context_menu: Option<TabContextMenuState>,
     pub(crate) sftp_creating_folder: bool,
     pub(crate) sftp_new_folder_input: Entity<InputState>,
@@ -906,6 +913,8 @@ impl Ashell {
             connection_progress: None,
             pending_sftp_path_sync: Some("/".into()),
             sftp_context_menu: None,
+            sftp_editor: None,
+            pending_edit: None,
             tab_context_menu: None,
             sftp_creating_folder: false,
             sftp_new_folder_input,
@@ -1175,6 +1184,30 @@ impl Ashell {
                     }
                     if self.active_group.as_ref() == Some(&tab_id) {
                         self.status = text.into();
+                    }
+                }
+                BackendEvent::SftpFileContent {
+                    tab_id,
+                    remote_path,
+                    content,
+                } => {
+                    // 收到文件内容 → 暂存,等 render 时(有 window)再构造 SftpEditor
+                    if let Some(handle) = self.sftp_handles.get(&tab_id).cloned() {
+                        self.pending_edit = Some((remote_path, content, handle));
+                        cx.notify();
+                    }
+                }
+                BackendEvent::SftpContentUploaded {
+                    tab_id: _,
+                    remote_path,
+                } => {
+                    // 上传完成 → 更新编辑器状态
+                    if let Some(editor) = &self.sftp_editor {
+                        editor.update(cx, |e, cx| {
+                            if e.remote_path == remote_path {
+                                e.mark_uploaded(cx);
+                            }
+                        });
                     }
                 }
                 BackendEvent::RemoteSystem { tab_id, snapshot } => {

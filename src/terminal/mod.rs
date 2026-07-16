@@ -59,6 +59,17 @@ pub enum BackendEvent {
         tab_id: String,
         text: String,
     },
+    /// 文件内容已下载到内存,供内置编辑器使用。
+    SftpFileContent {
+        tab_id: String,
+        remote_path: String,
+        content: String,
+    },
+    /// 内存中的文件内容已上传完成。
+    SftpContentUploaded {
+        tab_id: String,
+        remote_path: String,
+    },
     RemoteSystem {
         tab_id: String,
         snapshot: SystemSnapshot,

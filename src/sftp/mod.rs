@@ -76,6 +76,15 @@ pub enum SftpCommand {
         local_path: String,
         remote_path: String,
     },
+    /// 下载文件内容到内存(不落地临时文件),供内置编辑器使用。
+    DownloadFileContent {
+        remote_path: String,
+    },
+    /// 上传内存中的文件内容,覆盖远程文件。供内置编辑器 Ctrl+S 使用。
+    UploadFileContent {
+        remote_path: String,
+        content: String,
+    },
     UploadPaths {
         locals: Vec<String>,
         remote_dir: String,
@@ -187,6 +196,23 @@ impl SftpHandle {
 
     pub fn edit_file(&self, remote_path: String) {
         let _ = self.commands.send(SftpCommand::EditFile { remote_path });
+    }
+
+    /// 下载文件内容到内存,供内置编辑器使用。
+    pub fn download_file_content(&self, remote_path: String) {
+        let _ = self
+            .commands
+            .send(SftpCommand::DownloadFileContent { remote_path });
+    }
+
+    /// 上传内存中的文件内容,覆盖远程文件。
+    pub fn upload_file_content(&self, remote_path: String, content: String) {
+        let _ = self
+            .commands
+            .send(SftpCommand::UploadFileContent {
+                remote_path,
+                content,
+            });
     }
 
     pub fn close(&self) {
@@ -671,6 +697,92 @@ async fn run_sftp(
                             let _ = events_clone.send(BackendEvent::SftpStatus {
                                 tab_id: tab_id_clone.clone(),
                                 text: format!("Auto-upload failed: {err:#}"),
+                            });
+                        }
+                    }
+                });
+            }
+            SftpCommand::DownloadFileContent { remote_path } => {
+                let handle_clone = handle.clone();
+                let events_clone = events.clone();
+                let tab_id_clone = tab_id.clone();
+
+                tokio::spawn(async move {
+                    let Ok(channel) = handle_clone.channel_open_session().await else {
+                        let _ = events_clone.send(BackendEvent::SftpStatus {
+                            tab_id: tab_id_clone,
+                            text: "Failed to open SFTP channel".into(),
+                        });
+                        return;
+                    };
+                    let Ok(_) = channel.request_subsystem(true, "sftp").await else {
+                        return;
+                    };
+                    let Ok(sftp_session) = SftpSession::new(channel.into_stream()).await else {
+                        return;
+                    };
+
+                    match read_file_to_string(&sftp_session, &remote_path).await {
+                        Ok(content) => {
+                            let _ = events_clone.send(BackendEvent::SftpFileContent {
+                                tab_id: tab_id_clone,
+                                remote_path,
+                                content,
+                            });
+                        }
+                        Err(err) => {
+                            let _ = events_clone.send(BackendEvent::SftpStatus {
+                                tab_id: tab_id_clone,
+                                text: format!("Failed to read file: {err:#}"),
+                            });
+                        }
+                    }
+                });
+            }
+            SftpCommand::UploadFileContent {
+                remote_path,
+                content,
+            } => {
+                let handle_clone = handle.clone();
+                let events_clone = events.clone();
+                let tab_id_clone = tab_id.clone();
+
+                tokio::spawn(async move {
+                    let Ok(channel) = handle_clone.channel_open_session().await else {
+                        let _ = events_clone.send(BackendEvent::SftpStatus {
+                            tab_id: tab_id_clone,
+                            text: "Failed to open SFTP channel".into(),
+                        });
+                        return;
+                    };
+                    let Ok(_) = channel.request_subsystem(true, "sftp").await else {
+                        return;
+                    };
+                    let Ok(sftp_session) = SftpSession::new(channel.into_stream()).await else {
+                        return;
+                    };
+
+                    match write_string_to_file(&sftp_session, &remote_path, &content).await {
+                        Ok(_) => {
+                            let now = chrono::Local::now().format("%H:%M:%S");
+                            let base = base_name(&remote_path).to_string();
+                            let _ = events_clone.send(BackendEvent::SftpContentUploaded {
+                                tab_id: tab_id_clone.clone(),
+                                remote_path,
+                            });
+                            let _ = events_clone.send(BackendEvent::SftpStatus {
+                                tab_id: tab_id_clone,
+                                text: format!(
+                                    "{} ({})",
+                                    t!("auto_saved_and_uploaded", base = base.as_str()),
+                                    now
+                                ),
+                            });
+                        }
+                        Err(err) => {
+                            let _ = events_clone.send(BackendEvent::SftpStatus {
+                                tab_id: tab_id_clone,
+                                text: format!("Upload failed: {err:#}"),
                             });
                         }
                     }
@@ -1337,6 +1449,48 @@ async fn download_remote_directory_archive(
     }
 
     Ok(extracted_to)
+}
+
+/// 读取远程文件全部内容到 String。供内置编辑器使用。
+/// 限制 5MB 以防大文件撑爆内存。
+async fn read_file_to_string(sftp: &SftpSession, remote: &str) -> Result<String> {
+    // 先检查文件大小,超过 5MB 拒绝
+    if let Ok(meta) = sftp.metadata(remote).await {
+        if let Some(size) = meta.size {
+            if size > 5 * 1024 * 1024 {
+                return Err(anyhow::anyhow!(
+                    "file too large for in-memory editor ({} bytes, max 5MB)",
+                    size
+                ));
+            }
+        }
+    }
+    let mut file = sftp
+        .open(remote)
+        .await
+        .with_context(|| format!("open remote {remote}"))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .await
+        .with_context(|| format!("read remote {remote}"))?;
+    String::from_utf8(buf).with_context(|| format!("convert {remote} to UTF-8"))
+}
+
+/// 将 String 内容写入远程文件(覆盖)。供内置编辑器 Ctrl+S 使用。
+async fn write_string_to_file(
+    sftp: &SftpSession,
+    remote: &str,
+    content: &str,
+) -> Result<()> {
+    let mut file = sftp
+        .create(remote)
+        .await
+        .with_context(|| format!("create remote {remote}"))?;
+    file.write_all(content.as_bytes())
+        .await
+        .with_context(|| format!("write remote {remote}"))?;
+    file.flush().await.context("flush remote file")?;
+    Ok(())
 }
 
 async fn download_file_impl(
