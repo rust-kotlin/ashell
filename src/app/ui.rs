@@ -623,8 +623,13 @@ impl Ashell {
                                                                 entry.clone(),
                                                                 cx,
                                                             );
-                                                            // 双击非目录文件 → 内置编辑器
-                                                            if event.click_count >= 2 && !entry.is_dir {
+                                                            // 双击受支持的文本文件 → 内置编辑器
+                                                            if event.click_count >= 2
+                                                                && !entry.is_dir
+                                                                && is_editable_text_file(
+                                                                    &entry.full_path,
+                                                                )
+                                                            {
                                                                 this.open_file_in_editor(
                                                                     entry.full_path.clone(),
                                                                     cx,

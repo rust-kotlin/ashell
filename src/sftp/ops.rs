@@ -13,8 +13,10 @@ pub(crate) fn is_editable_text_file(filename: &str) -> bool {
         .and_then(|s| s.to_str())
         .unwrap_or("");
     let known_exts = [
-        "txt", "conf", "json", "yaml", "yml", "xml", "ini", "sh", "py", "rs", "js", "ts", "html",
-        "css", "md", "toml", "csv", "log", "cfg",
+        "txt", "conf", "json", "yaml", "yml", "xml", "ini", "sh", "bash", "zsh", "py", "rs", "js",
+        "mjs", "cjs", "ts", "html", "htm", "css", "scss", "md", "toml", "csv", "log", "cfg",
+        "properties", "service", "env", "sql", "lua", "rb", "php", "go", "java", "kt", "swift",
+        "c", "h", "cpp", "cc", "cxx", "hpp", "gradle",
     ];
     if known_exts.contains(&ext) {
         return true;
