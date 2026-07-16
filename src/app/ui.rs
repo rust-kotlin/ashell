@@ -2,7 +2,8 @@ use crate::app::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui::{
     canvas, div, hsla, point, prelude::FluentBuilder as _, px, relative, rems, uniform_list,
     Context, DispatchPhase, ElementId, Focusable as _, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, PathBuilder, Pixels, Render,
+    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement as _, PathBuilder, Pixels, Render,
     StatefulInteractiveElement as _, Styled as _, Window,
 };
 use gpui_component::{
@@ -2373,10 +2374,11 @@ impl Ashell {
             .when(self.search_active, |el| {
                 el.child(self.render_search_bar(window, cx))
             })
-            // Only show feedback for an actionable destination. Moving through
-            // the window center is a neutral state and should not dim the UI.
+            // Every non-reorder drag has visible feedback. A neutral destination
+            // explicitly states that releasing will cancel instead of moving data.
             .when(
-                self.tab_drag.outside() || self.incoming_tab_drag.is_some(),
+                (self.tab_drag.is_dragging() && self.tab_drag.reorder_index().is_none())
+                    || self.incoming_tab_drag.is_some(),
                 |el| el.child(self.render_tab_drag_overlay(cx)),
             )
     }
@@ -2386,6 +2388,8 @@ impl Ashell {
         let card_bg = hsla(217. / 360., 0.88, 0.40, 0.98);
         let card_border = hsla(199. / 360., 0.95, 0.72, 1.0);
         let card_text = hsla(0., 0., 1.0, 1.0);
+        let neutral_bg = hsla(32. / 360., 0.82, 0.34, 0.98);
+        let neutral_border = hsla(42. / 360., 0.95, 0.68, 1.0);
 
         div()
             .absolute()
@@ -2433,7 +2437,52 @@ impl Ashell {
                     )
                 },
             )
-            .when(self.incoming_tab_drag.is_some(), |this| {
+            .when(
+                self.tab_drag.is_dragging()
+                    && !self.tab_drag.outside()
+                    && self.tab_drag.merge_target().is_none()
+                    && self.tab_drag.reorder_index().is_none()
+                    && self.incoming_tab_drag.is_none(),
+                |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .px(px(20.))
+                                    .py(px(12.))
+                                    .rounded_lg()
+                                    .border_2()
+                                    .border_color(neutral_border)
+                                    .bg(neutral_bg)
+                                    .shadow_lg()
+                                    .text_color(card_text)
+                                    .child(
+                                        Icon::new(IconName::Close)
+                                            .with_size(Size::Small)
+                                            .text_color(card_text),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(t!("drag_cancel_hint").to_string()),
+                                    ),
+                            ),
+                    )
+                },
+            )
+            .when(
+                self.incoming_tab_drag.is_some() || self.tab_drag.merge_target().is_some(),
+                |this| {
                 this.child(
                     div()
                         .absolute()
@@ -2772,6 +2821,16 @@ impl Render for Ashell {
         self.sync_sftp_path_input(window, cx);
 
         let view = cx.entity();
+        let move_view = view.clone();
+        window.on_mouse_event(
+            move |event: &MouseMoveEvent, phase, window, cx| {
+                if phase == DispatchPhase::Capture {
+                    let _ = move_view.update(cx, |this, cx| {
+                        this.on_tab_drag_mouse_move(event, window, cx);
+                    });
+                }
+            },
+        );
         window.on_mouse_event(
             move |event: &MouseUpEvent, phase, window, cx| {
                 if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
@@ -2949,10 +3008,8 @@ impl Render for Ashell {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .font_family(self.ui_font_family.clone())
-            // Global tab-drag movement handler. Mouse release is registered at
-            // window level so it also fires while Windows mouse capture reports
-            // a cursor position outside the source window.
-            .on_mouse_move(cx.listener(Self::on_tab_drag_mouse_move))
+            // Tab dragging is tracked by window-level capture listeners so
+            // movement continues after the cursor leaves the source element.
             .on_action(cx.listener(|this, _: &crate::OpenSettings, window, cx| this.show_settings_dialog(window, cx)))
             .on_action(cx.listener(|this, _: &crate::OpenSession, window, cx| this.show_selector_dialog(window, cx)))
             .on_action(cx.listener(|this, _: &crate::OpenTransfers, window, cx| this.show_transfers_dialog(window, cx)))

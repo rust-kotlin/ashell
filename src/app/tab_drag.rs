@@ -109,6 +109,10 @@ impl<I: PartialEq, T> TabDragState<I, T> {
         true
     }
 
+    pub(crate) fn reorder_index(&self) -> Option<usize> {
+        self.reorder_index
+    }
+
     pub(crate) fn outside(&self) -> bool {
         self.outside
     }
@@ -173,6 +177,25 @@ impl<I: PartialEq, T> TabDragState<I, T> {
     }
 }
 
+pub(crate) fn should_close_empty_source<I: PartialEq>(
+    merge_succeeded: bool,
+    source_is_empty: bool,
+    source_window: &I,
+    target_window: &I,
+) -> bool {
+    merge_succeeded && source_is_empty && source_window != target_window
+}
+
+pub(crate) fn cursor_inside_viewport(
+    cursor: Point<Pixels>,
+    viewport_size: Size<Pixels>,
+) -> bool {
+    cursor.x >= px(0.)
+        && cursor.y >= px(0.)
+        && cursor.x < viewport_size.width
+        && cursor.y < viewport_size.height
+}
+
 pub(crate) fn should_offer_detach(
     group_count: usize,
     cursor: Point<Pixels>,
@@ -180,10 +203,7 @@ pub(crate) fn should_offer_detach(
     tab_bar_bounds: Option<Bounds<Pixels>>,
     has_merge_target: bool,
 ) -> bool {
-    let inside_source_window = cursor.x >= px(0.)
-        && cursor.y >= px(0.)
-        && cursor.x < viewport_size.width
-        && cursor.y < viewport_size.height;
+    let inside_source_window = cursor_inside_viewport(cursor, viewport_size);
     let inside_tab_bar = tab_bar_bounds.is_some_and(|bounds| bounds.contains(&cursor));
 
     group_count > 1 && inside_source_window && !inside_tab_bar && !has_merge_target
@@ -218,8 +238,8 @@ mod tests {
     use gpui::{point, px, size, Bounds};
 
     use super::{
-        DragTarget, DropIntent, TabDragState, TargetUpdate, reorder_index_at_x,
-        should_offer_detach,
+        DragTarget, DropIntent, TabDragState, TargetUpdate, cursor_inside_viewport,
+        reorder_index_at_x, should_close_empty_source, should_offer_detach,
     };
 
     #[test]
@@ -365,6 +385,32 @@ mod tests {
 
         state.cancel();
         assert!(matches!(state.finish(), DropIntent::None));
+    }
+
+    #[test]
+    fn empty_source_closes_only_after_successful_cross_window_merge() {
+        assert!(should_close_empty_source(true, true, &1_u8, &2_u8));
+        assert!(!should_close_empty_source(false, true, &1_u8, &2_u8));
+        assert!(!should_close_empty_source(true, false, &1_u8, &2_u8));
+        assert!(!should_close_empty_source(true, true, &1_u8, &1_u8));
+    }
+
+    #[test]
+    fn viewport_hit_test_rejects_positions_outside_source_window() {
+        let viewport = size(px(800.), px(600.));
+
+        assert!(cursor_inside_viewport(
+            point(px(400.), px(300.)),
+            viewport
+        ));
+        assert!(!cursor_inside_viewport(
+            point(px(801.), px(300.)),
+            viewport
+        ));
+        assert!(!cursor_inside_viewport(
+            point(px(-1.), px(300.)),
+            viewport
+        ));
     }
 
     #[test]

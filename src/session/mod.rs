@@ -19,7 +19,10 @@ use crate::{
     app::{
         IncomingTabDrag,
         constants::{DEFAULT_COLS, DEFAULT_ROWS},
-        tab_drag::{DragTarget, DropIntent, TargetUpdate, reorder_index_at_x, should_offer_detach},
+        tab_drag::{
+            DragTarget, DropIntent, TargetUpdate, cursor_inside_viewport, reorder_index_at_x,
+            should_close_empty_source, should_offer_detach,
+        },
     },
     backend::{local, ssh},
     terminal::{BackendCommand, RenderSnapshot, TabKind, TerminalTab},
@@ -1762,7 +1765,14 @@ impl Ashell {
         let source_handle = window.window_handle();
         let source_entity = cx.entity();
         let screen_pos = Self::screen_position(window, event.position);
-        self.update_tab_drag_merge_target(source_handle, source_entity, screen_pos, cx);
+        let allow_merge_target = !cursor_inside_viewport(event.position, window.viewport_size());
+        self.update_tab_drag_merge_target(
+            source_handle,
+            source_entity,
+            screen_pos,
+            allow_merge_target,
+            cx,
+        );
 
         let has_merge_target = self.tab_drag.merge_target().is_some();
         let reorder_index = if has_merge_target {
@@ -1810,14 +1820,16 @@ impl Ashell {
         source_handle: AnyWindowHandle,
         source_entity: Entity<Ashell>,
         screen_pos: Point<Pixels>,
+        allow_target: bool,
         cx: &mut Context<Self>,
     ) {
-        let new_target = crate::app::find_window_at_screen_pos(&source_handle, screen_pos).map(
-            |(window_id, entity, _)| DragTarget {
+        let new_target = allow_target
+            .then(|| crate::app::find_window_at_screen_pos(&source_handle, screen_pos))
+            .flatten()
+            .map(|(window_id, entity, _)| DragTarget {
                 window_id,
                 payload: (window_id, entity),
-            },
-        );
+            });
 
         if let TargetUpdate::Changed { previous } = self.tab_drag.set_merge_target(new_target) {
             if let Some((_, previous)) = previous {
@@ -1858,40 +1870,70 @@ impl Ashell {
 
         let source_handle = window.window_handle();
         let screen_pos = Self::screen_position(window, event.position);
-        self.update_tab_drag_merge_target(source_handle, cx.entity(), screen_pos, cx);
+        let actual_target_window = if cursor_inside_viewport(event.position, window.viewport_size()) {
+            None
+        } else {
+            crate::app::find_window_at_screen_pos(&source_handle, screen_pos)
+                .map(|(window_handle, _, _)| window_handle)
+        };
+        let presented_target_is_valid = self
+            .tab_drag
+            .merge_target()
+            .is_some_and(|target| Some(target.window_id) == actual_target_window);
+
+        if self.tab_drag.merge_target().is_some() && !presented_target_is_valid {
+            if let TargetUpdate::Changed {
+                previous: Some((_, previous)),
+            } = self.tab_drag.set_merge_target(None)
+            {
+                previous.update(cx, |target, cx| {
+                    target.incoming_tab_drag = None;
+                    cx.notify();
+                });
+            }
+        }
 
         let has_merge_target = self.tab_drag.merge_target().is_some();
-        let reorder_index = if !has_merge_target
-            && self
-                .tab_bar_bounds
-                .as_ref()
-                .is_some_and(|bounds| bounds.contains(&event.position))
-        {
-            let ordered_bounds = self
-                .tab_groups
-                .iter()
-                .filter_map(|group| {
-                    self.tab_group_bounds
-                        .get(&group.id)
-                        .copied()
-                        .map(|bounds| (group.id.clone(), bounds))
+        if let Some(presented_index) = self.tab_drag.reorder_index() {
+            let release_index = if !has_merge_target
+                && self
+                    .tab_bar_bounds
+                    .as_ref()
+                    .is_some_and(|bounds| bounds.contains(&event.position))
+            {
+                let ordered_bounds = self
+                    .tab_groups
+                    .iter()
+                    .filter_map(|group| {
+                        self.tab_group_bounds
+                            .get(&group.id)
+                            .copied()
+                            .map(|bounds| (group.id.clone(), bounds))
+                    })
+                    .collect::<Vec<_>>();
+                self.tab_drag.dragging_group().and_then(|group_id| {
+                    reorder_index_at_x(group_id, event.position.x, &ordered_bounds)
                 })
-                .collect::<Vec<_>>();
-            self.tab_drag.dragging_group().and_then(|group_id| {
-                reorder_index_at_x(group_id, event.position.x, &ordered_bounds)
-            })
-        } else {
-            None
-        };
-        let should_detach = should_offer_detach(
-            self.tab_groups.len(),
-            event.position,
-            window.viewport_size(),
-            self.tab_bar_bounds,
-            has_merge_target,
-        );
-        self.tab_drag.set_reorder_index(reorder_index);
-        self.tab_drag.set_outside(should_detach);
+            } else {
+                None
+            };
+            if release_index != Some(presented_index) {
+                self.tab_drag.set_reorder_index(None);
+            }
+        }
+
+        if self.tab_drag.outside() {
+            let detach_is_still_valid = should_offer_detach(
+                self.tab_groups.len(),
+                event.position,
+                window.viewport_size(),
+                self.tab_bar_bounds,
+                has_merge_target,
+            );
+            if !detach_is_still_valid {
+                self.tab_drag.set_outside(false);
+            }
+        }
     }
 
     /// Convert a window-local cursor position to a screen-space position by
@@ -1931,15 +1973,25 @@ impl Ashell {
             let target = cx.entity();
             let target_window = window.window_handle();
             window.defer(cx, move |_window, cx| {
-                let _ = source.update(cx, |source, cx| {
+                let source_window_for_commit = source_window;
+                let should_close_source = source.update(cx, |source, cx| {
                     source.finish_tab_drag_on_target(
                         group_id,
-                        source_window,
+                        source_window_for_commit,
                         target_window,
                         target,
                         cx,
-                    );
+                    )
                 });
+                if should_close_source {
+                    if let Err(error) = source_window.update(cx, |_, window, _| {
+                        window.remove_window();
+                    }) {
+                        tracing::warn!(
+                            "[tab-drag] failed to close empty source window after target-forwarded merge: {error:?}"
+                        );
+                    }
+                }
             });
             cx.notify();
             return;
@@ -1954,9 +2006,14 @@ impl Ashell {
                 group_id,
                 target: (target_window, target),
             } => {
-                if self.commit_group_merge(group_id, target_window, target, cx)
-                    && self.tab_groups.is_empty()
-                {
+                let source_window = window.window_handle();
+                let merged = self.commit_group_merge(group_id, target_window, target, cx);
+                if should_close_empty_source(
+                    merged,
+                    self.tab_groups.is_empty(),
+                    &source_window,
+                    &target_window,
+                ) {
                     window.remove_window();
                 }
             }
@@ -1974,7 +2031,7 @@ impl Ashell {
         target_window: AnyWindowHandle,
         target: Entity<Ashell>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let intent = self.tab_drag.finish();
         let valid_merge = matches!(
             intent,
@@ -1988,16 +2045,16 @@ impl Ashell {
                 target.incoming_tab_drag = None;
                 cx.notify();
             });
-            return;
+            return false;
         }
 
-        if self.commit_group_merge(group_id, target_window, target, cx)
-            && self.tab_groups.is_empty()
-        {
-            let _ = source_window.update(cx, |_, window, _| {
-                window.remove_window();
-            });
-        }
+        let merged = self.commit_group_merge(group_id, target_window, target, cx);
+        should_close_empty_source(
+            merged,
+            self.tab_groups.is_empty(),
+            &source_window,
+            &target_window,
+        )
     }
 
     fn commit_group_merge(
