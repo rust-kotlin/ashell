@@ -2835,14 +2835,33 @@ impl Render for Ashell {
                 self.sftp_editor = None;
             }
         }
-        // 若有待打开的编辑请求,在此处(有 window)构造 SftpEditor
-        if let Some((remote_path, content, handle)) = self.pending_edit.take() {
-            let editor = cx.new(|cx| {
-                crate::app::sftp_editor::SftpEditor::new(
-                    remote_path, content, handle, window, cx,
-                )
-            });
-            self.sftp_editor = Some(editor);
+        // 处理待打开的编辑请求队列(此处有 window,可构造/追加 SftpEditor)
+        if !self.pending_edits.is_empty() {
+            let pending = std::mem::take(&mut self.pending_edits);
+            if let Some(editor) = &self.sftp_editor {
+                // 编辑器已存在 → 逐个 open_file(已开的会切换 tab 不重复打开)
+                editor.update(cx, |e, cx| {
+                    for (path, content, _handle) in pending {
+                        e.open_file(path, content, window, cx);
+                    }
+                });
+            } else {
+                // 无编辑器 → 用第一个请求创建,其余追加
+                let mut iter = pending.into_iter();
+                if let Some((path, content, handle)) = iter.next() {
+                    let editor = cx.new(|cx| {
+                        crate::app::sftp_editor::SftpEditor::new(
+                            path, content, handle, window, cx,
+                        )
+                    });
+                    editor.update(cx, |e, cx| {
+                        for (p, c, _handle) in iter {
+                            e.open_file(p, c, window, cx);
+                        }
+                    });
+                    self.sftp_editor = Some(editor);
+                }
+            }
         }
         if self
             .active_tab
