@@ -17,7 +17,10 @@ use gpui_component::{
 };
 use rust_i18n::t;
 
-use crate::{Ashell, session::config::AuthMethod, system::format_bytes};
+use crate::{
+    Ashell, app::ssh_key_import::KeyImportValidation, session::config::AuthMethod,
+    system::format_bytes,
+};
 
 impl Ashell {
     pub(crate) fn show_ssh_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -51,6 +54,7 @@ impl Ashell {
                     move |_, _, cx| {
                         view.update(cx, |this, cx| {
                             this.active_dialog = None;
+                            this.key_import.close();
                             cx.notify();
                         });
                     }
@@ -77,6 +81,9 @@ impl Ashell {
                         let is_editing = view.read(cx).editing_session_id.is_some();
                         let proxy_type = view.read(cx).ssh_proxy_type.clone();
                         let show_proxy_fields = proxy_type != "none";
+                        let key_auth_incomplete = is_key
+                            && !view.read(cx).using_custom_key_path
+                            && view.read(cx).managed_key_selected.is_none();
                         content.child(
                             v_flex()
                                 .gap_3()
@@ -147,11 +154,11 @@ impl Ashell {
                                 })
                                 .when(is_key, |this| {
                                     let managed_keys = view.read(cx).managed_keys.clone();
-                                    let managed_key_selected = view.read(cx).managed_key_selected.clone();
+                                    let managed_key_selected =
+                                        view.read(cx).managed_key_selected.clone();
                                     let using_custom_key_path = view.read(cx).using_custom_key_path;
                                     let theme = cx.theme();
-                                    let show_managed = managed_key_selected.is_some()
-                                        && !using_custom_key_path;
+                                    let using_managed_key = !using_custom_key_path;
 
                                     let key_label = if let Some(mk_id) = &managed_key_selected {
                                         managed_keys
@@ -163,76 +170,61 @@ impl Ashell {
                                         t!("select_managed_key").to_string()
                                     };
 
-                                    let this = this.child(
-                                        h_flex()
-                                            .gap_2()
-                                            .child(
-                                                Button::new("managed-key-select")
-                                                    .small()
-                                                    .label(key_label)
-                                                    .dropdown_menu_with_anchor(
-                                                        Anchor::BottomLeft,
-                                                        {
-                                                            let view = view.clone();
-                                                            move |mut menu, window, cx| {
-                                                                let keys =
-                                                                    view.read(cx).managed_keys.clone();
-                                                                let selected = view
-                                                                    .read(cx)
-                                                                    .managed_key_selected
-                                                                    .clone();
-                                                                menu = menu.min_w(200.);
-                                                                for key in keys {
-                                                                    let is_checked =
-                                                                        selected.as_deref()
-                                                                            == Some(&key.id);
-                                                                    let label = format!(
-                                                                        "{} ({})",
-                                                                        key.name, key.key_type
-                                                                    );
-                                                                    let key_id = key.id.clone();
-                                                                    menu = menu.item(
-                                                                        PopupMenuItem::new(label)
-                                                                            .checked(is_checked)
-                                                                            .on_click(window.listener_for(&view, move |this, _, _, cx| {
-                                                                                this.select_managed_key(key_id.clone(), cx);
-                                                                            })),
-                                                                    );
-                                                                }
-                                                                menu
-                                                            }
-                                                        },
-                                                    ),
-                                            )
-                                            .child(
-                                                Button::new("import-new-key")
-                                                    .small()
-                                                    .ghost()
-                                                    .icon(IconName::Plus)
-                                                    .label(t!("import_new_key").to_string())
-                                                    .on_click(window.listener_for(
-                                                        &view,
-                                                        |this, _, window, cx| {
-                                                            this.import_managed_key(window, cx);
-                                                        },
-                                                    )),
-                                            )
-                                            .child(
-                                                Button::new("use-custom-path")
-                                                    .small()
-                                                    .ghost()
-                                                    .when(using_custom_key_path, |b| b.primary())
-                                                    .label(t!("use_custom_path").to_string())
-                                                    .on_click(window.listener_for(
-                                                        &view,
-                                                        |this, _, _, cx| {
-                                                            this.use_custom_key_path(cx);
-                                                        },
-                                                    )),
-                                            ),
-                                    );
+                                    let this =
+                                        this.child(
+                                            h_flex()
+                                                .w_full()
+                                                .gap_1()
+                                                .p(px(3.))
+                                                .rounded_md()
+                                                .border_1()
+                                                .border_color(theme.border)
+                                                .bg(theme.muted)
+                                                .child(
+                                                    Button::new("use-managed-key")
+                                                        .small()
+                                                        .flex_1()
+                                                        .when(using_managed_key, |button| {
+                                                            button.primary()
+                                                        })
+                                                        .label(t!("select_managed_key").to_string())
+                                                        .on_click(window.listener_for(
+                                                            &view,
+                                                            |this, _, _, cx| {
+                                                                this.use_managed_key(cx)
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    Button::new("use-custom-path")
+                                                        .small()
+                                                        .flex_1()
+                                                        .when(using_custom_key_path, |button| {
+                                                            button.primary()
+                                                        })
+                                                        .label(t!("use_custom_path").to_string())
+                                                        .on_click(window.listener_for(
+                                                            &view,
+                                                            |this, _, _, cx| {
+                                                                this.use_custom_key_path(cx)
+                                                            },
+                                                        )),
+                                                ),
+                                        );
 
-                                    if show_managed {
+                                    if using_managed_key {
+                                        let this = this.child(
+                                            Button::new("managed-key-select")
+                                                .small()
+                                                .w_full()
+                                                .label(key_label)
+                                                .on_click(window.listener_for(
+                                                    &view,
+                                                    |this, _, window, cx| {
+                                                        this.open_managed_key_selector(window, cx);
+                                                    },
+                                                )),
+                                        );
                                         let info = managed_key_selected
                                             .as_ref()
                                             .and_then(|id| {
@@ -260,13 +252,16 @@ impl Ashell {
                                                     .child(info),
                                             )
                                         } else {
-                                            this
+                                            this.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(
+                                                        t!("select_managed_key_hint").to_string(),
+                                                    ),
+                                            )
                                         };
-                                        this.child(
-                                            Input::new(&passphrase_input)
-                                                .mask_toggle()
-                                                .tab_index(6),
-                                        )
+                                        this
                                     } else {
                                         this.child(
                                             h_flex()
@@ -309,9 +304,7 @@ impl Ashell {
                                                 ),
                                         )
                                         .child(
-                                            Input::new(&key_inline_input)
-                                                .h(px(128.))
-                                                .tab_index(5),
+                                            Input::new(&key_inline_input).h(px(128.)).tab_index(5),
                                         )
                                         .child(
                                             Input::new(&passphrase_input)
@@ -491,6 +484,7 @@ impl Ashell {
                                             this.child(
                                                 Button::new("connect-ssh-confirm")
                                                     .primary()
+                                                    .disabled(key_auth_incomplete)
                                                     .label(if is_editing {
                                                         t!("save")
                                                     } else {
@@ -513,6 +507,416 @@ impl Ashell {
             window.focus(&focus_host_input.read(cx).focus_handle(cx), cx);
         });
     }
+    pub(crate) fn show_managed_key_selector_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_dialog.is_some() {
+            return;
+        }
+        self.active_dialog = Some(crate::app::DialogKind::ManagedKeySelector);
+
+        let view = cx.entity();
+        let rename_input = self.key_import_remark_input.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _window, _cx| {
+            dialog
+                .title(t!("select_private_key").to_string())
+                .w(px(760.))
+                .close_button(false)
+                .overlay_closable(false)
+                .content({
+                    let view = view.clone();
+                    let rename_input = rename_input.clone();
+                    move |content, window, cx| {
+                        let keys = view.read(cx).managed_keys.clone();
+                        let selected = view.read(cx).managed_key_dialog_selection.clone();
+                        let is_renaming = view.read(cx).editing_managed_key_id.is_some();
+                        let has_selection = selected.is_some();
+
+                        let mut rows = v_flex()
+                            .h(px(220.))
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .rounded_md()
+                            .overflow_hidden()
+                            .child(
+                                h_flex()
+                                    .px_2()
+                                    .py_1()
+                                    .bg(cx.theme().muted)
+                                    .border_b_1()
+                                    .border_color(cx.theme().border)
+                                    .child(
+                                        div()
+                                            .w(px(220.))
+                                            .flex_shrink_0()
+                                            .text_sm()
+                                            .child(t!("name").to_string()),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(110.))
+                                            .flex_shrink_0()
+                                            .text_sm()
+                                            .child(t!("key_type").to_string()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .overflow_hidden()
+                                            .text_sm()
+                                            .child(t!("key_fingerprint").to_string()),
+                                    ),
+                            );
+
+                        if keys.is_empty() {
+                            rows = rows.child(
+                                div()
+                                    .flex_1()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(t!("no_managed_keys").to_string()),
+                            );
+                        } else {
+                            for (index, key) in keys.into_iter().enumerate() {
+                                let key_id = key.id.clone();
+                                let is_selected = selected.as_deref() == Some(key.id.as_str());
+                                let fingerprint = if key.fingerprint.len() > 24 {
+                                    format!("{}…", &key.fingerprint[..24])
+                                } else {
+                                    key.fingerprint.clone()
+                                };
+                                rows = rows.child(
+                                    h_flex()
+                                        .id(("managed-key-choice", index))
+                                        .px_2()
+                                        .py_2()
+                                        .cursor_pointer()
+                                        .border_b_1()
+                                        .border_color(cx.theme().border)
+                                        .when(is_selected, |row| row.bg(cx.theme().selection))
+                                        .hover(|row| row.bg(cx.theme().selection))
+                                        .child(
+                                            div()
+                                                .w(px(220.))
+                                                .flex_shrink_0()
+                                                .min_w(px(0.))
+                                                .overflow_hidden()
+                                                .text_sm()
+                                                .child(key.name),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(110.))
+                                                .flex_shrink_0()
+                                                .text_sm()
+                                                .child(key.key_type),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .overflow_hidden()
+                                                .text_sm()
+                                                .child(fingerprint),
+                                        )
+                                        .on_click(window.listener_for(
+                                            &view,
+                                            move |this, _, _, cx| {
+                                                this.select_managed_key_candidate(
+                                                    key_id.clone(),
+                                                    cx,
+                                                );
+                                            },
+                                        )),
+                                );
+                            }
+                        }
+
+                        content.child(
+                            v_flex()
+                                .gap_3()
+                                .child(
+                                    h_flex().gap_3().child(rows.flex_1()).child(
+                                        v_flex()
+                                            .w(px(104.))
+                                            .gap_2()
+                                            .child(
+                                                Button::new("selector-import-key")
+                                                    .w_full()
+                                                    .label(t!("import_key").to_string())
+                                                    .on_click(window.listener_for(
+                                                        &view,
+                                                        |this, _, window, cx| {
+                                                            this.open_key_import(window, cx);
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new("selector-edit-key")
+                                                    .w_full()
+                                                    .disabled(!has_selection)
+                                                    .label(t!("edit").to_string())
+                                                    .on_click(window.listener_for(
+                                                        &view,
+                                                        |this, _, window, cx| {
+                                                            this.begin_managed_key_rename(
+                                                                window, cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new("selector-delete-key")
+                                                    .w_full()
+                                                    .disabled(!has_selection)
+                                                    .label(t!("delete").to_string())
+                                                    .on_click(window.listener_for(
+                                                        &view,
+                                                        |this, _, _, cx| {
+                                                            this.delete_selected_managed_key(cx);
+                                                        },
+                                                    )),
+                                            ),
+                                    ),
+                                )
+                                .when(is_renaming, |this| {
+                                    this.child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(Input::new(&rename_input).flex_1())
+                                            .child(
+                                                Button::new("save-key-rename")
+                                                    .primary()
+                                                    .label(t!("save").to_string())
+                                                    .on_click(window.listener_for(
+                                                        &view,
+                                                        |this, _, _, cx| {
+                                                            this.save_managed_key_rename(cx);
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new("cancel-key-rename")
+                                                    .label(t!("cancel").to_string())
+                                                    .on_click(window.listener_for(
+                                                        &view,
+                                                        |this, _, _, cx| {
+                                                            this.cancel_managed_key_rename(cx);
+                                                        },
+                                                    )),
+                                            ),
+                                    )
+                                })
+                                .child(
+                                    h_flex()
+                                        .justify_center()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("confirm-key-selection")
+                                                .primary()
+                                                .disabled(!has_selection)
+                                                .label(t!("confirm").to_string())
+                                                .on_click(window.listener_for(
+                                                    &view,
+                                                    |this, _, window, cx| {
+                                                        this.confirm_managed_key_selection(
+                                                            window, cx,
+                                                        );
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new("cancel-key-selection")
+                                                .label(t!("cancel").to_string())
+                                                .on_click(window.listener_for(
+                                                    &view,
+                                                    |this, _, window, cx| {
+                                                        this.return_to_ssh_dialog(window, cx);
+                                                    },
+                                                )),
+                                        ),
+                                ),
+                        )
+                    }
+                })
+        });
+    }
+
+    pub(crate) fn show_managed_key_import_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_dialog.is_some() {
+            return;
+        }
+        self.active_dialog = Some(crate::app::DialogKind::ManagedKeyImport);
+
+        let view = cx.entity();
+        let remark_input = self.key_import_remark_input.clone();
+        let passphrase_input = self.key_import_passphrase_input.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _window, _cx| {
+            dialog
+                .title(t!("key_import_dialog_title").to_string())
+                .w(px(440.))
+                .close_button(false)
+                .overlay_closable(false)
+                .content({
+                    let view = view.clone();
+                    let remark_input = remark_input.clone();
+                    let passphrase_input = passphrase_input.clone();
+                    move |content, window, cx| {
+                        let path = view.read(cx).key_import.path.clone();
+                        let validation = view.read(cx).key_import.validation.clone();
+                        let can_confirm = validation.can_confirm();
+                        let (status, status_color) = match &validation {
+                            KeyImportValidation::WaitingForFile => (
+                                t!("key_import_select_file_hint").to_string(),
+                                cx.theme().muted_foreground,
+                            ),
+                            KeyImportValidation::Validating => (
+                                t!("key_import_validating").to_string(),
+                                cx.theme().muted_foreground,
+                            ),
+                            KeyImportValidation::Invalid(error) => (
+                                format!("{}: {error}", t!("key_import_failed")),
+                                cx.theme().danger,
+                            ),
+                            KeyImportValidation::Duplicate => (
+                                t!("key_duplicate_fingerprint").to_string(),
+                                cx.theme().danger,
+                            ),
+                            KeyImportValidation::Valid {
+                                key_type,
+                                fingerprint,
+                            } => (
+                                format!(
+                                    "{} · {}: {}",
+                                    key_type,
+                                    t!("key_fingerprint"),
+                                    fingerprint
+                                ),
+                                cx.theme().success,
+                            ),
+                        };
+
+                        content.child(
+                            v_flex()
+                                .gap_3()
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .w(px(80.))
+                                                .text_sm()
+                                                .child(t!("name").to_string()),
+                                        )
+                                        .child(Input::new(&remark_input).flex_1()),
+                                )
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .w(px(80.))
+                                                .text_sm()
+                                                .child(t!("private_key").to_string()),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .px_3()
+                                                .py_2()
+                                                .rounded_md()
+                                                .border_1()
+                                                .border_color(cx.theme().border)
+                                                .text_sm()
+                                                .overflow_hidden()
+                                                .text_color(if path.is_empty() {
+                                                    cx.theme().muted_foreground
+                                                } else {
+                                                    cx.theme().foreground
+                                                })
+                                                .child(if path.is_empty() {
+                                                    t!("key_import_choose_file").to_string()
+                                                } else {
+                                                    path
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("browse-key-import")
+                                                .label(t!("browse").to_string())
+                                                .on_click(window.listener_for(
+                                                    &view,
+                                                    |this, _, window, cx| {
+                                                        this.pick_managed_key_import_file(
+                                                            window, cx,
+                                                        );
+                                                    },
+                                                )),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .w(px(80.))
+                                                .text_sm()
+                                                .child(t!("key_passphrase").to_string()),
+                                        )
+                                        .child(
+                                            Input::new(&passphrase_input).flex_1().mask_toggle(),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .pl(px(80.))
+                                        .text_xs()
+                                        .text_color(status_color)
+                                        .child(status),
+                                )
+                                .child(
+                                    h_flex()
+                                        .justify_center()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("confirm-key-import")
+                                                .primary()
+                                                .disabled(!can_confirm)
+                                                .label(t!("confirm").to_string())
+                                                .on_click(window.listener_for(
+                                                    &view,
+                                                    |this, _, window, cx| {
+                                                        this.confirm_managed_key_import(window, cx);
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new("cancel-key-import")
+                                                .label(t!("cancel").to_string())
+                                                .on_click(window.listener_for(
+                                                    &view,
+                                                    |this, _, window, cx| {
+                                                        this.close_key_import(window, cx);
+                                                    },
+                                                )),
+                                        ),
+                                ),
+                        )
+                    }
+                })
+        });
+    }
+
     pub(crate) fn show_selector_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_dialog.is_some() {
             return;

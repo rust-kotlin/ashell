@@ -4,6 +4,7 @@ pub mod dialogs;
 pub mod keybinding_recorder;
 pub mod resizable;
 pub mod search;
+pub mod ssh_key_import;
 pub mod startup;
 pub mod tab_drag;
 pub mod theme;
@@ -22,7 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::app::resizable::ResizableState;
+use crate::app::{resizable::ResizableState, ssh_key_import::KeyImportState};
 use gpui::{
     AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Pixels, Point,
     SharedString, Size, UniformListScrollHandle, Window, point, px, size,
@@ -390,6 +391,8 @@ pub(crate) enum DialogKind {
     SessionSelector,
     Transfers,
     NewSsh,
+    ManagedKeySelector,
+    ManagedKeyImport,
 }
 
 pub(crate) struct Ashell {
@@ -403,6 +406,10 @@ pub(crate) struct Ashell {
     pub(crate) key_path_input: Entity<InputState>,
     pub(crate) key_inline_input: Entity<InputState>,
     pub(crate) passphrase_input: Entity<InputState>,
+    pub(crate) key_import_remark_input: Entity<InputState>,
+    pub(crate) key_import_passphrase_input: Entity<InputState>,
+    pub(crate) key_import: KeyImportState,
+    pub(crate) managed_key_dialog_selection: Option<String>,
     pub(crate) ssh_proxy_type: String,
     pub(crate) proxy_host_input: Entity<InputState>,
     pub(crate) proxy_port_input: Entity<InputState>,
@@ -633,6 +640,14 @@ impl Ashell {
                 .placeholder("SSH private key passphrase (optional)")
                 .masked(true)
         });
+        let key_import_remark_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("key_import_remark_placeholder").to_string())
+        });
+        let key_import_passphrase_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t!("key_passphrase").to_string())
+                .masked(true)
+        });
         let proxy_host_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(t!("proxy_host").to_string()));
         let proxy_port_input =
@@ -742,6 +757,8 @@ impl Ashell {
             cx.subscribe_in(&key_path_input, window, Self::on_input_event),
             cx.subscribe_in(&key_inline_input, window, Self::on_input_event),
             cx.subscribe_in(&passphrase_input, window, Self::on_input_event),
+            cx.subscribe_in(&key_import_remark_input, window, Self::on_input_event),
+            cx.subscribe_in(&key_import_passphrase_input, window, Self::on_input_event),
             cx.subscribe_in(&proxy_host_input, window, Self::on_input_event),
             cx.subscribe_in(&proxy_port_input, window, Self::on_input_event),
             cx.subscribe_in(&proxy_user_input, window, Self::on_input_event),
@@ -820,6 +837,10 @@ impl Ashell {
             key_path_input,
             key_inline_input,
             passphrase_input,
+            key_import_remark_input,
+            key_import_passphrase_input,
+            key_import: KeyImportState::default(),
+            managed_key_dialog_selection: None,
             ssh_proxy_type: "none".to_string(),
             proxy_host_input,
             proxy_port_input,
@@ -970,7 +991,14 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if input == &self.sftp_path_input {
+        if input == &self.key_import_passphrase_input {
+            let passphrase = self
+                .key_import_passphrase_input
+                .read(cx)
+                .value()
+                .to_string();
+            self.key_import.revalidate(&passphrase, &self.managed_keys);
+        } else if input == &self.sftp_path_input {
             if let InputEvent::PressEnter { .. } = event {
                 let path = self
                     .sftp_path_input

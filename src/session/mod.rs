@@ -128,7 +128,7 @@ impl Ashell {
                         user.clone(),
                         String::new(),
                         String::new(),
-                        passphrase.clone(),
+                        String::new(),
                     );
                     s.managed_key_id = Some(mk_id.clone());
                     s
@@ -187,6 +187,8 @@ impl Ashell {
         self.ssh_auth_method = AuthMethod::Password;
         self.ssh_config_selected = None;
         self.managed_key_selected = None;
+        self.managed_key_dialog_selection = None;
+        self.editing_managed_key_id = None;
         self.using_custom_key_path = false;
         Self::set_input_value(&self.session_name_input, "", window, cx);
         Self::set_input_value(&self.host_input, "", window, cx);
@@ -196,6 +198,9 @@ impl Ashell {
         Self::set_input_value(&self.key_path_input, "", window, cx);
         Self::set_input_value(&self.key_inline_input, "", window, cx);
         Self::set_input_value(&self.passphrase_input, "", window, cx);
+        Self::set_input_value(&self.key_import_remark_input, "", window, cx);
+        Self::set_input_value(&self.key_import_passphrase_input, "", window, cx);
+        self.key_import.close();
         self.ssh_proxy_type = "none".to_string();
         Self::set_input_value(&self.proxy_host_input, "", window, cx);
         Self::set_input_value(&self.proxy_port_input, "", window, cx);
@@ -301,6 +306,248 @@ impl Ashell {
     }
 
     // ── Managed SSH keys ────────────────────────────────────────────
+
+    pub(crate) fn open_managed_key_selector(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.managed_key_dialog_selection = self.managed_key_selected.clone();
+        self.active_dialog = None;
+        window.close_dialog(cx);
+        let view = cx.entity();
+        window.defer(cx, move |window, cx| {
+            view.update(cx, |this, cx| {
+                this.show_managed_key_selector_dialog(window, cx);
+            });
+        });
+    }
+
+    pub(crate) fn select_managed_key_candidate(&mut self, key_id: String, cx: &mut Context<Self>) {
+        self.managed_key_dialog_selection = Some(key_id);
+        cx.notify();
+    }
+
+    pub(crate) fn begin_managed_key_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(key_id) = self.managed_key_dialog_selection.clone() else {
+            return;
+        };
+        let Some(key) = self.managed_keys.iter().find(|key| key.id == key_id) else {
+            return;
+        };
+        self.editing_managed_key_id = Some(key_id);
+        Self::set_input_value(&self.key_import_remark_input, key.name.clone(), window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn save_managed_key_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(key_id) = self.editing_managed_key_id.clone() else {
+            return;
+        };
+        let name = self
+            .key_import_remark_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            return;
+        }
+        self.rename_managed_key(key_id, name, cx);
+    }
+
+    pub(crate) fn cancel_managed_key_rename(&mut self, cx: &mut Context<Self>) {
+        self.editing_managed_key_id = None;
+        cx.notify();
+    }
+
+    pub(crate) fn confirm_managed_key_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.managed_key_selected = self.managed_key_dialog_selection.clone();
+        self.using_custom_key_path = false;
+        self.return_to_ssh_dialog(window, cx);
+    }
+
+    pub(crate) fn return_to_ssh_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing_managed_key_id = None;
+        self.managed_key_dialog_selection = None;
+        self.active_dialog = None;
+        window.close_dialog(cx);
+        let view = cx.entity();
+        window.defer(cx, move |window, cx| {
+            view.update(cx, |this, cx| this.show_ssh_dialog(window, cx));
+        });
+    }
+
+    pub(crate) fn open_key_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing_managed_key_id = None;
+        self.key_import.open();
+        Self::set_input_value(&self.key_import_remark_input, "", window, cx);
+        Self::set_input_value(&self.key_import_passphrase_input, "", window, cx);
+        self.active_dialog = None;
+        window.close_dialog(cx);
+        let view = cx.entity();
+        window.defer(cx, move |window, cx| {
+            view.update(cx, |this, cx| {
+                this.show_managed_key_import_dialog(window, cx);
+            });
+        });
+    }
+
+    pub(crate) fn close_key_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.key_import.close();
+        Self::set_input_value(&self.key_import_remark_input, "", window, cx);
+        Self::set_input_value(&self.key_import_passphrase_input, "", window, cx);
+        self.active_dialog = None;
+        window.close_dialog(cx);
+        let view = cx.entity();
+        window.defer(cx, move |window, cx| {
+            view.update(cx, |this, cx| {
+                this.show_managed_key_selector_dialog(window, cx);
+            });
+        });
+    }
+
+    pub(crate) fn pick_managed_key_import_file(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let start_dir = directories::BaseDirs::new()
+            .map(|d| d.home_dir().join(".ssh"))
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        let file_dialog = rfd::AsyncFileDialog::new()
+            .set_directory(start_dir)
+            .pick_file();
+
+        cx.spawn_in(window, async move |this, mut cx| {
+            if let Some(file) = file_dialog.await {
+                let path = file.path().to_path_buf();
+                let display_path = path.to_string_lossy().to_string();
+                let default_name = path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("imported-key")
+                    .to_string();
+
+                let _ = gpui::AsyncWindowContext::update(&mut cx, |_, cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        this.key_import.begin_file_validation(display_path.clone());
+                        cx.notify();
+                    });
+                });
+
+                let (result_tx, result_rx) = futures::channel::oneshot::channel();
+                std::thread::spawn(move || {
+                    let _ = result_tx.send(std::fs::read_to_string(&path));
+                });
+                let read_result = result_rx.await.unwrap_or_else(|_| {
+                    Err(std::io::Error::other("private key validation task stopped"))
+                });
+                let _ = gpui::AsyncWindowContext::update(&mut cx, |window, cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        if !this.key_import.open || this.key_import.path != display_path {
+                            return;
+                        }
+                        if this
+                            .key_import_remark_input
+                            .read(cx)
+                            .value()
+                            .trim()
+                            .is_empty()
+                        {
+                            Self::set_input_value(
+                                &this.key_import_remark_input,
+                                default_name,
+                                window,
+                                cx,
+                            );
+                        }
+                        match read_result {
+                            Ok(content) => {
+                                let passphrase = this
+                                    .key_import_passphrase_input
+                                    .read(cx)
+                                    .value()
+                                    .to_string();
+                                this.key_import.set_file(
+                                    display_path,
+                                    content,
+                                    &passphrase,
+                                    &this.managed_keys,
+                                );
+                            }
+                            Err(err) => this
+                                .key_import
+                                .set_read_error(display_path, format!("{err:#}")),
+                        }
+                        cx.notify();
+                    });
+                });
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    pub(crate) fn confirm_managed_key_import(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let crate::app::ssh_key_import::KeyImportValidation::Valid {
+            key_type,
+            fingerprint,
+        } = self.key_import.validation.clone()
+        else {
+            return;
+        };
+
+        let fallback_name = std::path::Path::new(&self.key_import.path)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("imported-key");
+        let remark = self
+            .key_import_remark_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let name = if remark.is_empty() {
+            fallback_name.to_string()
+        } else {
+            remark
+        };
+        let passphrase = self
+            .key_import_passphrase_input
+            .read(cx)
+            .value()
+            .to_string();
+        let key = ManagedKey {
+            id: Uuid::new_v4().to_string(),
+            name,
+            key_type,
+            fingerprint,
+            inline_content: self.key_import.content.clone(),
+            passphrase,
+            created_at: chrono::Local::now().timestamp(),
+        };
+        let key_id = key.id.clone();
+        self.config.upsert_managed_key(key);
+        if let Err(err) = self.config.save() {
+            tracing::warn!("failed to save config: {err:#}");
+            self.status = format!("{}: {err:#}", t!("key_import_failed")).into();
+            cx.notify();
+            return;
+        }
+        self.managed_keys = self.config.managed_keys().to_vec();
+        self.managed_key_dialog_selection = Some(key_id);
+        self.status = t!("key_imported").to_string().into();
+        self.close_key_import(window, cx);
+    }
 
     /// Open a file picker to import a private key into managed storage.
     /// Reads the file content, validates it, detects type + fingerprint,
@@ -419,12 +666,21 @@ impl Ashell {
         if self.managed_key_selected.as_deref() == Some(&key_id) {
             self.managed_key_selected = None;
         }
+        if self.managed_key_dialog_selection.as_deref() == Some(&key_id) {
+            self.managed_key_dialog_selection = None;
+        }
         cx.notify();
     }
 
-    /// Select a managed key in the connection form.
-    pub(crate) fn select_managed_key(&mut self, key_id: String, cx: &mut Context<Self>) {
-        self.managed_key_selected = Some(key_id);
+    pub(crate) fn delete_selected_managed_key(&mut self, cx: &mut Context<Self>) {
+        let Some(key_id) = self.managed_key_dialog_selection.clone() else {
+            return;
+        };
+        self.delete_managed_key(key_id, cx);
+    }
+
+    /// Switch the connection form back to managed-key mode.
+    pub(crate) fn use_managed_key(&mut self, cx: &mut Context<Self>) {
         self.using_custom_key_path = false;
         cx.notify();
     }
