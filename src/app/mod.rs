@@ -152,6 +152,49 @@ pub(crate) fn mark_window_active(window_handle: AnyWindowHandle) {
     }
 }
 
+/// Activate a target window after a cross-window operation and verify that the
+/// platform accepted the foreground request. Windows can reject the first
+/// request while the source window is still completing its mouse-up event.
+pub(crate) fn activate_window_with_retry(
+    window_handle: AnyWindowHandle,
+    focus_handle: FocusHandle,
+    cx: &mut App,
+) {
+    cx.spawn(async move |cx| {
+        const RETRY_DELAYS_MS: [u64; 4] = [0, 40, 80, 160];
+
+        for delay_ms in RETRY_DELAYS_MS {
+            if delay_ms > 0 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(delay_ms))
+                    .await;
+            }
+
+            if window_handle
+                .update(cx, |_, window, cx| {
+                    window.activate_window();
+                    window.focus(&focus_handle, cx);
+                })
+                .is_err()
+            {
+                return;
+            }
+
+            cx.background_executor()
+                .timer(Duration::from_millis(30))
+                .await;
+            match window_handle.update(cx, |_, window, _| window.is_window_active()) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(_) => return,
+            }
+        }
+
+        tracing::warn!("[ui] target window did not become active after retries");
+    })
+    .detach();
+}
+
 /// Update the stored screen bounds for `window_handle`.
 pub(crate) fn update_window_bounds(window_handle: AnyWindowHandle, bounds: Bounds<Pixels>) {
     let registry = window_registry();

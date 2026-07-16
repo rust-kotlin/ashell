@@ -2079,10 +2079,7 @@ impl Ashell {
                 match result {
                     Ok(()) => {
                         let focus_handle = target.read(cx).focus_handle.clone();
-                        let _ = target_window.update(cx, |_, window, cx| {
-                            window.activate_window();
-                            window.focus(&focus_handle, cx);
-                        });
+                        crate::app::activate_window_with_retry(target_window, focus_handle, cx);
                         self.status = "tab group moved into another window".into();
                         true
                     }

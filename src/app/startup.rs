@@ -348,6 +348,7 @@ fn open_window_with_options(
             if let Some(session) = session {
                 view.update(cx, |this, cx| this.open_ssh_session(session, cx));
             }
+            true
         },
         cx,
     )
@@ -372,13 +373,17 @@ pub(crate) fn open_new_window_with_group(
         session_store,
         move |view, cx| {
             let Some(transfer) = pending_for_window.borrow_mut().take() else {
-                return;
+                return false;
             };
-            if let Err((message, transfer)) = view.update(cx, |this, cx| {
+            match view.update(cx, |this, cx| {
                 this.receive_group_transfer(transfer, source_owner_id, cx)
             }) {
-                *failure_for_window.borrow_mut() = Some(message);
-                *pending_for_window.borrow_mut() = Some(transfer);
+                Ok(()) => true,
+                Err((message, transfer)) => {
+                    *failure_for_window.borrow_mut() = Some(message);
+                    *pending_for_window.borrow_mut() = Some(transfer);
+                    false
+                }
             }
         },
         cx,
@@ -403,21 +408,22 @@ pub(crate) fn open_new_window_with_group(
 fn open_window_with_initializer(
     window_options: WindowOptions,
     session_store: Entity<SessionStore>,
-    initialize: impl FnOnce(Entity<Ashell>, &mut App) + 'static,
+    initialize: impl FnOnce(Entity<Ashell>, &mut App) -> bool + 'static,
     cx: &mut App,
 ) -> Result<(), String> {
     cx.open_window(window_options, |window, cx| {
-        window.activate_window();
         window.set_window_title("ashell");
         gpui_component::Theme::sync_system_appearance(Some(window), cx);
         let view = cx.new(|cx| Ashell::new(window, session_store.clone(), cx));
 
         crate::app::register_window(window.window_handle(), view.clone());
-        initialize(view.clone(), cx);
+        let should_activate = initialize(view.clone(), cx);
 
         tracing::info!("[ui] application window opened");
-        let focus_handle = view.read(cx).focus_handle.clone();
-        window.focus(&focus_handle, cx);
+        if should_activate {
+            let focus_handle = view.read(cx).focus_handle.clone();
+            crate::app::activate_window_with_retry(window.window_handle(), focus_handle, cx);
+        }
 
         let view_clone = view.clone();
         window.on_window_should_close(cx, move |window: &mut gpui::Window, cx: &mut gpui::App| {
