@@ -3,11 +3,13 @@ name: Release
 # Build native installers and portable archives for Windows / Linux / macOS.
 #  - Push a tag like `v0.2.3`  -> builds all platforms and attaches the archives
 #    to a GitHub Release.
+#  - Push a `build/**` branch -> builds preview installers as workflow artifacts.
 #  - Run manually (workflow_dispatch) -> builds all platforms and uploads them as
 #    downloadable workflow artifacts (no release created).
 
 on:
   push:
+    branches: ["build/**"]
     tags: ["v*"]
   workflow_dispatch:
 
