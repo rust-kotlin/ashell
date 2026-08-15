@@ -90,6 +90,31 @@ To run the application locally:
 cargo run --release
 ```
 
+## Codex and Terminal Completion Notifications
+
+ashell supports generic OSC 9 completion notifications. For Codex CLI, add the following to
+`~/.codex/config.toml`:
+
+```toml
+[tui]
+notifications = ["agent-turn-complete", "approval-requested"]
+notification_method = "osc9"
+notification_condition = "unfocused"
+```
+
+When a task finishes while its tab is not visible, ashell shows a native notification. Unread
+notifications add a red badge to the macOS Dock icon or a red overlay to the Windows taskbar icon;
+viewing the corresponding tab clears it. The loading indicator beside a tab title prioritizes OSC
+133/633 shell-integration command lifecycle markers. Shells and CLI tools without those markers fall
+back to recent terminal output activity, while an OSC 9 completion notification clears the task's
+loading state immediately.
+
+You can test a generic OSC 9 notification with:
+
+```bash
+printf '\033]9;Task completed\007'
+```
+
 ## Package macOS App
 
 ```bash

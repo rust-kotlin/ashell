@@ -1750,6 +1750,7 @@ impl Ashell {
         if self.active_dialog.is_some() {
             return;
         }
+        self.show_collapsed_connections = false;
         let editing_group = group.clone();
         let is_editing = editing_group.is_some();
         let existing_groups = self.config.connection_groups();

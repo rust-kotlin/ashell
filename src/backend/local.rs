@@ -64,8 +64,9 @@ pub fn spawn_local_terminal_at(
                 $promptText = if ($global:AshellOriginalPrompt) { & $global:AshellOriginalPrompt } else { "PS $PWD> " }
                 $cwd = $PWD.ProviderPath
                 $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($cwd))
+                [Console]::Write("$([char]27)]133;D$([char]7)$([char]27)]133;A$([char]7)")
                 [Console]::Write("$([char]27)]0;ASHELL_CWD_B64:$encoded$([char]7)")
-                $promptText
+                "$promptText$([char]27)]133;B$([char]7)"
             }
         }"#;
         cmd.args(["-NoLogo", "-NoExit", "-Command", POWERSHELL_CWD_REPORTER]);

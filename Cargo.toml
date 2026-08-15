@@ -62,7 +62,22 @@ sha2 = "0.10"
 libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+raw-window-handle = "0.6"
+windows = { version = "0.57", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 winreg = "0.52"
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+desktop-notify = { package = "notify-rust", version = "=4.11.5", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSDockTile"] }
+objc2-foundation = { version = "0.3.2", features = ["NSString"] }
 
 [package.metadata.deb]
 maintainer = "ashell contributors"

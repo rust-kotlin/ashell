@@ -456,6 +456,7 @@ impl Ashell {
     }
 
     pub(crate) fn open_local(&mut self, cx: &mut Context<Self>) {
+        let previous_active_tab = self.active_tab.clone();
         let id = Uuid::new_v4().to_string();
         let initial_directory = default_local_directory();
         let backend_events =
@@ -494,6 +495,7 @@ impl Ashell {
                 self.status = format!("failed to open local terminal: {err:#}").into();
             }
         }
+        self.update_terminal_focus(previous_active_tab.as_deref());
         self.save_tabs_state_background();
         cx.notify();
     }
@@ -787,6 +789,7 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.show_collapsed_connections = false;
         let Some(session) = self.config.get(&session_id).cloned() else {
             self.status = "saved session not found".into();
             cx.notify();
@@ -802,6 +805,7 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.show_collapsed_connections = false;
         let Some(session) = self.config.get(&session_id).cloned() else {
             self.status = "saved session not found".into();
             cx.notify();
@@ -1006,6 +1010,7 @@ impl Ashell {
     }
 
     pub(crate) fn connect_saved_session(&mut self, session_id: String, cx: &mut Context<Self>) {
+        self.show_collapsed_connections = false;
         tracing::info!(
             "[ui] user clicked to connect saved session '{}'",
             session_id
@@ -1113,6 +1118,7 @@ impl Ashell {
     }
 
     pub(crate) fn open_ssh_session(&mut self, session: Session, cx: &mut Context<Self>) {
+        let previous_active_tab = self.active_tab.clone();
         tracing::info!(
             "[session] opening ssh tab for session '{}' ({}@{})",
             session.name,
@@ -1177,11 +1183,13 @@ impl Ashell {
         self.pending_sftp_path_sync = Some("/".into());
         self.status = "ssh tab opened".into();
         self.sync_system_tab_to_active_group();
+        self.update_terminal_focus(previous_active_tab.as_deref());
         self.save_tabs_state_background();
         cx.notify();
     }
 
     pub(crate) fn open_serial_session(&mut self, session: Session, cx: &mut Context<Self>) {
+        let previous_active_tab = self.active_tab.clone();
         tracing::info!(
             "[session] opening serial tab for session '{}' ({})",
             session.name,
@@ -1233,6 +1241,7 @@ impl Ashell {
             }
         }
         self.status = "serial tab opened".into();
+        self.update_terminal_focus(previous_active_tab.as_deref());
         self.save_tabs_state_background();
         cx.notify();
     }
@@ -1519,7 +1528,8 @@ impl Ashell {
 
     #[allow(dead_code)]
     pub(crate) fn activate_tab(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let active_tab_changed = self.active_tab.as_deref() != Some(id.as_str());
+        let previous_active_tab = self.active_tab.clone();
+        let active_tab_changed = previous_active_tab.as_deref() != Some(id.as_str());
         // Save current group state
         if let Some(group_id) = self.active_group.clone() {
             if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id) {
@@ -1563,6 +1573,7 @@ impl Ashell {
         }
         self.sync_sftp_to_active_tab();
         self.sync_system_tab_to_active_group();
+        self.update_terminal_focus(previous_active_tab.as_deref());
         if active_tab_changed {
             self.prompt_active_ssh_reconnect_if_needed(window, cx);
         }
@@ -1575,6 +1586,7 @@ impl Ashell {
     }
 
     pub(crate) fn handle_tab_close(&mut self, id: String) {
+        let previous_active_tab = self.active_tab.clone();
         if self
             .connection_progress
             .as_ref()
@@ -1704,6 +1716,8 @@ impl Ashell {
             for (_, handle) in self.sftp_handles.drain() {
                 handle.close();
             }
+            self.clear_closed_terminal_notifications();
+            self.update_terminal_focus(previous_active_tab.as_deref());
             self.save_tabs_state_background();
             return;
         }
@@ -1747,6 +1761,8 @@ impl Ashell {
         }
         self.sync_sftp_to_active_tab();
         self.sync_system_tab_to_active_group();
+        self.clear_closed_terminal_notifications();
+        self.update_terminal_focus(previous_active_tab.as_deref());
         self.save_tabs_state_background();
     }
 
@@ -1864,6 +1880,7 @@ impl Ashell {
     }
 
     pub(crate) fn split_current_pane(&mut self, direction: &str, cx: &mut Context<Self>) {
+        let previous_active_tab = self.active_tab.clone();
         tracing::info!(
             "[split] direction={} pane_root={:?} focused_path={:?} active_tab={:?} tabs={}",
             direction,
@@ -1995,6 +2012,7 @@ impl Ashell {
         self.active_tab = Some(new_id);
         self.sync_sftp_to_active_tab();
         self.sync_system_tab_to_active_group();
+        self.update_terminal_focus(previous_active_tab.as_deref());
         self.status = "pane split".into();
         tracing::info!(
             "[split] DONE: pane_root={:?} focused_path={:?} active_tab={:?} tabs={}",
@@ -2016,6 +2034,7 @@ impl Ashell {
         if self.focused_pane_path.is_empty() {
             return;
         }
+        let previous_active_tab = self.active_tab.clone();
         let mut active_tab_changed = false;
         let path = self.focused_pane_path.clone();
         if let Some(new_path) = Self::find_adjacent_pane(&self.pane_root, &path, direction) {
@@ -2040,6 +2059,7 @@ impl Ashell {
             cx.notify();
         }
         if active_tab_changed {
+            self.update_terminal_focus(previous_active_tab.as_deref());
             self.prompt_active_ssh_reconnect_if_needed(window, cx);
         }
     }
@@ -2176,6 +2196,7 @@ impl Ashell {
         }
         self.sync_sftp_to_active_tab();
         self.sync_system_tab_to_active_group();
+        self.update_terminal_focus(previous_active_tab.as_deref());
         self.save_tabs_state_background();
         if previous_active_tab != self.active_tab {
             self.prompt_active_ssh_reconnect_if_needed(window, cx);
@@ -2390,6 +2411,7 @@ impl Ashell {
     }
 
     pub(crate) fn focus_pane_with_id(&mut self, tab_id: String) {
+        let previous_active_tab = self.active_tab.clone();
         // Find the path to the given tab_id in the pane tree
         fn find_path(layout: &PaneLayout, target: &str, path: &mut Vec<usize>) -> bool {
             match layout {
@@ -2442,5 +2464,6 @@ impl Ashell {
                 self.sync_system_tab_to_active_group();
             }
         }
+        self.update_terminal_focus(previous_active_tab.as_deref());
     }
 }

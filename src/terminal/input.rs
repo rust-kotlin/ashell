@@ -208,6 +208,7 @@ impl Ashell {
         }
 
         tab.clear_selection();
+        tab.record_terminal_input(&bytes);
         let encoded = tab.encode_input(&bytes);
         tab.send_backend(BackendCommand::Input(encoded));
         window.prevent_default();

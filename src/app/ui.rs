@@ -17,6 +17,7 @@ use gpui_component::{
     popover::Popover,
     progress::Progress,
     scroll::{ScrollableElement as _, Scrollbar, ScrollbarShow},
+    spinner::Spinner,
     tab::{Tab, TabBar},
     v_flex,
 };
@@ -36,7 +37,7 @@ use crate::{
     },
     sftp::format_mtime,
     system::{RemotePort, RemoteProcess, format_bytes},
-    terminal::{self, TabKind},
+    terminal::{self, TabKind, TerminalTab},
     text_encoding::TERMINAL_ENCODINGS,
 };
 
@@ -3703,139 +3704,10 @@ impl Ashell {
             )
     }
 
-    fn render_collapsed_connection_row(
+    fn render_collapsed_connections_popover_content(
         &self,
-        session: crate::session::config::Session,
-        active_session_id: Option<&str>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let connect_id = session.id.clone();
-        let is_active = active_session_id == Some(session.id.as_str());
-        let name = session.name.clone();
-        let edit_id = session.id.clone();
-        let delete_id = session.id.clone();
-        let row_id = ElementId::Name(format!("collapsed-saved-{}", session.id).into());
-        let button_id = ElementId::Name(format!("connect-collapsed-session-{}", session.id).into());
-
-        div()
-            .id(row_id)
-            .w(px(36.))
-            .h(px(36.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .border_1()
-            .border_color(if is_active {
-                cx.theme().primary
-            } else {
-                cx.theme().border
-            })
-            .bg(if is_active {
-                cx.theme().tab_active
-            } else {
-                cx.theme().muted
-            })
-            .hover(|this| this.bg(cx.theme().secondary))
-            .tooltip({
-                let tooltip_text = format!("{} {}", name, session.user);
-                move |window, cx| {
-                    gpui_component::tooltip::Tooltip::new(tooltip_text.clone()).build(window, cx)
-                }
-            })
-            .context_menu({
-                let view = cx.entity();
-                move |menu, window, _| {
-                    let edit_value = edit_id.clone();
-                    let clone_value = edit_id.clone();
-                    let delete_value = delete_id.clone();
-                    menu.item(PopupMenuItem::new(t!("clone").to_string()).on_click(
-                        window.listener_for(&view, move |this, _, window, cx| {
-                            this.clone_saved_session(clone_value.clone(), window, cx)
-                        }),
-                    ))
-                    .item(
-                        PopupMenuItem::new(t!("edit").to_string()).on_click(window.listener_for(
-                            &view,
-                            move |this, _, window, cx| {
-                                this.edit_saved_session(edit_value.clone(), window, cx)
-                            },
-                        )),
-                    )
-                    .item(
-                        PopupMenuItem::new(t!("delete").to_string()).on_click(window.listener_for(
-                            &view,
-                            move |this, _, _, cx| {
-                                this.remove_saved_session(delete_value.clone(), cx)
-                            },
-                        )),
-                    )
-                }
-            })
-            .child(
-                pointer_button(button_id)
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::ExternalLink)
-                    .tooltip(t!("connect").to_string())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.connect_saved_session(connect_id.clone(), cx);
-                    })),
-            )
-            .into_any_element()
-    }
-
-    fn render_collapsed_connection_group_section(
-        &self,
-        section: ConnectionGroupSection,
-        force_expanded: bool,
-        active_session_id: Option<&str>,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let group = section.name.clone();
-        let display_name = if group.is_empty() {
-            t!("ungrouped").to_string()
-        } else {
-            group.clone()
-        };
-        let collapsed = !force_expanded && self.config.is_connection_group_collapsed(&group);
-        let tooltip = format!("{} ({})", display_name, section.sessions.len());
-        let toggle_group = group.clone();
-        let group_id = if group.is_empty() {
-            "section-ungrouped".to_string()
-        } else {
-            format!("section-group-{group}")
-        };
-
-        v_flex()
-            .w_full()
-            .items_center()
-            .gap_1()
-            .child(
-                pointer_button(ElementId::Name(
-                    format!("collapsed-connection-group-{group_id}").into(),
-                ))
-                .ghost()
-                .xsmall()
-                .icon(if collapsed {
-                    IconName::FolderClosed
-                } else {
-                    IconName::FolderOpen
-                })
-                .tooltip(tooltip)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggle_connection_group(toggle_group.clone(), cx);
-                })),
-            )
-            .when(!collapsed, |this| {
-                this.children(section.sessions.into_iter().map(|session| {
-                    self.render_collapsed_connection_row(session, active_session_id, cx)
-                }))
-            })
-            .into_any_element()
-    }
-
-    fn render_collapsed_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let connection_filter = self
             .connection_filter_input
             .read(cx)
@@ -3843,8 +3715,280 @@ impl Ashell {
             .trim()
             .to_lowercase();
         let group_sections = self.connection_group_sections(&connection_filter);
+        let visible_session_ids = group_sections
+            .iter()
+            .flat_map(|section| section.sessions.iter())
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        let has_connections = !visible_session_ids.is_empty();
+        let all_connections_selected = has_connections
+            && visible_session_ids
+                .iter()
+                .all(|id| self.selected_connection_ids.contains(id));
+        let total_connections = self.config.sessions().len();
+        let selected_connections = self
+            .config
+            .sessions()
+            .iter()
+            .filter(|session| self.selected_connection_ids.contains(&session.id))
+            .count();
+        let has_selected_connections = selected_connections > 0;
+        let has_group_sections = !group_sections.is_empty();
+        let connection_groups = self.config.connection_groups();
         let active_session_id = self.active_session_id().map(ToOwned::to_owned);
+        let expanded_session_count = group_sections
+            .iter()
+            .filter(|section| {
+                !connection_filter.is_empty()
+                    || !self.config.is_connection_group_collapsed(&section.name)
+            })
+            .map(|section| section.sessions.len())
+            .sum::<usize>();
+        let estimated_list_height = if has_group_sections {
+            (group_sections.len() as f32 * 36. + expanded_session_count as f32 * 40.)
+                .clamp(112., 420.)
+        } else {
+            88.
+        };
+        let empty_message = if self.config.sessions().is_empty() {
+            t!("no_connections").to_string()
+        } else {
+            t!("no_matching_connections").to_string()
+        };
+        let collapsed_saved_sessions_overflowing = self.collapsed_saved_sessions_overflowing;
+        let collapsed_saved_scroll_handle = self.collapsed_saved_scroll_handle.clone();
+        let sidebar_view = cx.entity();
+        let theme = cx.theme().clone();
 
+        v_flex()
+            .w_full()
+            .p_3()
+            .gap_2()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.foreground)
+                            .child(t!("connection_management")),
+                    )
+                    .child(
+                        pointer_button("collapsed-import-connections")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::ArrowDown)
+                            .tooltip(t!("import_connections").to_string())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_collapsed_connections = false;
+                                this.import_connections(window, cx);
+                            })),
+                    )
+                    .child(
+                        pointer_button("collapsed-export-connections")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::ArrowUp)
+                            .tooltip(t!("export_connections").to_string())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_collapsed_connections = false;
+                                this.export_connections(window, cx);
+                            })),
+                    )
+                    .child(
+                        pointer_button("collapsed-new-connection")
+                            .primary()
+                            .small()
+                            .icon(IconName::Plus)
+                            .label(t!("new_connection_short").to_string())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_collapsed_connections = false;
+                                this.open_new_ssh_dialog(window, cx);
+                            })),
+                    )
+                    .child(
+                        pointer_button("close-collapsed-connections")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip(t!("close_connections").to_string())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_collapsed_connections = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                Input::new(&self.connection_filter_input)
+                    .w_full()
+                    .min_w(px(0.)),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_1()
+                    .pl(px(5.))
+                    .py(px(4.))
+                    .child(
+                        h_flex()
+                            .w(px(16.))
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                pointer_checkbox("collapsed-connections-select-all")
+                                    .small()
+                                    .checked(all_connections_selected)
+                                    .disabled(!has_connections)
+                                    .tab_stop(false)
+                                    .on_click(cx.listener({
+                                        let visible_session_ids = visible_session_ids.clone();
+                                        move |this, checked, _, cx| {
+                                            this.set_connection_selection(
+                                                visible_session_ids.clone(),
+                                                *checked,
+                                                cx,
+                                            );
+                                        }
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(rems(0.75))
+                            .text_color(theme.muted_foreground)
+                            .child(format!("{selected_connections}/{total_connections}")),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        pointer_button("collapsed-new-connection-group")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Plus)
+                            .tooltip(t!("new_connection_group").to_string())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_collapsed_connections = false;
+                                this.show_connection_group_dialog(None, window, cx);
+                            })),
+                    )
+                    .child({
+                        let groups = connection_groups.clone();
+                        pointer_button("collapsed-move-selected-connections")
+                            .ghost()
+                            .small()
+                            .icon(IconName::FolderClosed)
+                            .tooltip(t!("move_to_group").to_string())
+                            .disabled(!has_selected_connections)
+                            .dropdown_menu_with_anchor(Anchor::BottomRight, {
+                                let view = cx.entity();
+                                move |menu, window, _| {
+                                    let menu = menu.min_w(0.).item(
+                                        PopupMenuItem::new(t!("ungrouped").to_string()).on_click(
+                                            window.listener_for(&view, |this, _, _, cx| {
+                                                this.move_selected_connections_to_group(
+                                                    String::new(),
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
+                                    );
+                                    groups.iter().fold(menu, |menu, group| {
+                                        let group = group.clone();
+                                        let label = group.clone();
+                                        menu.item(PopupMenuItem::new(label).on_click(
+                                            window.listener_for(&view, move |this, _, _, cx| {
+                                                this.move_selected_connections_to_group(
+                                                    group.clone(),
+                                                    cx,
+                                                );
+                                            }),
+                                        ))
+                                    })
+                                }
+                            })
+                    })
+                    .child(
+                        pointer_button("collapsed-delete-selected-connections")
+                            .danger()
+                            .small()
+                            .icon(IconName::Delete)
+                            .label(t!("delete_selected_connections").to_string())
+                            .disabled(!has_selected_connections)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.remove_selected_sessions(cx);
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .h(px(estimated_list_height))
+                    .flex_none()
+                    .min_h(px(0.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .h_full()
+                            .id("collapsed-connections-scroll")
+                            .track_scroll(&self.collapsed_saved_scroll_handle)
+                            .overflow_y_scroll()
+                            .on_prepaint(move |_, _, cx| {
+                                let overflowing =
+                                    collapsed_saved_scroll_handle.max_offset().y > px(0.);
+                                sidebar_view.update(cx, |this, cx| {
+                                    if this.collapsed_saved_sessions_overflowing != overflowing {
+                                        this.collapsed_saved_sessions_overflowing = overflowing;
+                                        cx.notify();
+                                    }
+                                });
+                            })
+                            .child(if has_group_sections {
+                                v_flex()
+                                    .w_full()
+                                    .min_w(px(0.))
+                                    .gap_2()
+                                    .children(group_sections.into_iter().map(|section| {
+                                        self.render_connection_group_section(
+                                            section,
+                                            !connection_filter.is_empty(),
+                                            active_session_id.as_deref(),
+                                            cx,
+                                        )
+                                    }))
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .size_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(rems(0.833))
+                                    .text_color(theme.muted_foreground)
+                                    .child(empty_message)
+                                    .into_any_element()
+                            }),
+                    )
+                    .when(collapsed_saved_sessions_overflowing, |this| {
+                        this.child(
+                            div().relative().w(px(12.)).h_full().flex_none().child(
+                                Scrollbar::vertical(&self.collapsed_saved_scroll_handle)
+                                    .scrollbar_show(ScrollbarShow::Scrolling),
+                            ),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_collapsed_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .w_full()
             .h_full()
@@ -3855,7 +3999,6 @@ impl Ashell {
             .bg(cx.theme().sidebar)
             .overflow_hidden()
             .items_center()
-            // Top: expand button only
             .child(
                 div()
                     .w_full()
@@ -3869,6 +4012,7 @@ impl Ashell {
                             .icon(IconName::PanelLeftOpen)
                             .tooltip(t!("settings_toggle_sidebar").to_string())
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_collapsed_connections = false;
                                 this.sidebar_collapsed = false;
                                 this.config.set_sidebar_collapsed(false);
                                 this.save_preferences_background();
@@ -3876,48 +4020,29 @@ impl Ashell {
                             })),
                     ),
             )
-            // Saved sessions as compact cards
             .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .w_full()
-                    .child(
-                        v_flex()
-                            .size_full()
-                            .id("collapsed-saved-sessions-scroll")
-                            .track_scroll(&self.collapsed_saved_scroll_handle)
-                            .overflow_y_scroll()
-                            .pr(px(12.))
-                            .gap_2()
-                            .items_center()
-                            .children(group_sections.into_iter().map(|section| {
-                                self.render_collapsed_connection_group_section(
-                                    section,
-                                    !connection_filter.is_empty(),
-                                    active_session_id.as_deref(),
-                                    cx,
-                                )
-                            })),
+                Popover::new("collapsed-connections-popover")
+                    .anchor(Anchor::TopLeft)
+                    .open(self.show_collapsed_connections)
+                    .on_open_change(cx.listener(|this, open, _, cx| {
+                        if this.show_collapsed_connections != *open {
+                            this.show_collapsed_connections = *open;
+                            cx.notify();
+                        }
+                    }))
+                    .trigger(
+                        pointer_button("collapsed-connections-trigger")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Network)
+                            .tooltip(t!("connection_management").to_string()),
                     )
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .bottom_0()
-                            .right_0()
-                            .w(px(12.))
-                            .child(
-                                gpui_component::scroll::Scrollbar::new(
-                                    &self.collapsed_saved_scroll_handle,
-                                )
-                                .id("collapsed-saved-scrollbar")
-                                .axis(gpui_component::scroll::ScrollbarAxis::Vertical)
-                                .scrollbar_show(gpui_component::scroll::ScrollbarShow::Scrolling),
-                            ),
-                    ),
+                    .ml(px(40.))
+                    .w(px(480.))
+                    .p_0()
+                    .child(self.render_collapsed_connections_popover_content(cx)),
             )
+            .child(div().flex_1())
     }
 
     fn render_window_controls(
@@ -4142,6 +4267,12 @@ impl Ashell {
                                             }
                                         })
                                         .unwrap_or(cx.theme().success);
+                                    let output_active = pane_ids.iter().any(|id| {
+                                        self.tabs
+                                            .iter()
+                                            .find(|tab| tab.id == *id)
+                                            .is_some_and(TerminalTab::is_command_active)
+                                    });
                                     Tab::new()
                                         .min_w(px(80.))
                                         .child(
@@ -4151,11 +4282,26 @@ impl Ashell {
                                                 .items_center()
                                                 .gap_2()
                                                 .child(
-                                                    div()
+                                                    h_flex()
                                                         .flex_none()
-                                                        .size(px(6.))
-                                                        .rounded_full()
-                                                        .bg(dot_color),
+                                                        .size(px(12.))
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .when(output_active, |this| {
+                                                            this.child(
+                                                                Spinner::new()
+                                                                    .xsmall()
+                                                                    .color(cx.theme().primary),
+                                                            )
+                                                        })
+                                                        .when(!output_active, |this| {
+                                                            this.child(
+                                                                div()
+                                                                    .size(px(6.))
+                                                                    .rounded_full()
+                                                                    .bg(dot_color),
+                                                            )
+                                                        }),
                                                 )
                                                 .child(
                                                     div()
@@ -5211,6 +5357,9 @@ impl Render for Ashell {
             .on_action(cx.listener(|this, _: &crate::OpenSearch, window, cx| this.toggle_search(window, cx)))
             .on_action(cx.listener(|this, _: &crate::ToggleSidebar, _, cx| {
                 this.sidebar_collapsed = !this.sidebar_collapsed;
+                if !this.sidebar_collapsed {
+                    this.show_collapsed_connections = false;
+                }
                 this.is_layout_reset = false;
                 this.config.set_sidebar_collapsed(this.sidebar_collapsed);
                 this.save_preferences_background();

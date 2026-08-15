@@ -1,4 +1,5 @@
 #define MyAppName "ashell"
+#define MyAppUserModelId "dev.ashell.app"
 #define MyAppVersion GetEnv("PACKAGE_VERSION")
 #define MyAppArch GetEnv("ASHELL_ARCH")
 #define MyAppExeSource GetEnv("ASHELL_BINARY_PATH")
@@ -74,8 +75,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#MyAppExeSource}"; DestDir: "{app}"; DestName: "ashell.exe"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\ashell"; Filename: "{app}\ashell.exe"
-Name: "{autodesktop}\ashell"; Filename: "{app}\ashell.exe"; Tasks: desktopicon
+Name: "{autoprograms}\ashell"; Filename: "{app}\ashell.exe"; AppUserModelID: "{#MyAppUserModelId}"
+Name: "{autodesktop}\ashell"; Filename: "{app}\ashell.exe"; AppUserModelID: "{#MyAppUserModelId}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\ashell.exe"; Description: "{cm:LaunchProgram,ashell}"; Flags: nowait postinstall skipifsilent

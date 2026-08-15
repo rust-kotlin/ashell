@@ -316,6 +316,7 @@ pub(crate) struct Ashell {
     pub(crate) transfers: Vec<crate::terminal::Transfer>,
     pub(crate) show_transfers_dialog: bool,
     pub(crate) show_command_history: bool,
+    pub(crate) show_collapsed_connections: bool,
     pub(crate) ssh_command_buffers: HashMap<String, String>,
     pub(crate) ssh_command_starts: HashMap<String, (usize, usize)>,
     pub(crate) system_status: Option<SharedString>,
@@ -339,6 +340,10 @@ pub(crate) struct Ashell {
     pub(crate) sftp_panel_minimized: bool,
     pub(crate) sidebar_collapsed: bool,
     pub(crate) collapsed_saved_scroll_handle: gpui::ScrollHandle,
+    pub(crate) collapsed_saved_sessions_overflowing: bool,
+    pub(crate) window_active: bool,
+    pub(crate) native_window_handle: Option<isize>,
+    pub(crate) unread_terminal_notifications: HashSet<String>,
     pub(crate) prev_monitoring_size: Option<Pixels>,
     pub(crate) status: SharedString,
     pub(crate) config: ConfigStore,
@@ -658,6 +663,7 @@ impl Ashell {
                 window,
                 Self::on_input_event,
             ),
+            cx.observe_window_activation(window, Self::on_window_activation_changed),
             cx.observe_window_bounds(window, Self::on_window_bounds_changed),
             cx.on_app_quit(Self::save_layout_on_app_quit),
         ];
@@ -837,6 +843,7 @@ impl Ashell {
             },
             show_transfers_dialog: false,
             show_command_history: false,
+            show_collapsed_connections: false,
             ssh_command_buffers: HashMap::new(),
             ssh_command_starts: HashMap::new(),
             system_status: None,
@@ -857,6 +864,10 @@ impl Ashell {
             sftp_panel_minimized: config.sftp_panel_minimized(),
             sidebar_collapsed: config.sidebar_collapsed(),
             collapsed_saved_scroll_handle: gpui::ScrollHandle::new(),
+            collapsed_saved_sessions_overflowing: false,
+            window_active: window.is_window_active(),
+            native_window_handle: crate::desktop_notification::native_window_handle(window),
+            unread_terminal_notifications: HashSet::new(),
             prev_monitoring_size: None,
             status: "ready".into(),
             active_title_bar_style: config.title_bar_style(),
@@ -902,6 +913,7 @@ impl Ashell {
 
         this.apply_theme_preferences(window, cx);
         this.restore_saved_tabs(window, cx);
+        this.report_active_terminal_focus(this.window_active);
         this.start_event_pump(cx);
         this
     }
@@ -1056,6 +1068,126 @@ impl Ashell {
         });
     }
 
+    fn expire_terminal_activity(&mut self, now: Instant) -> bool {
+        self.tabs.iter_mut().fold(false, |changed, tab| {
+            tab.expire_output_activity(now) || changed
+        })
+    }
+
+    fn handle_terminal_notification(&mut self, tab_id: &str, message: String) {
+        if self.is_terminal_visible(tab_id) {
+            return;
+        }
+
+        let title = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| format!("ashell - {}", tab.title))
+            .unwrap_or_else(|| "ashell".to_string());
+        crate::desktop_notification::show_terminal_notification(title, message);
+        if self
+            .unread_terminal_notifications
+            .insert(tab_id.to_string())
+        {
+            self.update_unread_indicator();
+        }
+    }
+
+    fn is_terminal_visible(&self, tab_id: &str) -> bool {
+        if !self.window_active {
+            return false;
+        }
+
+        self.active_group
+            .as_ref()
+            .and_then(|group_id| self.tab_groups.iter().find(|group| &group.id == group_id))
+            .map(|group| group.pane_root.contains(tab_id))
+            .unwrap_or_else(|| self.active_tab.as_deref() == Some(tab_id))
+    }
+
+    fn update_unread_indicator(&self) {
+        crate::desktop_notification::set_unread_indicator(
+            !self.unread_terminal_notifications.is_empty(),
+            self.native_window_handle,
+        );
+    }
+
+    pub(crate) fn clear_visible_terminal_notifications(&mut self) {
+        if !self.window_active {
+            return;
+        }
+
+        let visible_tab_ids = self
+            .active_group
+            .as_ref()
+            .and_then(|group_id| self.tab_groups.iter().find(|group| &group.id == group_id))
+            .map(|group| {
+                group
+                    .pane_root
+                    .tab_ids()
+                    .into_iter()
+                    .map(ToOwned::to_owned)
+                    .collect::<HashSet<_>>()
+            })
+            .or_else(|| {
+                self.active_tab
+                    .as_ref()
+                    .map(|tab_id| HashSet::from([tab_id.clone()]))
+            })
+            .unwrap_or_default();
+        let previous_count = self.unread_terminal_notifications.len();
+        self.unread_terminal_notifications
+            .retain(|tab_id| !visible_tab_ids.contains(tab_id));
+        if previous_count != self.unread_terminal_notifications.len() {
+            self.update_unread_indicator();
+        }
+    }
+
+    pub(crate) fn clear_closed_terminal_notifications(&mut self) {
+        let open_tab_ids = self
+            .tabs
+            .iter()
+            .map(|tab| tab.id.clone())
+            .collect::<HashSet<_>>();
+        let previous_count = self.unread_terminal_notifications.len();
+        self.unread_terminal_notifications
+            .retain(|tab_id| open_tab_ids.contains(tab_id));
+        if previous_count != self.unread_terminal_notifications.len() {
+            self.update_unread_indicator();
+        }
+    }
+
+    pub(crate) fn update_terminal_focus(&mut self, previous_tab_id: Option<&str>) {
+        let active_tab_id = self.active_tab.clone();
+        if previous_tab_id != active_tab_id.as_deref() {
+            if let Some(previous_tab_id) = previous_tab_id {
+                if let Some(tab) = self.tabs.iter().find(|tab| tab.id == previous_tab_id) {
+                    tab.report_focus(false);
+                }
+            }
+            self.report_active_terminal_focus(self.window_active);
+        }
+        self.clear_visible_terminal_notifications();
+    }
+
+    fn report_active_terminal_focus(&self, focused: bool) {
+        if let Some(tab) = self
+            .active_tab
+            .as_ref()
+            .and_then(|tab_id| self.tabs.iter().find(|tab| &tab.id == tab_id))
+        {
+            tab.report_focus(focused);
+        }
+    }
+
+    fn on_window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_active = window.is_window_active();
+        self.report_active_terminal_focus(self.window_active);
+        self.clear_visible_terminal_notifications();
+        cx.notify();
+    }
+
     pub(crate) fn start_event_pump(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let mut last_blink_time = std::time::Instant::now();
@@ -1074,10 +1206,11 @@ impl Ashell {
                                 | crate::session::config::CursorStyle::BeamBlink
                         );
                         let now = std::time::Instant::now();
+                        let activity_changed = this.expire_terminal_activity(now);
                         let blink_due = is_blinking
                             && now.duration_since(last_blink_time)
                                 >= std::time::Duration::from_millis(600);
-                        if changed || system_sampled || blink_due {
+                        if changed || system_sampled || activity_changed || blink_due {
                             cx.notify();
                             if blink_due {
                                 last_blink_time = now;
@@ -1104,8 +1237,14 @@ impl Ashell {
             match event {
                 BackendEvent::Guarded { .. } => unreachable!("guarded events are unwrapped above"),
                 BackendEvent::Output { tab_id, bytes } => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        tab.feed(&bytes);
+                    let notifications = self
+                        .tabs
+                        .iter_mut()
+                        .find(|tab| tab.id == tab_id)
+                        .map(|tab| tab.feed(&bytes))
+                        .unwrap_or_default();
+                    for message in notifications {
+                        self.handle_terminal_notification(&tab_id, message);
                     }
                 }
                 BackendEvent::Status { tab_id, text } => {
@@ -1315,6 +1454,7 @@ impl Ashell {
                         continue;
                     }
                     if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        tab.clear_command_activity();
                         tab.connected = false;
                         tab.status = reason.clone();
                         tab.disconnected_reason = Some(reason.clone());
@@ -2032,6 +2172,7 @@ impl Ashell {
     }
 
     fn save_layout_on_app_quit(&mut self, cx: &mut Context<Self>) -> gpui::Task<()> {
+        crate::desktop_notification::clear_unread_indicator(self.native_window_handle);
         let entity_id = cx.entity_id();
         let _ = cx.with_window(entity_id, |window, cx| {
             self.save_layout_state(window, cx);

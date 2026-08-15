@@ -5,6 +5,7 @@ use gpui_component_assets::Assets;
 
 mod app;
 mod backend;
+mod desktop_notification;
 mod session;
 mod sftp;
 mod sync;
@@ -27,6 +28,7 @@ pub(crate) use app::{Ashell, PaneLayout, SelectorEntry, SftpContextMenuState, Ta
 fn main() {
     app::startup::sync_macos_launch_environment();
     app::startup::init_logging();
+    desktop_notification::initialize();
 
     #[cfg(target_os = "macos")]
     let app = gpui_platform::application()

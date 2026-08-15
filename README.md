@@ -90,6 +90,29 @@ sudo xattr -cr /Applications/ashell.app
 cargo run --release
 ```
 
+## Codex 与终端完成通知
+
+ashell 支持通用 OSC 9 完成通知。以 Codex CLI 为例，可在 `~/.codex/config.toml` 中加入：
+
+```toml
+[tui]
+notifications = ["agent-turn-complete", "approval-requested"]
+notification_method = "osc9"
+notification_condition = "unfocused"
+```
+
+当任务完成且对应标签不可见时，ashell 会显示系统通知；未读通知会在 macOS Dock
+或 Windows 任务栏图标上显示红色徽标，切回对应标签后自动清除。标签标题左侧的
+Loading 动画优先识别 OSC 133/633 shell integration 的命令开始和结束标记；未提供
+这些标记的 shell 或 CLI 会根据近期终端输出活动回退显示。OSC 9 完成通知会立即结束
+对应任务的 Loading 状态。
+
+也可以使用下面的命令测试任意 OSC 9 通知：
+
+```bash
+printf '\033]9;Task completed\007'
+```
+
 ## 打包 macOS 应用
 
 ```bash
