@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-16
+
 ### 新增
 
 - 新增应用退出快捷键。macOS 默认使用 `Command+Q`，Windows 默认使用 `Alt+F4`，
