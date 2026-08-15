@@ -20,7 +20,11 @@ v0.4 builds on the v0.3 foundation and focuses on more capable workspace operati
 
 ## Download
 
-You can download the latest pre-compiled releases for macOS, Windows, and Linux from the [GitHub Releases page](https://github.com/rust-kotlin/ashell/releases/latest).
+You can download the latest installers from the [GitHub Releases page](https://github.com/rust-kotlin/ashell/releases/latest):
+
+- macOS: `.dmg` installers for x64 and arm64, plus portable `.zip` archives.
+- Windows: `Setup.exe` installers for x64, x86, and arm64, plus portable `.zip` archives.
+- Linux: a portable x64 `.tar.gz` archive.
 
 ## Mac Installation Guide
 
@@ -43,13 +47,26 @@ brew upgrade ashell --cask
 
 ### Method 2: Manual Download
 
-1. Download and unzip from the [Releases page](https://github.com/rust-kotlin/ashell/releases/latest).
-2. Move `ashell.app` to your **Applications** folder. 
+1. Download the `.dmg` matching your processor from the [Releases page](https://github.com/rust-kotlin/ashell/releases/latest).
+2. Open the DMG and drag `ashell.app` into **Applications**.
 3. Since the app uses ad-hoc signing, macOS may warn that the app is "damaged" upon first launch. If this happens, open Terminal and run:
 
 ```bash
 sudo xattr -cr /Applications/ashell.app
 ```
+
+## Windows Installation Guide
+
+Download the appropriate installer from the [Releases page](https://github.com/rust-kotlin/ashell/releases/latest):
+
+| System architecture | Installer suffix |
+| --- | --- |
+| Intel/AMD 64-bit | `windows-x64-setup.exe` |
+| Intel/AMD 32-bit | `windows-x86-setup.exe` |
+| Windows on ARM | `windows-arm64-setup.exe` |
+
+The installer can optionally create a desktop shortcut and registers ashell in the Start menu and the Windows uninstall list.
+The installer is not yet signed with a commercial code-signing certificate, so Windows SmartScreen may display a security warning.
 
 ## Features
 

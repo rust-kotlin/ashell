@@ -1,6 +1,6 @@
 name: Release
 
-# Build native binaries for Windows / Linux / macOS.
+# Build native installers and portable archives for Windows / Linux / macOS.
 #  - Push a tag like `v0.2.3`  -> builds all platforms and attaches the archives
 #    to a GitHub Release.
 #  - Run manually (workflow_dispatch) -> builds all platforms and uploads them as
@@ -22,21 +22,43 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          - os: windows-2022
             target: x86_64-pc-windows-msvc
-            name: windows-x86_64
+            name: windows-x64
+            kind: windows
+            arch: x64
+            bin: ashell.exe
+          - os: windows-2022
+            target: i686-pc-windows-msvc
+            name: windows-x86
+            kind: windows
+            arch: x86
+            bin: ashell.exe
+          - os: windows-2022
+            target: aarch64-pc-windows-msvc
+            name: windows-arm64
+            kind: windows
+            arch: arm64
             bin: ashell.exe
           - os: ubuntu-22.04 # build on the oldest supported runner for broader glibc compatibility
             target: x86_64-unknown-linux-gnu
-            name: linux-x86_64
+            name: linux-x64
+            kind: linux
+            arch: x64
             bin: ashell
           - os: macos-14 # Apple Silicon
             target: aarch64-apple-darwin
-            name: macos-aarch64
+            name: macos-arm64
+            kind: macos
+            arch: arm64
+            binary_arch: arm64
             bin: ashell
           - os: macos-14 # Intel (cross-compiled from Apple Silicon to avoid queue delays)
             target: x86_64-apple-darwin
-            name: macos-x86_64
+            name: macos-x64
+            kind: macos
+            arch: x64
+            binary_arch: x86_64
             bin: ashell
 
     steps:
@@ -68,28 +90,46 @@ jobs:
       - name: Build (release)
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Set package metadata
         shell: bash
         run: |
-          set -eu
-          VERSION="${GITHUB_REF_NAME:-dev}"
-          STAGE="ashell-${VERSION}-${{ matrix.name }}"
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$VERSION" ]; then
+            echo "Unable to read the package version from Cargo.toml" >&2
+            exit 1
+          fi
 
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            # ── Build a proper .app bundle ────────────────────────────────────
-            # Note: We build the bundle manually here rather than running
-            # scripts/package-macos-app.sh, because that script runs `cargo build`
-            # without respecting the `--target` flag from the matrix.
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            PACKAGE_VERSION="${GITHUB_REF_NAME#v}"
+            if [ "$PACKAGE_VERSION" != "$VERSION" ]; then
+              echo "Tag version $PACKAGE_VERSION does not match Cargo.toml version $VERSION" >&2
+              exit 1
+            fi
+          else
+            PACKAGE_VERSION="${VERSION}-dev.${GITHUB_SHA:0:7}"
+          fi
 
-            APP="ashell.app"
-            CONTENTS="$APP/Contents"
-            mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "PACKAGE_VERSION=$PACKAGE_VERSION" >> "$GITHUB_ENV"
+          echo "PACKAGE_BASENAME=ashell-v${PACKAGE_VERSION}-${{ matrix.name }}" >> "$GITHUB_ENV"
 
-            cp "target/${{ matrix.target }}/release/ashell" "$CONTENTS/MacOS/"
-            cp "assets/icons/ashell.icns" "$CONTENTS/Resources/ashell.icns"
+      - name: Package macOS app, DMG, and portable archive
+        if: matrix.kind == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_ROOT="$RUNNER_TEMP/${PACKAGE_BASENAME}-app"
+          DMG_ROOT="$RUNNER_TEMP/${PACKAGE_BASENAME}-dmg"
+          APP="$APP_ROOT/ashell.app"
+          CONTENTS="$APP/Contents"
 
-            VERSION_NUM="${VERSION#v}"
-            cat > "$CONTENTS/Info.plist" <<EOF
+          mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$DMG_ROOT" dist
+          cp "target/${{ matrix.target }}/release/ashell" "$CONTENTS/MacOS/ashell"
+          chmod 755 "$CONTENTS/MacOS/ashell"
+          cp "assets/icons/ashell.icns" "$CONTENTS/Resources/ashell.icns"
+
+          cat > "$CONTENTS/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
             "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -110,9 +150,9 @@ jobs:
             <key>CFBundlePackageType</key>
             <string>APPL</string>
             <key>CFBundleShortVersionString</key>
-            <string>${VERSION_NUM}</string>
+            <string>${VERSION}</string>
             <key>CFBundleVersion</key>
-            <string>1</string>
+            <string>${GITHUB_RUN_NUMBER}</string>
             <key>LSMinimumSystemVersion</key>
             <string>12.0</string>
             <key>NSHighResolutionCapable</key>
@@ -121,35 +161,88 @@ jobs:
           </plist>
           EOF
 
-            printf 'APPL????' > "$CONTENTS/PkgInfo"
+          printf 'APPL????' > "$CONTENTS/PkgInfo"
+          plutil -lint "$CONTENTS/Info.plist"
 
-            # Ad-hoc code-sign the assembled bundle.
-            codesign --force --deep --sign - "$APP"
-            codesign --verify --verbose "$APP"
+          # Release builds remain ad-hoc signed until signing credentials are configured.
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
 
-            # Package with ditto (Apple's tool) to preserve signature/metadata
-            ditto -c -k --keepParent "$APP" "${STAGE}.zip"
-            echo "ASSET=${STAGE}.zip" >> "$GITHUB_ENV"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$APP" "dist/${PACKAGE_BASENAME}-portable.zip"
+          ditto "$APP" "$DMG_ROOT/ashell.app"
+          ln -s /Applications "$DMG_ROOT/Applications"
+          hdiutil create \
+            -volname "ashell ${VERSION}" \
+            -srcfolder "$DMG_ROOT" \
+            -ov \
+            -format UDZO \
+            "dist/${PACKAGE_BASENAME}.dmg"
 
-          elif [ "${{ runner.os }}" = "Windows" ]; then
-            mkdir "$STAGE"
-            cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGE/"
-            7z a "${STAGE}.zip" "$STAGE" >/dev/null
-            echo "ASSET=${STAGE}.zip" >> "$GITHUB_ENV"
-
-          else
-            # Linux
-            mkdir "$STAGE"
-            cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGE/"
-            tar -czf "${STAGE}.tar.gz" "$STAGE"
-            echo "ASSET=${STAGE}.tar.gz" >> "$GITHUB_ENV"
+          EXPECTED_ARCH="${{ matrix.binary_arch }}"
+          ACTUAL_ARCHS="$(lipo -archs "$CONTENTS/MacOS/ashell")"
+          if [ "$ACTUAL_ARCHS" != "$EXPECTED_ARCH" ]; then
+            echo "Expected $EXPECTED_ARCH binary, found $ACTUAL_ARCHS" >&2
+            exit 1
           fi
+
+          shasum -a 256 dist/*
+
+      - name: Package Windows installer and portable archive
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        env:
+          ASHELL_ARCH: ${{ matrix.arch }}
+          ASHELL_BINARY_PATH: ${{ github.workspace }}\target\${{ matrix.target }}\release\ashell.exe
+          ASHELL_OUTPUT_DIR: ${{ github.workspace }}\dist
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Path "dist" -Force | Out-Null
+
+          $isccCommand = Get-Command "ISCC.exe" -ErrorAction SilentlyContinue
+          if ($null -ne $isccCommand) {
+            $iscc = $isccCommand.Source
+          } else {
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path $iscc)) {
+            throw "Inno Setup compiler was not found"
+          }
+
+          & $iscc "packaging\windows\ashell.iss"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup failed with exit code $LASTEXITCODE"
+          }
+
+          $installer = "dist\${env:PACKAGE_BASENAME}-setup.exe"
+          if (-not (Test-Path $installer)) {
+            throw "Expected installer was not created: $installer"
+          }
+
+          $stage = Join-Path $env:RUNNER_TEMP $env:PACKAGE_BASENAME
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item $env:ASHELL_BINARY_PATH (Join-Path $stage "ashell.exe")
+          Compress-Archive -Path $stage -DestinationPath "dist\${env:PACKAGE_BASENAME}-portable.zip"
+          Get-FileHash -Algorithm SHA256 "dist\*"
+
+      - name: Package Linux portable archive
+        if: matrix.kind == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/$PACKAGE_BASENAME"
+          mkdir -p "$STAGE" dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGE/"
+          tar -C "$RUNNER_TEMP" -czf "dist/${PACKAGE_BASENAME}.tar.gz" "$PACKAGE_BASENAME"
+          sha256sum dist/*
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: ${{ env.ASSET }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
 
   publish:
     name: Publish Release
@@ -161,11 +254,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
+          merge-multiple: true
 
       - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/**/*
+          files: dist/*
           generate_release_notes: true
           fail_on_unmatched_files: true
 
@@ -187,12 +281,13 @@ jobs:
         with:
           pattern: macos-*
           path: dist
+          merge-multiple: true
 
       - name: Update Cask
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
-          SHA_ARM=$(sha256sum dist/macos-aarch64/*.zip | cut -d' ' -f1)
-          SHA_INTEL=$(sha256sum dist/macos-x86_64/*.zip | cut -d' ' -f1)
+          SHA_ARM=$(sha256sum "dist/ashell-v${VERSION}-macos-arm64.dmg" | cut -d' ' -f1)
+          SHA_INTEL=$(sha256sum "dist/ashell-v${VERSION}-macos-x64.dmg" | cut -d' ' -f1)
 
           mkdir -p tap/Casks
           CASK_FILE="tap/Casks/ashell.rb"
@@ -203,11 +298,11 @@ jobs:
 
             on_arm do
               sha256 "${SHA_ARM}"
-              url "https://github.com/rust-kotlin/ashell/releases/download/v#{version}/ashell-v#{version}-macos-aarch64.zip"
+              url "https://github.com/rust-kotlin/ashell/releases/download/v#{version}/ashell-v#{version}-macos-arm64.dmg"
             end
             on_intel do
               sha256 "${SHA_INTEL}"
-              url "https://github.com/rust-kotlin/ashell/releases/download/v#{version}/ashell-v#{version}-macos-x86_64.zip"
+              url "https://github.com/rust-kotlin/ashell/releases/download/v#{version}/ashell-v#{version}-macos-x64.dmg"
             end
 
             name "ashell"

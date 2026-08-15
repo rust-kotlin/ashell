@@ -20,7 +20,11 @@ v0.4 在 v0.3 打下的基础上，重点带来了更完整的工作区操作能
 
 ## 下载
 
-您可以从 [GitHub Releases 页面](https://github.com/rust-kotlin/ashell/releases/latest) 下载 macOS、Windows 和 Linux 版本的最新预编译程序。
+您可以从 [GitHub Releases 页面](https://github.com/rust-kotlin/ashell/releases/latest) 下载最新安装包：
+
+- macOS：x64 和 arm64 的 `.dmg`，同时提供便携 `.zip`。
+- Windows：x64、x86 和 arm64 的 `Setup.exe`，同时提供便携 `.zip`。
+- Linux：x64 便携 `.tar.gz`。
 
 ## Mac 安装指南
 
@@ -43,13 +47,26 @@ brew upgrade ashell --cask
 
 ### 方法 2: 手动下载
 
-1. 从 [Releases 页面](https://github.com/rust-kotlin/ashell/releases/latest) 下载并解压。
-2. 将 `ashell.app` 拖入或移动到 **应用程序 (Applications)** 目录。
+1. 从 [Releases 页面](https://github.com/rust-kotlin/ashell/releases/latest) 下载与处理器匹配的 `.dmg`。
+2. 打开 DMG，将 `ashell.app` 拖入 **Applications** 目录。
 3. 由于应用采用本地签名，初次启动时如果系统提示“App 已损坏，无法打开”，请打开终端（Terminal）并执行以下命令：
 
 ```bash
 sudo xattr -cr /Applications/ashell.app
 ```
+
+## Windows 安装指南
+
+从 [Releases 页面](https://github.com/rust-kotlin/ashell/releases/latest) 下载对应安装程序：
+
+| 系统架构 | 安装包名称后缀 |
+| --- | --- |
+| Intel/AMD 64 位 | `windows-x64-setup.exe` |
+| Intel/AMD 32 位 | `windows-x86-setup.exe` |
+| Windows on ARM | `windows-arm64-setup.exe` |
+
+运行安装程序后，可选择是否创建桌面快捷方式；应用也会出现在开始菜单和系统卸载列表中。
+当前安装包尚未使用商业代码签名证书，Windows SmartScreen 可能显示安全提醒。
 
 ## 功能特性
 
