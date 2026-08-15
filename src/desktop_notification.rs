@@ -87,6 +87,7 @@ pub(crate) fn set_unread_indicator(unread: bool, window_handle: Option<isize>) {
         use objc2_app_kit::NSApplication;
         use objc2_foundation::NSString;
 
+        let _ = window_handle;
         let Some(main_thread) = MainThreadMarker::new() else {
             tracing::warn!("attempted to update the Dock badge outside the main thread");
             return;
