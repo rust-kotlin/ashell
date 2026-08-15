@@ -65,7 +65,7 @@ ArchitecturesInstallIn64BitMode=arm64
 
 [Languages]
 Name: "en"; MessagesFile: "compiler:Default.isl"
-Name: "zhcn"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+Name: "zhcn"; MessagesFile: "ChineseSimplified.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
