@@ -23,6 +23,25 @@ pub struct DiskSample {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct RemoteProcess {
+    pub pid: u32,
+    pub user: String,
+    pub cpu_percent: f32,
+    pub memory_bytes: u64,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RemotePort {
+    pub protocol: String,
+    pub address: String,
+    pub port: u16,
+    pub state: String,
+    pub pid: Option<u32>,
+    pub process: String,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct SystemSnapshot {
     pub cpu_percent: f32,
     pub mem_percent: f32,
@@ -52,8 +71,8 @@ impl SystemSampler {
         sys.refresh_all();
         let nets = Networks::new_with_refreshed_list();
         let disks = Disks::new_with_refreshed_list();
-        let last_rx_total = nets.iter().map(|(_, d)| d.total_received()).sum();
-        let last_tx_total = nets.iter().map(|(_, d)| d.total_transmitted()).sum();
+        let last_rx_total = nets.values().map(|d| d.total_received()).sum();
+        let last_tx_total = nets.values().map(|d| d.total_transmitted()).sum();
 
         Self {
             sys,
@@ -81,8 +100,8 @@ impl SystemSampler {
         let swap_total = self.sys.total_swap();
         let swap_used = self.sys.used_swap();
 
-        let rx_total: u64 = self.nets.iter().map(|(_, d)| d.total_received()).sum();
-        let tx_total: u64 = self.nets.iter().map(|(_, d)| d.total_transmitted()).sum();
+        let rx_total: u64 = self.nets.values().map(|d| d.total_received()).sum();
+        let tx_total: u64 = self.nets.values().map(|d| d.total_transmitted()).sum();
         let now = Instant::now();
         let elapsed = now
             .duration_since(self.last_instant)
@@ -228,8 +247,144 @@ pub fn remote_snapshot_from_kv(raw: &str) -> Result<SystemSnapshot> {
     })
 }
 
+pub fn remote_processes_from_ps(raw: &str) -> Vec<RemoteProcess> {
+    raw.lines()
+        .filter_map(|line| {
+            if let Some(record) = line.strip_prefix("PROCESS\t") {
+                let mut fields = record.splitn(5, '\t');
+                let pid = fields.next()?.parse::<u32>().ok()?;
+                let user = fields.next()?.to_string();
+                let cpu_percent = fields.next()?.parse::<f32>().ok()?.max(0.0);
+                let memory_bytes = fields.next()?.parse::<u64>().ok()?;
+                let command = fields.next()?.trim().to_string();
+                return (!command.is_empty()).then_some(RemoteProcess {
+                    pid,
+                    user,
+                    cpu_percent,
+                    memory_bytes,
+                    command,
+                });
+            }
+
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<u32>().ok()?;
+            let user = fields.next()?.to_string();
+            let cpu_percent = fields.next()?.parse::<f32>().ok()?.max(0.0);
+            let memory_bytes = fields.next()?.parse::<u64>().ok()?.saturating_mul(1024);
+            let command = fields.collect::<Vec<_>>().join(" ");
+            if command.is_empty() {
+                return None;
+            }
+            Some(RemoteProcess {
+                pid,
+                user,
+                cpu_percent,
+                memory_bytes,
+                command,
+            })
+        })
+        .collect()
+}
+
+pub fn remote_ports_from_probe(raw: &str) -> Vec<RemotePort> {
+    raw.lines()
+        .filter_map(|line| {
+            let record = line.strip_prefix("PORT\t")?;
+            let mut fields = record.splitn(6, '\t');
+            let protocol = fields.next()?.trim().to_string();
+            let address = fields.next()?.trim().to_string();
+            let port = fields.next()?.parse::<u16>().ok()?;
+            let state = fields.next()?.trim().to_string();
+            let pid = match fields.next()?.trim() {
+                "" | "-" | "0" => None,
+                value => value.parse::<u32>().ok(),
+            };
+            let process = fields.next()?.trim().to_string();
+            if protocol.is_empty() || address.is_empty() || state.is_empty() {
+                return None;
+            }
+            Some(RemotePort {
+                protocol,
+                address,
+                port,
+                state,
+                pid,
+                process: if process.is_empty() {
+                    "-".to_string()
+                } else {
+                    process
+                },
+            })
+        })
+        .collect()
+}
+
 fn parse_u64(kv: &BTreeMap<String, String>, key: &str) -> u64 {
     kv.get(key)
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{remote_ports_from_probe, remote_processes_from_ps};
+
+    #[test]
+    fn parses_remote_process_rows_and_rss_bytes() {
+        let processes = remote_processes_from_ps(
+            "  42 alice 12.5 2048 worker --queue main\n  7 root 0.0 512 sshd\n",
+        );
+
+        assert_eq!(processes.len(), 2);
+        assert_eq!(processes[0].pid, 42);
+        assert_eq!(processes[0].user, "alice");
+        assert_eq!(processes[0].cpu_percent, 12.5);
+        assert_eq!(processes[0].memory_bytes, 2 * 1024 * 1024);
+        assert_eq!(processes[0].command, "worker --queue main");
+    }
+
+    #[test]
+    fn parses_structured_current_process_rows() {
+        let processes =
+            remote_processes_from_ps("PROCESS\t42\talice\t37.25\t2097152\tworker --queue main\n");
+
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0].pid, 42);
+        assert_eq!(processes[0].user, "alice");
+        assert_eq!(processes[0].cpu_percent, 37.25);
+        assert_eq!(processes[0].memory_bytes, 2 * 1024 * 1024);
+        assert_eq!(processes[0].command, "worker --queue main");
+    }
+
+    #[test]
+    fn skips_malformed_remote_process_rows() {
+        let processes = remote_processes_from_ps("PID USER CPU RSS COMMAND\n9 root bad 64 init\n");
+
+        assert!(processes.is_empty());
+    }
+
+    #[test]
+    fn parses_structured_remote_port_rows() {
+        let ports = remote_ports_from_probe(
+            "PORT\ttcp\t0.0.0.0\t22\tLISTEN\t123\tsshd\nPORT\tudp\t127.0.0.1\t5353\tUNCONN\t-\t-\n",
+        );
+
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0].protocol, "tcp");
+        assert_eq!(ports[0].address, "0.0.0.0");
+        assert_eq!(ports[0].port, 22);
+        assert_eq!(ports[0].state, "LISTEN");
+        assert_eq!(ports[0].pid, Some(123));
+        assert_eq!(ports[0].process, "sshd");
+        assert_eq!(ports[1].pid, None);
+    }
+
+    #[test]
+    fn skips_malformed_remote_port_rows() {
+        let ports = remote_ports_from_probe(
+            "PORT\ttcp\t0.0.0.0\tbad\tLISTEN\t1\tsshd\nPORT\ttcp\t\t80\tLISTEN\t1\tnginx\n",
+        );
+
+        assert!(ports.is_empty());
+    }
 }

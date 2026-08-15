@@ -3,13 +3,13 @@ use gpui::{
 };
 use gpui_component::{
     Sizable,
-    button::{Button, ButtonVariants},
+    button::ButtonVariants,
     kbd::Kbd,
     setting::{SettingField, SettingGroup, SettingItem},
 };
 use rust_i18n::t;
 
-use crate::{Ashell, session::config::ConfigStore};
+use crate::{Ashell, app::controls::pointer_button, session::config::ConfigStore};
 
 gpui::actions!(
     ashell_workspace,
@@ -19,6 +19,7 @@ gpui::actions!(
         OpenTransfers,
         NewSsh,
         OpenSearch,
+        QuitApplication,
         ToggleSidebar,
         ToggleSftpZoom,
         FocusPaneLeft,
@@ -62,13 +63,18 @@ pub(crate) const WORKSPACE_ACTIONS: &[WorkspaceAction] = &[
     },
     WorkspaceAction {
         id: "NewSsh",
-        label_key: "settings_new_ssh",
+        label_key: "settings_new_connection",
         default_suffix: "n",
     },
     WorkspaceAction {
         id: "OpenSearch",
         label_key: "settings_open_search",
         default_suffix: "f",
+    },
+    WorkspaceAction {
+        id: "QuitApplication",
+        label_key: "settings_quit_application",
+        default_suffix: "q",
     },
     WorkspaceAction {
         id: "ToggleSidebar",
@@ -154,6 +160,10 @@ pub(crate) fn default_modifier() -> &'static str {
 }
 
 pub(crate) fn default_keystroke(action_id: &str) -> Option<String> {
+    if action_id == "QuitApplication" && cfg!(target_os = "windows") {
+        return Some("alt-f4".to_string());
+    }
+
     WORKSPACE_ACTIONS
         .iter()
         .find(|action| action.id == action_id)
@@ -206,7 +216,41 @@ pub(crate) fn bind_workspace_keys_from_config(cx: &mut App, config: &ConfigStore
     bind_workspace_actions(cx, config);
 }
 
-/// Unbind all workspace keybindings (used when entering keybinding settings to prevent interference).
+pub(crate) fn suspend_quit_keybinding(cx: &mut App, config: &ConfigStore) {
+    let default = default_keystroke("QuitApplication").expect("quit action has a default key");
+    let configured =
+        configured_keystroke(config, "QuitApplication").unwrap_or_else(|| default.clone());
+    let action_name = crate::QuitApplication.name();
+    let mut bindings = vec![KeyBinding::new(&default, Unbind(action_name.into()), None)];
+    if configured != default && configured != "none" && !configured.is_empty() {
+        bindings.push(KeyBinding::new(
+            &configured,
+            Unbind(action_name.into()),
+            None,
+        ));
+    }
+    cx.bind_keys(bindings);
+}
+
+pub(crate) fn restore_quit_keybinding(cx: &mut App, config: &ConfigStore) {
+    let default = default_keystroke("QuitApplication").expect("quit action has a default key");
+    let configured =
+        configured_keystroke(config, "QuitApplication").unwrap_or_else(|| default.clone());
+    let action_name = crate::QuitApplication.name();
+    let mut bindings = Vec::new();
+    if configured != default {
+        bindings.push(KeyBinding::new(&default, Unbind(action_name.into()), None));
+    }
+    if configured != "none" && !configured.is_empty() {
+        bindings.push(KeyBinding::new(&configured, crate::QuitApplication, None));
+    }
+    cx.bind_keys(bindings);
+}
+
+/// Unbind workspace keybindings that could interfere with key recording.
+///
+/// The quit binding remains active so the application can always be closed while
+/// the settings dialog is open.
 pub(crate) fn unbind_all_workspace_keys(cx: &mut App, config: &ConfigStore) {
     let mut bindings = Vec::new();
 
@@ -293,6 +337,7 @@ fn bind_workspace_actions(cx: &mut App, config: &ConfigStore) {
     bind_action!("OpenTransfers", crate::OpenTransfers);
     bind_action!("NewSsh", crate::NewSsh);
     bind_action!("OpenSearch", crate::OpenSearch);
+    bind_action!("QuitApplication", crate::QuitApplication);
     bind_action!("ToggleSidebar", crate::ToggleSidebar);
     bind_action!("ToggleSftpZoom", crate::ToggleSftpZoom);
     bind_action!("FocusPaneLeft", crate::FocusPaneLeft);
@@ -321,6 +366,7 @@ impl KeybindingsPage {
                     "OpenTransfers",
                     "NewSsh",
                     "OpenSearch",
+                    "QuitApplication",
                     "Copy",
                     "Paste",
                 ],
@@ -395,7 +441,7 @@ impl KeybindingsPage {
                         let view = view.clone();
                         let action_id = action.id.to_string();
                         move |_, _window, _cx| {
-                            Button::new(gpui::SharedString::from(format!("keybind-{action_id}")))
+                            pointer_button(gpui::SharedString::from(format!("keybind-{action_id}")))
                                 .label(btn_label.clone())
                                 .small()
                                 .when(recording, |this| this.primary())
@@ -407,6 +453,7 @@ impl KeybindingsPage {
                                         view.update(cx, |this, cx| {
                                             // Clear any previous error when starting new recording
                                             this.keybind_error = None;
+                                            suspend_quit_keybinding(cx, &this.config);
                                             this.recording_action = Some(action_id.clone());
                                             this.focus_handle.focus(window, cx);
                                             cx.notify();

@@ -2,7 +2,75 @@ use gpui::{App, AppContext as _, Bounds, WindowOptions, point, px, size};
 use gpui_component::Root;
 
 use crate::Ashell;
-use crate::session::config::ConfigStore;
+use crate::session::config::{ConfigStore, SavedWindowBounds};
+
+fn clamp_saved_window_bounds(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    cx: &App,
+) -> Bounds<gpui::Pixels> {
+    let displays = cx.displays();
+    let Some(display) = displays.iter().max_by(|left, right| {
+        let intersection_area = |display: &std::rc::Rc<dyn gpui::PlatformDisplay>| {
+            let visible = display.visible_bounds();
+            let left_edge = x.max(visible.origin.x.as_f32());
+            let top_edge = y.max(visible.origin.y.as_f32());
+            let right_edge =
+                (x + width).min(visible.origin.x.as_f32() + visible.size.width.as_f32());
+            let bottom_edge =
+                (y + height).min(visible.origin.y.as_f32() + visible.size.height.as_f32());
+            (right_edge - left_edge).max(0.0) * (bottom_edge - top_edge).max(0.0)
+        };
+        intersection_area(left).total_cmp(&intersection_area(right))
+    }) else {
+        return Bounds::new(point(px(x), px(y)), size(px(width), px(height)));
+    };
+
+    let visible = display.visible_bounds();
+    let visible_x = visible.origin.x.as_f32();
+    let visible_y = visible.origin.y.as_f32();
+    let visible_width = visible.size.width.as_f32();
+    let visible_height = visible.size.height.as_f32();
+    let width = width.max(1.0).min(visible_width);
+    let height = height.max(1.0).min(visible_height);
+    let x = if x.is_finite() {
+        x.clamp(visible_x, visible_x + visible_width - width)
+    } else {
+        visible_x + (visible_width - width) / 2.0
+    };
+    let y = if y.is_finite() {
+        y.clamp(visible_y, visible_y + visible_height - height)
+    } else {
+        visible_y + (visible_height - height) / 2.0
+    };
+
+    Bounds::new(point(px(x), px(y)), size(px(width), px(height)))
+}
+
+fn restore_window_bounds(bounds: &SavedWindowBounds, cx: &App) -> gpui::WindowBounds {
+    match bounds {
+        SavedWindowBounds::Fullscreen {
+            x,
+            y,
+            width,
+            height,
+        } => gpui::WindowBounds::Fullscreen(clamp_saved_window_bounds(*x, *y, *width, *height, cx)),
+        SavedWindowBounds::Maximized {
+            x,
+            y,
+            width,
+            height,
+        } => gpui::WindowBounds::Maximized(clamp_saved_window_bounds(*x, *y, *width, *height, cx)),
+        SavedWindowBounds::Windowed {
+            x,
+            y,
+            width,
+            height,
+        } => gpui::WindowBounds::Windowed(clamp_saved_window_bounds(*x, *y, *width, *height, cx)),
+    }
+}
 
 pub(crate) fn bind_workspace_keys(cx: &mut gpui::App) {
     let config = ConfigStore::load().unwrap_or_else(|_| ConfigStore::in_memory());
@@ -251,35 +319,7 @@ pub(crate) fn open_main_window(cx: &mut App) {
     }
 
     if let Some(bounds) = config.window_bounds() {
-        window_options.window_bounds = Some(match bounds {
-            crate::session::config::SavedWindowBounds::Fullscreen {
-                x,
-                y,
-                width,
-                height,
-            } => gpui::WindowBounds::Fullscreen(Bounds::new(
-                point(px(*x), px(*y)),
-                size(px(*width), px(*height)),
-            )),
-            crate::session::config::SavedWindowBounds::Maximized {
-                x,
-                y,
-                width,
-                height,
-            } => gpui::WindowBounds::Maximized(Bounds::new(
-                point(px(*x), px(*y)),
-                size(px(*width), px(*height)),
-            )),
-            crate::session::config::SavedWindowBounds::Windowed {
-                x,
-                y,
-                width,
-                height,
-            } => gpui::WindowBounds::Windowed(Bounds::new(
-                point(px(*x), px(*y)),
-                size(px(*width), px(*height)),
-            )),
-        });
+        window_options.window_bounds = Some(restore_window_bounds(bounds, cx));
     } else if let Some(display) = cx.displays().first().cloned() {
         let display_bounds = display.bounds();
         let width = display_bounds.size.width * 0.8;
@@ -317,7 +357,9 @@ pub(crate) fn open_main_window(cx: &mut App) {
                 );
                 return true;
             }
-            view_clone.read(cx).save_layout_state(window, cx);
+            view_clone.update(cx, |this, cx| {
+                this.save_layout_state(window, cx);
+            });
             true
         });
 

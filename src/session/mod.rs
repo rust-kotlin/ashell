@@ -2,6 +2,7 @@ pub mod config;
 pub mod ssh_config;
 pub mod ssh_keys;
 
+use base64::Engine as _;
 use gpui::{
     AppContext as _, Context, Entity, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     SharedString, Window, px,
@@ -10,28 +11,467 @@ use gpui_component::{Theme, WindowExt as _, input::InputState};
 use rust_i18n::t;
 use uuid::Uuid;
 
-use self::config::{AuthMethod, Session};
+use self::config::{
+    AuthMethod, SavedPaneLayout, SavedTabGroup, SavedTabsState, SavedTerminalTab, Session,
+};
 
 use crate::{
     Ashell, PaneLayout, SelectorEntry, TabGroup,
     app::constants::{DEFAULT_COLS, DEFAULT_ROWS},
     backend::{local, ssh},
     terminal::{BackendCommand, RenderSnapshot, TabKind, TerminalTab},
+    text_encoding::TextEncoding,
 };
 
+pub(crate) fn compact_local_path(path: &std::path::Path) -> String {
+    if let Some(base_dirs) = directories::BaseDirs::new() {
+        if let Some(relative_path) = relative_to_home(path, base_dirs.home_dir()) {
+            if relative_path.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~{}{}", std::path::MAIN_SEPARATOR, relative_path.display());
+        }
+    }
+
+    path.display().to_string()
+}
+
+fn relative_to_home(path: &std::path::Path, home: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Ok(relative) = path.strip_prefix(home) {
+        return Some(relative.to_path_buf());
+    }
+
+    #[cfg(windows)]
+    {
+        let mut path_components = path.components();
+        for home_component in home.components() {
+            let path_component = path_components.next()?;
+            if !path_component
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&home_component.as_os_str().to_string_lossy())
+            {
+                return None;
+            }
+        }
+        return Some(path_components.as_path().to_path_buf());
+    }
+
+    #[cfg(not(windows))]
+    None
+}
+
+pub(crate) fn decode_local_path_title(encoded: &str) -> Option<std::path::PathBuf> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .ok()?;
+    let path = String::from_utf8(bytes).ok()?;
+    let path = std::path::PathBuf::from(path);
+    path.is_absolute().then_some(path)
+}
+
+fn default_local_directory() -> Option<std::path::PathBuf> {
+    directories::BaseDirs::new()
+        .map(|dirs| dirs.home_dir().to_path_buf())
+        .filter(|path| path.is_dir())
+}
+
+fn initial_local_title() -> String {
+    default_local_directory()
+        .map(|path| compact_local_path(&path))
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "PowerShell".to_string()
+            } else {
+                "Local".to_string()
+            }
+        })
+}
+
+fn connecting_sftp_state() -> crate::terminal::SftpUiState {
+    let mut expanded_directories = std::collections::HashSet::new();
+    expanded_directories.insert("/".to_string());
+    crate::terminal::SftpUiState {
+        current_path: "/".into(),
+        status: rust_i18n::t!("sftp_connecting").to_string(),
+        directory_cache: std::collections::HashMap::new(),
+        expanded_directories,
+        loading_directories: std::collections::HashSet::new(),
+        directory_errors: std::collections::HashMap::new(),
+        selected_path: None,
+        preview: None,
+        selected_entries: std::collections::HashSet::new(),
+        home_dir: "/".into(),
+        home_dir_resolved: false,
+    }
+}
+
+fn save_pane_layout(layout: &PaneLayout) -> SavedPaneLayout {
+    match layout {
+        PaneLayout::Single(tab_id) => SavedPaneLayout::Single {
+            tab_id: tab_id.clone(),
+        },
+        PaneLayout::Horizontal(children, ratio) => SavedPaneLayout::Horizontal {
+            children: children.iter().map(save_pane_layout).collect(),
+            ratio: *ratio,
+        },
+        PaneLayout::Vertical(children, ratio) => SavedPaneLayout::Vertical {
+            children: children.iter().map(save_pane_layout).collect(),
+            ratio: *ratio,
+        },
+    }
+}
+
+fn restore_pane_layout(layout: &SavedPaneLayout) -> PaneLayout {
+    match layout {
+        SavedPaneLayout::Single { tab_id } => PaneLayout::Single(tab_id.clone()),
+        SavedPaneLayout::Horizontal { children, ratio } => PaneLayout::Horizontal(
+            children.iter().map(restore_pane_layout).collect(),
+            (*ratio).clamp(0.1, 0.9),
+        ),
+        SavedPaneLayout::Vertical { children, ratio } => PaneLayout::Vertical(
+            children.iter().map(restore_pane_layout).collect(),
+            (*ratio).clamp(0.1, 0.9),
+        ),
+    }
+}
+
 impl Ashell {
+    pub(crate) fn apply_local_directory_change(&mut self, tab_id: &str, path: std::path::PathBuf) {
+        let title = compact_local_path(&path);
+        let is_local = if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            if tab.kind == TabKind::Local {
+                if tab.local_cwd.as_ref() == Some(&path) && tab.title == title {
+                    return;
+                }
+                tab.title = title.clone();
+                tab.dynamic_title = title.clone();
+                tab.local_cwd = Some(path);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !is_local {
+            return;
+        }
+
+        if let Some(group) = self
+            .tab_groups
+            .iter_mut()
+            .find(|group| group.pane_root.contains(tab_id))
+        {
+            let is_focused = self.active_tab.as_deref() == Some(tab_id);
+            let is_single_pane = matches!(&group.pane_root, PaneLayout::Single(_));
+            if is_focused || is_single_pane {
+                group.title = title;
+            }
+        }
+        self.save_tabs_state_background();
+    }
+
+    pub(crate) fn capture_tabs_state(&mut self) {
+        if !self.config.remember_tabs() {
+            self.config.set_saved_tabs(None);
+            return;
+        }
+
+        self.sync_pane_root_to_group();
+        let default_local_cwd = default_local_directory();
+        let groups = self
+            .tab_groups
+            .iter()
+            .filter_map(|group| {
+                let pane_ids = group.pane_root.tab_ids();
+                let tabs = pane_ids
+                    .iter()
+                    .filter_map(|tab_id| {
+                        let tab = self.tabs.iter().find(|tab| tab.id.as_str() == *tab_id)?;
+                        match tab.kind {
+                            TabKind::Local => Some(SavedTerminalTab::Local {
+                                id: tab.id.clone(),
+                                cwd: tab.local_cwd.clone().or_else(|| default_local_cwd.clone()),
+                                terminal_encoding: tab.text_encoding(),
+                            }),
+                            TabKind::Ssh => {
+                                tab.session.clone().map(|session| SavedTerminalTab::Ssh {
+                                    id: tab.id.clone(),
+                                    session,
+                                })
+                            }
+                            TabKind::Serial => {
+                                tab.session.clone().map(|session| SavedTerminalTab::Serial {
+                                    id: tab.id.clone(),
+                                    session,
+                                })
+                            }
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                if tabs.len() != pane_ids.len() {
+                    tracing::warn!(
+                        "[session] skipped tab group '{}' because its panes could not be saved",
+                        group.id
+                    );
+                    return None;
+                }
+
+                Some(SavedTabGroup {
+                    id: group.id.clone(),
+                    title: group.title.clone(),
+                    pane_root: save_pane_layout(&group.pane_root),
+                    tabs,
+                })
+            })
+            .collect();
+
+        self.config.set_saved_tabs(Some(SavedTabsState {
+            groups,
+            active_group: self.active_group.clone(),
+            active_tab: self.active_tab.clone(),
+        }));
+    }
+
+    pub(crate) fn save_tabs_state_background(&mut self) {
+        if self.config.remember_tabs() {
+            self.capture_tabs_state();
+            self.save_preferences_background();
+        }
+    }
+
+    pub(crate) fn restore_saved_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.config.remember_tabs() {
+            return;
+        }
+        let Some(saved_state) = self.config.saved_tabs().cloned() else {
+            return;
+        };
+
+        let requested_active_group = saved_state.active_group;
+        let requested_active_tab = saved_state.active_tab;
+        let mut restored_group_ids = std::collections::HashSet::new();
+        let mut restored_tab_ids = std::collections::HashSet::new();
+
+        for saved_group in saved_state.groups {
+            let SavedTabGroup {
+                id: group_id,
+                title,
+                pane_root,
+                tabs,
+            } = saved_group;
+            if group_id.is_empty() || !restored_group_ids.insert(group_id.clone()) {
+                continue;
+            }
+
+            let mut group_tab_ids = std::collections::HashSet::new();
+            for saved_tab in tabs {
+                let (tab_id, mut tab) = match saved_tab {
+                    SavedTerminalTab::Local {
+                        id,
+                        cwd,
+                        terminal_encoding,
+                    } => {
+                        if id.is_empty() || restored_tab_ids.contains(&id) {
+                            continue;
+                        }
+                        let cwd = cwd
+                            .filter(|path| path.is_absolute() && path.is_dir())
+                            .or_else(default_local_directory);
+                        let title = cwd
+                            .as_deref()
+                            .map(compact_local_path)
+                            .unwrap_or_else(initial_local_title);
+                        let backend_events =
+                            crate::terminal::GuardedBackendEventSender::new(self.events_tx.clone());
+                        let backend = match local::spawn_local_terminal_at(
+                            id.clone(),
+                            DEFAULT_COLS,
+                            DEFAULT_ROWS,
+                            backend_events.clone(),
+                            cwd.as_deref(),
+                        ) {
+                            Ok(backend) => backend,
+                            Err(err) => {
+                                tracing::warn!(
+                                    "[session] failed to restore local tab '{}': {err:#}",
+                                    id
+                                );
+                                continue;
+                            }
+                        };
+                        let mut tab =
+                            TerminalTab::new_local(id.clone(), title, backend, backend_events);
+                        tab.local_cwd = cwd;
+                        tab.set_text_encoding(terminal_encoding);
+                        (id, tab)
+                    }
+                    SavedTerminalTab::Ssh { id, session } => {
+                        if id.is_empty() || restored_tab_ids.contains(&id) {
+                            continue;
+                        }
+                        let backend_events =
+                            crate::terminal::GuardedBackendEventSender::new(self.events_tx.clone());
+                        let mut tab = TerminalTab::new_ssh(
+                            id.clone(),
+                            &session,
+                            crate::terminal::BackendTx::Pending,
+                            backend_events,
+                        );
+                        let pending_reason = t!("ssh_reconnect_pending").to_string();
+                        tab.status = pending_reason.clone();
+                        tab.disconnected_reason = Some(pending_reason);
+                        (id, tab)
+                    }
+                    SavedTerminalTab::Serial { id, session } => {
+                        if id.is_empty() || restored_tab_ids.contains(&id) {
+                            continue;
+                        }
+                        let backend_events =
+                            crate::terminal::GuardedBackendEventSender::new(self.events_tx.clone());
+                        let backend = crate::backend::serial::spawn_serial_client(
+                            self.runtime.handle(),
+                            id.clone(),
+                            session.clone(),
+                            backend_events.clone(),
+                        );
+                        (
+                            id.clone(),
+                            TerminalTab::new_serial(
+                                id,
+                                &session,
+                                crate::terminal::BackendTx::Serial(backend),
+                                backend_events,
+                            ),
+                        )
+                    }
+                };
+                tab.resize(DEFAULT_COLS, DEFAULT_ROWS);
+                group_tab_ids.insert(tab_id.clone());
+                restored_tab_ids.insert(tab_id);
+                self.tabs.push(tab);
+            }
+
+            let mut pane_root = restore_pane_layout(&pane_root);
+            let missing_tabs = pane_root
+                .tab_ids()
+                .into_iter()
+                .filter(|tab_id| !group_tab_ids.contains(*tab_id))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            for tab_id in missing_tabs {
+                pane_root.remove_tab(&tab_id);
+            }
+            let layout_tab_ids = pane_root
+                .tab_ids()
+                .into_iter()
+                .filter(|tab_id| !tab_id.is_empty())
+                .map(str::to_string)
+                .collect::<std::collections::HashSet<_>>();
+            let orphaned_tab_ids = group_tab_ids
+                .difference(&layout_tab_ids)
+                .cloned()
+                .collect::<Vec<_>>();
+            for tab_id in orphaned_tab_ids {
+                if let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) {
+                    tab.send_backend(BackendCommand::Close);
+                }
+                self.tabs.retain(|tab| tab.id != tab_id);
+                restored_tab_ids.remove(&tab_id);
+            }
+            if pane_root
+                .tab_ids()
+                .first()
+                .is_none_or(|tab_id| tab_id.is_empty())
+            {
+                continue;
+            }
+
+            self.tab_groups.push(TabGroup {
+                id: group_id.clone(),
+                title,
+                pane_root,
+                // Restored SSH sessions remain offline until the user confirms
+                // reconnecting, so their SFTP worker must remain stopped too.
+                sftp: None,
+                sftp_tab_id: None,
+            });
+        }
+
+        let active_group = requested_active_group
+            .filter(|id| self.tab_groups.iter().any(|group| group.id == *id))
+            .or_else(|| self.tab_groups.first().map(|group| group.id.clone()));
+        let Some(active_group) = active_group else {
+            return;
+        };
+        let Some(active_layout) = self
+            .tab_groups
+            .iter()
+            .find(|group| group.id == active_group)
+            .map(|group| group.pane_root.clone())
+        else {
+            return;
+        };
+
+        self.active_group = Some(active_group.clone());
+        self.pane_root = active_layout;
+        let active_tab = requested_active_tab
+            .filter(|id| self.pane_root.contains(id))
+            .or_else(|| self.pane_root.tab_ids().first().map(|id| (*id).to_string()));
+        if let Some(active_tab) = active_tab {
+            self.focus_pane_with_id(active_tab);
+        }
+        if let Some(group_index) = self
+            .tab_groups
+            .iter()
+            .position(|group| group.id == active_group)
+        {
+            self.tabs_scroll_handle.scroll_to_item(group_index);
+        }
+        self.pending_sftp_path_sync = Some("/".into());
+        self.sync_sftp_to_active_tab();
+        self.sync_system_tab_to_active_group();
+        self.status = "tabs restored".into();
+
+        // Defer the dialog until the restored view has been mounted. This also
+        // ensures that only the currently focused restored SSH tab is prompted.
+        let prompt_tab_id = self.active_tab.as_ref().and_then(|tab_id| {
+            self.tabs
+                .iter()
+                .find(|tab| tab.id == *tab_id && tab.kind == TabKind::Ssh && !tab.connected)
+                .map(|tab| tab.id.clone())
+        });
+        if let Some(prompt_tab_id) = prompt_tab_id {
+            let view = cx.entity();
+            window.defer(cx, move |window, cx| {
+                view.update(cx, |this, cx| {
+                    this.show_ssh_reconnect_dialog(prompt_tab_id, window, cx);
+                });
+            });
+        }
+        cx.notify();
+    }
+
     pub(crate) fn open_local(&mut self, cx: &mut Context<Self>) {
         let id = Uuid::new_v4().to_string();
-        match local::spawn_local_terminal(
+        let initial_directory = default_local_directory();
+        let backend_events =
+            crate::terminal::GuardedBackendEventSender::new(self.events_tx.clone());
+        match local::spawn_local_terminal_at(
             id.clone(),
             DEFAULT_COLS,
             DEFAULT_ROWS,
-            self.events_tx.clone(),
+            backend_events.clone(),
+            initial_directory.as_deref(),
         ) {
             Ok(backend) => {
-                let title = if cfg!(windows) { "PowerShell" } else { "Local" }.to_string();
+                let title = initial_local_title();
                 let mut tab =
-                    TerminalTab::new_local(id.clone(), title, backend, self.events_tx.clone());
+                    TerminalTab::new_local(id.clone(), title.clone(), backend, backend_events);
+                tab.local_cwd = initial_directory;
                 tab.resize(DEFAULT_COLS, DEFAULT_ROWS);
                 self.tabs.push(tab);
                 self.active_tab = Some(id.clone());
@@ -40,18 +480,21 @@ impl Ashell {
                 let group_id = Uuid::new_v4().to_string();
                 self.tab_groups.push(TabGroup {
                     id: group_id.clone(),
-                    title: "Local".to_string(),
+                    title,
                     pane_root: PaneLayout::Single(id),
                     sftp: None,
+                    sftp_tab_id: None,
                 });
                 self.active_group = Some(group_id);
                 self.tabs_scroll_handle.scroll_to_item(self.tabs.len() - 1);
+                self.sync_system_tab_to_active_group();
                 self.status = "local terminal opened".into();
             }
             Err(err) => {
                 self.status = format!("failed to open local terminal: {err:#}").into();
             }
         }
+        self.save_tabs_state_background();
         cx.notify();
     }
 
@@ -79,6 +522,7 @@ impl Ashell {
                 session_name
             };
 
+            let is_editing = self.editing_session_id.is_some();
             let existing_id = self.editing_session_id.clone();
             let existing_last_used = existing_id
                 .as_deref()
@@ -97,7 +541,9 @@ impl Ashell {
                 tracing::warn!("failed to save config: {err:#}");
             }
 
-            self.open_serial_session(session, cx);
+            if !is_editing {
+                self.open_serial_session(session, cx);
+            }
             self.editing_session_id = None;
             self.active_dialog = None;
             window.close_dialog(cx);
@@ -143,6 +589,7 @@ impl Ashell {
         } else {
             session_name
         };
+        let is_editing = self.editing_session_id.is_some();
         let existing_id = self.editing_session_id.clone();
         let existing_last_used = existing_id
             .as_deref()
@@ -177,12 +624,15 @@ impl Ashell {
             .ok();
         session.proxy_user = self.proxy_user_input.read(cx).value().trim().to_string();
         session.proxy_password = self.proxy_password_input.read(cx).value().to_string();
+        session.terminal_encoding = self.ssh_terminal_encoding;
         self.config.upsert(session.clone());
         if let Err(err) = self.config.save() {
             tracing::warn!("failed to save config: {err:#}");
         }
 
-        self.open_ssh_session(session, cx);
+        if !is_editing {
+            self.open_ssh_session(session, cx);
+        }
         self.editing_session_id = None;
         self.active_dialog = None;
         window.close_dialog(cx);
@@ -203,6 +653,7 @@ impl Ashell {
         self.ssh_auth_method = AuthMethod::Password;
         self.ssh_config_selected = None;
         self.session_protocol = "ssh".to_string();
+        self.ssh_terminal_encoding = TextEncoding::Utf8;
         Self::set_input_value(&self.session_name_input, "", window, cx);
         Self::set_input_value(&self.host_input, "", window, cx);
         Self::set_input_value(&self.port_input, "22", window, cx);
@@ -228,6 +679,7 @@ impl Ashell {
         self.editing_session_id = Some(session.id.clone());
         self.ssh_auth_method = session.auth;
         self.session_protocol = session.protocol.clone();
+        self.ssh_terminal_encoding = session.terminal_encoding;
         Self::set_input_value(&self.session_name_input, session.name.clone(), window, cx);
         Self::set_input_value(&self.host_input, session.host.clone(), window, cx);
         Self::set_input_value(&self.port_input, session.port.to_string(), window, cx);
@@ -300,9 +752,9 @@ impl Ashell {
             .set_directory(start_dir)
             .pick_file();
 
-        cx.spawn_in(window, async move |this, mut cx| {
+        cx.spawn_in(window, async move |this, cx| {
             if let Some(file) = file_dialog.await {
-                let _ = gpui::AsyncWindowContext::update(&mut cx, |window, cx| {
+                let _ = gpui::AsyncWindowContext::update(cx, |window, cx| {
                     let _ = this.update(cx, |this, cx| {
                         Self::set_input_value(
                             &this.key_path_input,
@@ -419,11 +871,16 @@ impl Ashell {
 
     pub(crate) fn reset_layout(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.config.set_layout_state(None, None, None);
+        self.config.set_sftp_tree_panels(None);
+        self.config.set_sftp_file_columns(None);
+        self.config.set_sftp_file_columns_customized(false);
         self.save_preferences_background();
 
         self.is_layout_reset = true;
         self.workspace_panels = cx.new(|_| crate::app::resizable::ResizableState::default());
         self.body_panels = cx.new(|_| crate::app::resizable::ResizableState::default());
+        self.sftp_tree_panels = cx.new(|_| crate::app::resizable::ResizableState::default());
+        self.sftp_file_columns = cx.new(|_| crate::app::resizable::ResizableState::default());
 
         cx.notify();
     }
@@ -439,6 +896,52 @@ impl Ashell {
 
     pub(crate) fn set_session_protocol(&mut self, protocol: String, cx: &mut Context<Self>) {
         self.session_protocol = protocol;
+        cx.notify();
+    }
+
+    pub(crate) fn set_ssh_terminal_encoding(
+        &mut self,
+        encoding: TextEncoding,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ssh_terminal_encoding != encoding {
+            self.ssh_terminal_encoding = encoding;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn set_terminal_encoding(
+        &mut self,
+        tab_id: String,
+        encoding: TextEncoding,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        if !matches!(tab.kind, TabKind::Local | TabKind::Ssh) || tab.text_encoding() == encoding {
+            return;
+        }
+
+        tab.set_text_encoding(encoding);
+        let saved_session = (tab.kind == TabKind::Ssh)
+            .then(|| tab.session.clone())
+            .flatten();
+        if let Some(session) = saved_session.as_ref() {
+            self.config.upsert(session.clone());
+        }
+        if self.config.remember_tabs() {
+            self.capture_tabs_state();
+        }
+        if (saved_session.is_some() || self.config.remember_tabs())
+            && let Err(err) = self.config.save()
+        {
+            tracing::warn!("failed to save terminal encoding: {err:#}");
+        }
+
+        self.status = t!("terminal_encoding_changed", encoding = encoding.label())
+            .to_string()
+            .into();
         cx.notify();
     }
 
@@ -606,19 +1109,21 @@ impl Ashell {
             session.host
         );
         let id = Uuid::new_v4().to_string();
+        let backend_events =
+            crate::terminal::GuardedBackendEventSender::new(self.events_tx.clone());
         let backend = ssh::spawn_ssh_terminal(
             self.runtime.handle(),
             id.clone(),
             session.clone(),
             DEFAULT_COLS,
             DEFAULT_ROWS,
-            self.events_tx.clone(),
+            backend_events.clone(),
         );
         self.tabs.push(TerminalTab::new_ssh(
             id.clone(),
             &session,
             backend,
-            self.events_tx.clone(),
+            backend_events,
         ));
         self.active_tab = Some(id.clone());
         self.connection_progress = Some(crate::app::ConnectionProgress {
@@ -634,15 +1139,8 @@ impl Ashell {
             id: group_id.clone(),
             title: session.name.clone(),
             pane_root: PaneLayout::Single(id.clone()),
-            sftp: Some(crate::terminal::SftpUiState {
-                current_path: "/".into(),
-                status: rust_i18n::t!("sftp_connecting").to_string(),
-                entries: Vec::new(),
-                selected_path: None,
-                preview: None,
-                selected_entries: std::collections::HashSet::new(),
-                home_dir: "/".into(),
-            }),
+            sftp: Some(connecting_sftp_state()),
+            sftp_tab_id: Some(id.clone()),
         });
         self.active_group = Some(group_id.clone());
         self.tabs_scroll_handle.scroll_to_item(self.tabs.len() - 1);
@@ -659,7 +1157,7 @@ impl Ashell {
         cx.notify();
         let sftp_handle = crate::sftp::spawn_sftp(
             self.runtime.handle(),
-            group_id.clone(),
+            id.clone(),
             session,
             self.events_tx.clone(),
         );
@@ -667,6 +1165,8 @@ impl Ashell {
         self.active_tab = Some(id.clone());
         self.pending_sftp_path_sync = Some("/".into());
         self.status = "ssh tab opened".into();
+        self.sync_system_tab_to_active_group();
+        self.save_tabs_state_background();
         cx.notify();
     }
 
@@ -677,17 +1177,19 @@ impl Ashell {
             session.host
         );
         let id = Uuid::new_v4().to_string();
+        let backend_events =
+            crate::terminal::GuardedBackendEventSender::new(self.events_tx.clone());
         let backend = crate::backend::serial::spawn_serial_client(
             self.runtime.handle(),
             id.clone(),
             session.clone(),
-            self.events_tx.clone(),
+            backend_events.clone(),
         );
         self.tabs.push(TerminalTab::new_serial(
             id.clone(),
             &session,
             crate::terminal::BackendTx::Serial(backend),
-            self.events_tx.clone(),
+            backend_events,
         ));
         self.active_tab = Some(id.clone());
         self.connection_progress = Some(crate::app::ConnectionProgress {
@@ -704,9 +1206,11 @@ impl Ashell {
             title: session.name.clone(),
             pane_root: PaneLayout::Single(id.clone()),
             sftp: None,
+            sftp_tab_id: None,
         });
         self.active_group = Some(group_id.clone());
         self.tabs_scroll_handle.scroll_to_item(self.tabs.len() - 1);
+        self.sync_system_tab_to_active_group();
         if let Some(session_id) = self.active_session_id() {
             if let Some(index) = self
                 .config
@@ -718,15 +1222,131 @@ impl Ashell {
             }
         }
         self.status = "serial tab opened".into();
+        self.save_tabs_state_background();
         cx.notify();
     }
 
     pub(crate) fn remove_saved_session(&mut self, session_id: String, cx: &mut Context<Self>) {
         self.config.remove(&session_id);
+        self.selected_connection_ids.remove(&session_id);
+        self.selected_command_history
+            .retain(|(id, _)| id != &session_id);
         if let Err(err) = self.config.save() {
             tracing::warn!("failed to save config: {err:#}");
         }
         self.status = "session removed".into();
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_connection_selection(
+        &mut self,
+        session_id: String,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if selected {
+            self.selected_connection_ids.insert(session_id);
+        } else {
+            self.selected_connection_ids.remove(&session_id);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn select_all_connections(
+        &mut self,
+        session_ids: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_connection_ids.extend(session_ids);
+        cx.notify();
+    }
+
+    pub(crate) fn remove_selected_sessions(&mut self, cx: &mut Context<Self>) {
+        let selected = self
+            .selected_connection_ids
+            .iter()
+            .filter(|id| self.config.get((*id).as_str()).is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            self.selected_connection_ids.clear();
+            cx.notify();
+            return;
+        }
+
+        let count = selected.len();
+        for session_id in selected {
+            self.config.remove(&session_id);
+            self.selected_command_history
+                .retain(|(id, _)| id != &session_id);
+        }
+        self.selected_connection_ids.clear();
+        if let Err(err) = self.config.save() {
+            tracing::warn!("failed to save selected sessions: {err:#}");
+        }
+        self.status = t!("connections_deleted", count = count).into();
+        cx.notify();
+    }
+
+    pub(crate) fn close_command_history(&mut self, cx: &mut Context<Self>) {
+        let changed = self.show_command_history || !self.selected_command_history.is_empty();
+        self.show_command_history = false;
+        self.selected_command_history.clear();
+        if changed {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn toggle_command_history_selection(
+        &mut self,
+        session_id: String,
+        index: usize,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (session_id, index);
+        if selected {
+            self.selected_command_history.insert(key);
+        } else {
+            self.selected_command_history.remove(&key);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn set_command_history_selection(
+        &mut self,
+        entries: Vec<(String, usize)>,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) {
+        for entry in entries {
+            if selected {
+                self.selected_command_history.insert(entry);
+            } else {
+                self.selected_command_history.remove(&entry);
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn remove_selected_command_history(&mut self, cx: &mut Context<Self>) {
+        let mut selected = self.selected_command_history.drain().collect::<Vec<_>>();
+        selected.sort_by(|(left_session, left_index), (right_session, right_index)| {
+            left_session
+                .cmp(right_session)
+                .then_with(|| right_index.cmp(left_index))
+        });
+
+        let mut count = 0;
+        for (session_id, index) in selected {
+            if self.config.remove_command_history(&session_id, index) {
+                count += 1;
+            }
+        }
+        if count > 0 {
+            self.save_preferences_background();
+            self.status = t!("commands_deleted", count = count).into();
+        }
         cx.notify();
     }
 
@@ -746,11 +1366,12 @@ impl Ashell {
 
         let is_ssh = self.tabs[ix].session.is_some();
         let session = self.tabs[ix].session.clone();
-        let new_generation = self.tabs[ix].backend_generation + 1;
         let cols = self.tabs[ix].cols;
         let rows = self.tabs[ix].rows;
 
-        // Close old backend (sends Close through the shared Arc<Mutex>)
+        let backend_events = self.tabs[ix].advance_backend_events();
+        // Advance the event generation before closing the old backend so its
+        // final events cannot be mistaken for events from the replacement.
         self.tabs[ix].send_backend(BackendCommand::Close);
 
         if let Some(session) = session {
@@ -761,7 +1382,7 @@ impl Ashell {
                         self.runtime.handle(),
                         tab_id.to_string(),
                         session.clone(),
-                        self.events_tx.clone(),
+                        backend_events.clone(),
                     );
                     self.tabs[ix].set_backend(crate::terminal::BackendTx::Serial(backend));
                 }
@@ -772,7 +1393,7 @@ impl Ashell {
                         session.clone(),
                         cols,
                         rows,
-                        self.events_tx.clone(),
+                        backend_events.clone(),
                     );
                     self.tabs[ix].set_backend(backend);
                 }
@@ -781,50 +1402,25 @@ impl Ashell {
             self.tabs[ix].connected = false;
             self.tabs[ix].status = "connecting".into();
             self.tabs[ix].disconnected_reason = None;
-            self.tabs[ix].backend_generation = new_generation;
-            self.tabs[ix].backend_initialized = false;
+            self.tabs[ix].terminal_title_received = false;
 
-            // Restart SFTP for the group containing this tab
-            if let Some(group) = self
-                .tab_groups
-                .iter()
-                .find(|g| g.pane_root.contains(tab_id))
+            if tab_kind == crate::terminal::TabKind::Ssh
+                && self.active_tab.as_deref() == Some(tab_id)
             {
-                let group_id = group.id.clone();
-                let group_session = self
-                    .tabs
-                    .iter()
-                    .find(|t| group.pane_root.contains(&t.id) && t.session.is_some())
-                    .and_then(|t| t.session.clone());
-
-                if let Some(session) = group_session {
-                    if session.protocol != "serial" {
-                        if let Some(old_handle) = self.sftp_handles.remove(&group_id) {
-                            old_handle.close();
-                        }
-                        let sftp_handle = crate::sftp::spawn_sftp(
-                            self.runtime.handle(),
-                            group_id.clone(),
-                            session,
-                            self.events_tx.clone(),
-                        );
-                        self.sftp_handles.insert(group_id.clone(), sftp_handle);
-
-                        if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id) {
-                            if let Some(sftp) = group.sftp.as_mut() {
-                                sftp.status = rust_i18n::t!("sftp_connecting").to_string();
-                            }
-                        }
-                    }
-                }
+                self.restart_active_sftp();
             }
         } else {
             // Local tab: spawn new local shell
-            match local::spawn_local_terminal(
+            let local_cwd = self.tabs[ix]
+                .local_cwd
+                .clone()
+                .or_else(default_local_directory);
+            match local::spawn_local_terminal_at(
                 tab_id.to_string(),
                 cols,
                 rows,
-                self.events_tx.clone(),
+                backend_events,
+                local_cwd.as_deref(),
             ) {
                 Ok(backend) => {
                     // Swap the backend — preserves terminal history.
@@ -832,8 +1428,7 @@ impl Ashell {
                     self.tabs[ix].connected = true;
                     self.tabs[ix].status = "local shell".into();
                     self.tabs[ix].disconnected_reason = None;
-                    self.tabs[ix].backend_generation = new_generation;
-                    self.tabs[ix].backend_initialized = false;
+                    self.tabs[ix].local_cwd = local_cwd;
                     // Resize the new PTY to match the pane dimensions.
                     self.tabs[ix].send_backend(BackendCommand::Resize { cols, rows });
                 }
@@ -856,6 +1451,7 @@ impl Ashell {
 
     #[allow(dead_code)]
     pub(crate) fn activate_tab(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let active_tab_changed = self.active_tab.as_deref() != Some(id.as_str());
         // Save current group state
         if let Some(group_id) = self.active_group.clone() {
             if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id) {
@@ -893,7 +1489,15 @@ impl Ashell {
             }
         }
         self.focus_handle.focus(window, cx);
+        if !matches!(self.active_kind(), Some(TabKind::Ssh)) {
+            self.show_command_history = false;
+            self.selected_command_history.clear();
+        }
+        self.sync_sftp_to_active_tab();
         self.sync_system_tab_to_active_group();
+        if active_tab_changed {
+            self.prompt_active_ssh_reconnect_if_needed(window, cx);
+        }
         cx.notify();
     }
 
@@ -906,7 +1510,7 @@ impl Ashell {
         if self
             .connection_progress
             .as_ref()
-            .map_or(false, |p| p.tab_id == id)
+            .is_some_and(|p| p.tab_id == id)
         {
             self.connection_progress = None;
         }
@@ -924,11 +1528,12 @@ impl Ashell {
                 self.tabs[ix].send_backend(BackendCommand::Close);
                 self.tabs.remove(ix);
             }
+            self.save_tabs_state_background();
             return;
         };
 
         let pane_ids = group.pane_root.tab_ids();
-        let pane_ids_str: Vec<&str> = pane_ids.iter().map(|s| *s).collect();
+        let pane_ids_str = pane_ids.to_vec();
         let is_group_close = pane_ids.len() <= 1;
         tracing::info!(
             "[handle_tab_close] id='{}' group_panes={:?} is_group_close={}",
@@ -1017,10 +1622,21 @@ impl Ashell {
             self.cpu_history.clear();
             self.net_rx_history.clear();
             self.net_tx_history.clear();
+            self.remote_processes.clear();
+            self.remote_ports.clear();
+            self.terminating_processes.clear();
+            self.remote_process_status = None;
+            self.remote_ports_status = None;
+            self.remote_processes_in_flight = false;
+            self.remote_ports_in_flight = false;
+            self.expanded_process_pid = None;
             self.system_status = None;
+            self.show_command_history = false;
+            self.selected_command_history.clear();
             for (_, handle) in self.sftp_handles.drain() {
                 handle.close();
             }
+            self.save_tabs_state_background();
             return;
         }
 
@@ -1057,7 +1673,13 @@ impl Ashell {
                 self.focus_pane_with_id(active_id);
             }
         }
+        if !matches!(self.active_kind(), Some(TabKind::Ssh)) {
+            self.show_command_history = false;
+            self.selected_command_history.clear();
+        }
+        self.sync_sftp_to_active_tab();
         self.sync_system_tab_to_active_group();
+        self.save_tabs_state_background();
     }
 
     pub(crate) fn focus_terminal(
@@ -1191,21 +1813,36 @@ impl Ashell {
             Some(tab) => tab,
             None => return,
         };
+        let local_cwd = current_tab
+            .local_cwd
+            .clone()
+            .or_else(default_local_directory);
         let new_id = Uuid::new_v4().to_string();
+        let backend_events =
+            crate::terminal::GuardedBackendEventSender::new(self.events_tx.clone());
         let mut tab = match current_tab.kind {
             TabKind::Local => {
-                match local::spawn_local_terminal(
+                match local::spawn_local_terminal_at(
                     new_id.clone(),
                     DEFAULT_COLS,
                     DEFAULT_ROWS,
-                    self.events_tx.clone(),
+                    backend_events.clone(),
+                    local_cwd.as_deref(),
                 ) {
-                    Ok(backend) => TerminalTab::new_local(
-                        new_id.clone(),
-                        "Local".into(),
-                        backend,
-                        self.events_tx.clone(),
-                    ),
+                    Ok(backend) => {
+                        let title = local_cwd
+                            .as_deref()
+                            .map(compact_local_path)
+                            .unwrap_or_else(initial_local_title);
+                        let mut tab = TerminalTab::new_local(
+                            new_id.clone(),
+                            title,
+                            backend,
+                            backend_events.clone(),
+                        );
+                        tab.local_cwd = local_cwd;
+                        tab
+                    }
                     Err(err) => {
                         self.status = format!("failed to split: {err:#}").into();
                         cx.notify();
@@ -1225,16 +1862,9 @@ impl Ashell {
                     session.clone(),
                     DEFAULT_COLS,
                     DEFAULT_ROWS,
-                    self.events_tx.clone(),
+                    backend_events.clone(),
                 );
-                let sftp_handle = crate::sftp::spawn_sftp(
-                    self.runtime.handle(),
-                    new_id.clone(),
-                    session.clone(),
-                    self.events_tx.clone(),
-                );
-                self.sftp_handles.insert(new_id.clone(), sftp_handle);
-                TerminalTab::new_ssh(new_id.clone(), &session, backend, self.events_tx.clone())
+                TerminalTab::new_ssh(new_id.clone(), &session, backend, backend_events.clone())
             }
             TabKind::Serial => {
                 let Some(session) = current_tab.session.clone() else {
@@ -1246,13 +1876,13 @@ impl Ashell {
                     self.runtime.handle(),
                     new_id.clone(),
                     session.clone(),
-                    self.events_tx.clone(),
+                    backend_events.clone(),
                 );
                 TerminalTab::new_serial(
                     new_id.clone(),
                     &session,
                     crate::terminal::BackendTx::Serial(backend),
-                    self.events_tx.clone(),
+                    backend_events,
                 )
             }
         };
@@ -1295,6 +1925,8 @@ impl Ashell {
         }
         self.focused_pane_path = new_full_path;
         self.active_tab = Some(new_id);
+        self.sync_sftp_to_active_tab();
+        self.sync_system_tab_to_active_group();
         self.status = "pane split".into();
         tracing::info!(
             "[split] DONE: pane_root={:?} focused_path={:?} active_tab={:?} tabs={}",
@@ -1303,19 +1935,27 @@ impl Ashell {
             self.active_tab,
             self.tabs.len(),
         );
+        self.save_tabs_state_background();
         cx.notify();
     }
 
-    pub(crate) fn focus_adjacent_pane(&mut self, direction: &str, cx: &mut Context<Self>) {
+    pub(crate) fn focus_adjacent_pane(
+        &mut self,
+        direction: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.focused_pane_path.is_empty() {
             return;
         }
+        let mut active_tab_changed = false;
         let path = self.focused_pane_path.clone();
         if let Some(new_path) = Self::find_adjacent_pane(&self.pane_root, &path, direction) {
             self.focused_pane_path = new_path;
             if let Some(id) = self.pane_root.focused_tab_id(&self.focused_pane_path) {
                 let id_owned = id.to_string();
                 let changed = self.active_tab.as_deref() != Some(id_owned.as_str());
+                active_tab_changed = changed;
                 self.active_tab = Some(id_owned);
                 // Clear stale search state when switching to a different pane.
                 if changed && self.search_active {
@@ -1324,8 +1964,15 @@ impl Ashell {
                     self.search_current = 0;
                     self.search_target_tab = None;
                 }
+                if changed {
+                    self.sync_sftp_to_active_tab();
+                    self.sync_system_tab_to_active_group();
+                }
             }
             cx.notify();
+        }
+        if active_tab_changed {
+            self.prompt_active_ssh_reconnect_if_needed(window, cx);
         }
     }
 
@@ -1437,6 +2084,7 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let previous_active_tab = self.active_tab.clone();
         // Save current group state
         if let Some(current_group_id) = self.active_group.clone() {
             if let Some(group) = self
@@ -1458,7 +2106,12 @@ impl Ashell {
             }
             self.focus_handle.focus(window, cx);
         }
+        self.sync_sftp_to_active_tab();
         self.sync_system_tab_to_active_group();
+        self.save_tabs_state_background();
+        if previous_active_tab != self.active_tab {
+            self.prompt_active_ssh_reconnect_if_needed(window, cx);
+        }
         cx.notify();
     }
 
@@ -1470,41 +2123,120 @@ impl Ashell {
         }
     }
 
-    pub(crate) fn sync_system_tab_to_active_group(&mut self) {
-        let mut group_ssh_tabs = vec![];
-        if let Some(group_id) = &self.active_group {
-            if let Some(group) = self.tab_groups.iter().find(|g| g.id == *group_id) {
-                let ids = group.pane_root.tab_ids();
-                for id in ids {
-                    if let Some(tab) = self.tabs.iter().find(|t| t.id == *id) {
-                        if tab.kind == TabKind::Ssh && tab.connected {
-                            group_ssh_tabs.push(tab.id.clone());
-                        }
-                    }
-                }
+    fn update_active_sftp_binding(&mut self, force: bool) {
+        let Some(group_id) = self.active_group.clone() else {
+            return;
+        };
+        let target = self.active_tab.as_ref().and_then(|active_id| {
+            self.tabs
+                .iter()
+                .find(|tab| {
+                    tab.id == *active_id && tab.kind == TabKind::Ssh && (tab.connected || force)
+                })
+                .and_then(|tab| tab.session.clone().map(|session| (tab.id.clone(), session)))
+        });
+        let target_tab_id = target.as_ref().map(|(tab_id, _)| tab_id.as_str());
+        let current_tab_id = self
+            .tab_groups
+            .iter()
+            .find(|group| group.id == group_id)
+            .and_then(|group| group.sftp_tab_id.clone());
+        let current_session_id = current_tab_id.as_ref().and_then(|tab_id| {
+            self.tabs
+                .iter()
+                .find(|tab| tab.id == *tab_id)
+                .and_then(|tab| tab.session.as_ref())
+                .map(|session| session.id.clone())
+        });
+        let target_session_id = target.as_ref().map(|(_, session)| session.id.as_str());
+
+        if !force {
+            if current_tab_id.as_deref() == target_tab_id {
+                return;
+            }
+            if current_session_id.as_deref() == target_session_id
+                && target_session_id.is_some_and(|session_id| !session_id.is_empty())
+                && self.sftp_handles.contains_key(&group_id)
+            {
+                return;
             }
         }
 
-        // Check if current system_tab_id is valid in this group
-        let is_current_valid = self
-            .system_tab_id
-            .as_ref()
-            .map_or(false, |id| group_ssh_tabs.contains(id));
+        if let Some(handle) = self.sftp_handles.remove(&group_id) {
+            handle.close();
+        }
+        if let Some(group) = self
+            .tab_groups
+            .iter_mut()
+            .find(|group| group.id == group_id)
+        {
+            group.sftp_tab_id = target.as_ref().map(|(tab_id, _)| tab_id.clone());
+            group.sftp = target.as_ref().map(|_| connecting_sftp_state());
+        }
 
-        if !is_current_valid {
-            let new_id = group_ssh_tabs.into_iter().next();
-            if self.system_tab_id != new_id {
-                self.system_tab_id = new_id;
-                self.cpu_history.clear();
-                self.net_rx_history.clear();
-                self.net_tx_history.clear();
-                self.remote_sample_in_flight = false;
-                if self.system_tab_id.is_none() {
-                    self.system_status = Some("monitored session closed".to_string().into());
-                } else {
-                    self.system_status = None;
-                }
-                self.request_active_system_snapshot();
+        if let Some((tab_id, session)) = target {
+            let handle = crate::sftp::spawn_sftp(
+                self.runtime.handle(),
+                tab_id,
+                session,
+                self.events_tx.clone(),
+            );
+            self.sftp_handles.insert(group_id, handle);
+            self.pending_sftp_path_sync = Some("/".into());
+            self.sftp_context_menu = None;
+        }
+    }
+
+    pub(crate) fn sync_sftp_to_active_tab(&mut self) {
+        self.update_active_sftp_binding(false);
+    }
+
+    pub(crate) fn restart_active_sftp(&mut self) {
+        self.update_active_sftp_binding(true);
+    }
+
+    pub(crate) fn sync_system_tab_to_active_group(&mut self) {
+        let active_ssh_tab = self.active_tab.as_ref().and_then(|id| {
+            self.tabs
+                .iter()
+                .find(|tab| tab.id == *id && tab.kind == TabKind::Ssh)
+        });
+        let new_id = active_ssh_tab.map(|tab| tab.id.clone());
+        let active_ssh_status = active_ssh_tab.and_then(|tab| {
+            (!tab.connected).then(|| {
+                tab.disconnected_reason
+                    .clone()
+                    .unwrap_or_else(|| tab.status.clone())
+            })
+        });
+
+        if self.system_tab_id != new_id {
+            self.system_tab_id = new_id;
+            self.system = crate::system::SystemSnapshot::default();
+            self.cpu_history.clear();
+            self.net_rx_history.clear();
+            self.net_tx_history.clear();
+            self.remote_processes.clear();
+            self.remote_ports.clear();
+            self.terminating_processes.clear();
+            self.remote_sample_in_flight = false;
+            self.remote_processes_in_flight = false;
+            self.remote_ports_in_flight = false;
+            self.remote_process_status = None;
+            self.remote_ports_status = None;
+            self.expanded_process_pid = None;
+            if let Some(status) = active_ssh_status {
+                self.system_status = Some(status.clone().into());
+                self.remote_process_status = Some(status.into());
+            } else {
+                self.system_status = None;
+            }
+            self.request_active_system_snapshot();
+            if self.active_dialog == Some(crate::app::DialogKind::Processes) {
+                self.request_active_process_snapshot();
+            }
+            if self.active_dialog == Some(crate::app::DialogKind::Ports) {
+                self.request_active_port_snapshot();
             }
         }
     }
@@ -1557,6 +2289,7 @@ impl Ashell {
     pub(crate) fn end_drag_split(&mut self) {
         self.dragging_splitter = None;
         self.drag_split_origin = None;
+        self.save_tabs_state_background();
     }
 
     fn is_layout_horizontal_at(layout: &PaneLayout, path: &[usize]) -> bool {
@@ -1568,7 +2301,7 @@ impl Ashell {
                 [first, rest @ ..],
             ) => children
                 .get(*first)
-                .map_or(false, |c| Self::is_layout_horizontal_at(c, rest)),
+                .is_some_and(|c| Self::is_layout_horizontal_at(c, rest)),
             _ => false,
         }
     }
@@ -1609,7 +2342,21 @@ impl Ashell {
         if find_path(&self.pane_root, &tab_id, &mut path) {
             let changed = self.active_tab.as_deref() != Some(tab_id.as_str());
             self.focused_pane_path = path;
-            self.active_tab = Some(tab_id);
+            self.active_tab = Some(tab_id.clone());
+            if let Some(title) = self
+                .tabs
+                .iter()
+                .find(|tab| tab.id == tab_id && tab.kind == TabKind::Local)
+                .map(|tab| tab.title.clone())
+            {
+                if let Some(group) = self
+                    .tab_groups
+                    .iter_mut()
+                    .find(|group| group.pane_root.contains(&tab_id))
+                {
+                    group.title = title;
+                }
+            }
             // Clear stale search state when switching to a different pane.
             // The user can press Enter to re-search in the new pane.
             if changed && self.search_active {
@@ -1617,6 +2364,14 @@ impl Ashell {
                 self.search_matches.clear();
                 self.search_current = 0;
                 self.search_target_tab = None;
+            }
+            if changed {
+                if !matches!(self.active_kind(), Some(TabKind::Ssh)) {
+                    self.show_command_history = false;
+                    self.selected_command_history.clear();
+                }
+                self.sync_sftp_to_active_tab();
+                self.sync_system_tab_to_active_group();
             }
         }
     }

@@ -13,7 +13,7 @@ use crate::{
 };
 
 thread_local! {
-    static LAST_DRAG_SCROLL: std::cell::Cell<Option<std::time::Instant>> = std::cell::Cell::new(None);
+    static LAST_DRAG_SCROLL: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
 }
 
 impl Ashell {
@@ -42,10 +42,10 @@ impl Ashell {
             && !event.keystroke.modifiers.platform
         {
             match event.keystroke.key.to_ascii_lowercase().as_str() {
-                "h" => self.focus_adjacent_pane("left", cx),
-                "j" => self.focus_adjacent_pane("down", cx),
-                "k" => self.focus_adjacent_pane("up", cx),
-                "l" => self.focus_adjacent_pane("right", cx),
+                "h" => self.focus_adjacent_pane("left", window, cx),
+                "j" => self.focus_adjacent_pane("down", window, cx),
+                "k" => self.focus_adjacent_pane("up", window, cx),
+                "l" => self.focus_adjacent_pane("right", window, cx),
                 "q" => {
                     if let Some(active_id) = self.active_tab.clone() {
                         self.close_tab(active_id, cx);
@@ -161,21 +161,19 @@ impl Ashell {
         let Some(active_id) = self.active_tab.clone() else {
             return;
         };
-        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) else {
+        let Some(app_cursor_mode) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == active_id)
+            .map(|tab| tab.app_cursor_mode())
+        else {
             return;
         };
 
-        if tab.render_snapshot(false).display_offset > 0 {
-            tab.scroll_to_bottom();
-        }
-        tab.clear_selection();
-
-        if let Some(bytes) = encode_key(&event.keystroke, tab.app_cursor_mode(), false) {
-            tab.send_backend(BackendCommand::Input(bytes));
-            window.prevent_default();
-            cx.stop_propagation();
-            cx.notify();
-        }
+        let Some(bytes) = encode_key(&event.keystroke, app_cursor_mode, false) else {
+            return;
+        };
+        self.send_terminal_input(bytes, window, cx);
     }
 
     pub(crate) fn on_terminal_tab_action(
@@ -200,6 +198,7 @@ impl Ashell {
         let Some(active_id) = self.active_tab.clone() else {
             return;
         };
+        self.record_ssh_input(&active_id, &bytes);
         let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) else {
             return;
         };
@@ -209,10 +208,31 @@ impl Ashell {
         }
 
         tab.clear_selection();
-        tab.send_backend(BackendCommand::Input(bytes));
+        let encoded = tab.encode_input(&bytes);
+        tab.send_backend(BackendCommand::Input(encoded));
         window.prevent_default();
         cx.stop_propagation();
         cx.notify();
+    }
+
+    pub(crate) fn execute_ssh_history_command(
+        &mut self,
+        command: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_connected_ssh = self
+            .active_tab
+            .as_ref()
+            .and_then(|active_id| self.tabs.iter().find(|tab| &tab.id == active_id))
+            .is_some_and(|tab| tab.kind == crate::terminal::TabKind::Ssh && tab.connected);
+        if !is_connected_ssh {
+            return;
+        }
+        let mut bytes = command.into_bytes();
+        bytes.push(b'\r');
+        self.send_terminal_input(bytes, window, cx);
+        self.close_command_history(cx);
     }
 
     pub(crate) fn active_terminal_selection_text(&self) -> Option<String> {
@@ -232,6 +252,11 @@ impl Ashell {
         let Some(active_id) = self.active_tab.clone() else {
             return;
         };
+        let normalized_text = text
+            .replace('\x1b', "")
+            .replace("\r\n", "\r")
+            .replace('\n', "\r");
+        self.record_ssh_input(&active_id, normalized_text.as_bytes());
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active_id) else {
             return;
         };
@@ -287,6 +312,8 @@ impl Ashell {
         let Some(active_id) = self.active_tab.clone() else {
             return;
         };
+        let bytes = text.as_bytes().to_vec();
+        self.record_ssh_input(&active_id, &bytes);
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active_id) else {
             return;
         };
@@ -296,9 +323,132 @@ impl Ashell {
         }
         tab.clear_selection();
         self.terminal_marked_text = None;
-        tab.send_backend(BackendCommand::Input(text.as_bytes().to_vec()));
+        let encoded = tab.encode_input(&bytes);
+        tab.send_backend(BackendCommand::Input(encoded));
         window.invalidate_character_coordinates();
         cx.notify();
+    }
+
+    /// Track the current SSH shell line and persist completed commands.
+    fn record_ssh_input(&mut self, tab_id: &str, bytes: &[u8]) {
+        let (session_id, cursor, is_alternate_screen_active) = {
+            let Some(tab) = self.tabs.iter().find(|tab| {
+                tab.id == tab_id && tab.kind == crate::terminal::TabKind::Ssh && tab.connected
+            }) else {
+                return;
+            };
+            let Some(session) = tab.session.as_ref() else {
+                return;
+            };
+            (
+                session.id.clone(),
+                tab.cursor_state().map(|cursor| (cursor.row, cursor.col)),
+                tab.is_alternate_screen_active(),
+            )
+        };
+
+        if is_alternate_screen_active {
+            self.ssh_command_buffers.remove(tab_id);
+            self.ssh_command_starts.remove(tab_id);
+            return;
+        }
+
+        let submits_command = bytes.iter().any(|byte| matches!(*byte, b'\r' | b'\n'));
+        let edits_command = bytes
+            .iter()
+            .any(|byte| !matches!(*byte, b'\r' | b'\n' | b'\x03'));
+        if edits_command && !self.ssh_command_starts.contains_key(tab_id) {
+            if let Some(cursor) = cursor {
+                self.ssh_command_starts.insert(tab_id.to_string(), cursor);
+            }
+        }
+
+        let mut rendered_command = if submits_command {
+            self.ssh_command_starts
+                .get(tab_id)
+                .copied()
+                .and_then(|start| {
+                    self.tabs
+                        .iter()
+                        .find(|tab| tab.id == tab_id)
+                        .map(|tab| tab.render_snapshot(false))
+                        .and_then(|snapshot| terminal_command_text(&snapshot, start))
+                })
+        } else {
+            None
+        };
+
+        let mut completed = Vec::new();
+        let mut reset_command_start = false;
+        {
+            let buffer = self
+                .ssh_command_buffers
+                .entry(tab_id.to_string())
+                .or_default();
+            let mut in_escape = false;
+            let mut in_csi = false;
+            for character in String::from_utf8_lossy(bytes).chars() {
+                if in_escape {
+                    if character == '[' || character == 'O' {
+                        in_escape = false;
+                        in_csi = true;
+                    } else {
+                        in_escape = false;
+                    }
+                    continue;
+                }
+                if in_csi {
+                    if character.is_ascii_alphabetic() || character == '~' {
+                        in_csi = false;
+                    }
+                    continue;
+                }
+                match character {
+                    '\x1b' => in_escape = true,
+                    '\r' | '\n' => {
+                        let command =
+                            merge_command_text(rendered_command.take().as_deref(), buffer);
+                        if !command.is_empty() {
+                            completed.push(command);
+                        }
+                        buffer.clear();
+                        reset_command_start = true;
+                    }
+                    '\u{8}' | '\u{7f}' => {
+                        buffer.pop();
+                    }
+                    '\u{15}' => buffer.clear(),
+                    '\u{3}' => {
+                        buffer.clear();
+                        reset_command_start = true;
+                    }
+                    '\u{17}' => {
+                        let trimmed_len = buffer.trim_end().len();
+                        buffer.truncate(trimmed_len);
+                        while let Some((index, character)) = buffer.char_indices().next_back() {
+                            if character.is_whitespace() {
+                                break;
+                            }
+                            buffer.truncate(index);
+                        }
+                    }
+                    character if !character.is_control() => buffer.push(character),
+                    _ => {}
+                }
+            }
+        }
+        if reset_command_start {
+            self.ssh_command_starts.remove(tab_id);
+        }
+
+        let mut changed = false;
+        for command in completed {
+            changed |= self.config.add_command_history(&session_id, command);
+        }
+        if changed {
+            self.selected_command_history.clear();
+            self.save_preferences_background();
+        }
     }
 
     pub(crate) fn on_terminal_right_click(
@@ -445,15 +595,11 @@ impl Ashell {
                 if should_scroll {
                     if row == 0 {
                         scroll_delta = 2;
-                    } else if row == 1 {
-                        scroll_delta = 1;
-                    } else if row == 2 {
+                    } else if row == 1 || row == 2 {
                         scroll_delta = 1;
                     } else if row == max_row {
                         scroll_delta = -2;
-                    } else if row == max_row.saturating_sub(1) {
-                        scroll_delta = -1;
-                    } else if row == max_row.saturating_sub(2) {
+                    } else if row == max_row.saturating_sub(1) || row == max_row.saturating_sub(2) {
                         scroll_delta = -1;
                     }
                 }
@@ -492,7 +638,7 @@ impl Ashell {
         let bounds = self.terminal_bounds.get(active_id)?;
         if !bounds.contains(&position) {
             // Try other pane bounds
-            for (_, b) in &self.terminal_bounds {
+            for b in self.terminal_bounds.values() {
                 if b.contains(&position) {
                     // Found a different pane - focus it
                     // (this path is for click-to-focus; handled via focus_terminal)
@@ -528,7 +674,7 @@ impl Ashell {
         // Platform modifier (Cmd on macOS, Ctrl on Windows/Linux) + scroll → zoom terminal font size
         if event.modifiers.platform {
             let delta = match event.delta {
-                ScrollDelta::Lines(point) => point.y as f32 * 20.0,
+                ScrollDelta::Lines(point) => point.y * 20.0,
                 ScrollDelta::Pixels(point) => point.y.as_f32(),
             };
             self.terminal_zoom_accumulator += delta;
@@ -627,5 +773,62 @@ impl Ashell {
             cx.stop_propagation();
             cx.notify();
         }
+    }
+}
+
+fn terminal_command_text(
+    snapshot: &crate::terminal::RenderSnapshot,
+    start: (usize, usize),
+) -> Option<String> {
+    let logical_lines =
+        crate::terminal::highlight::build_logical_lines(&snapshot.cells, snapshot.rows);
+    for line in logical_lines {
+        if !line.byte_to_cell.iter().any(|(row, _)| *row == start.0) {
+            continue;
+        }
+
+        let start_byte = line
+            .byte_to_cell
+            .iter()
+            .position(|(row, col)| *row > start.0 || (*row == start.0 && *col >= start.1))?;
+        let command = line
+            .text
+            .get(start_byte..)?
+            .trim_end_matches(|character: char| character == '\0' || character.is_whitespace())
+            .replace('\0', "");
+        if !command.trim().is_empty() {
+            return Some(command);
+        }
+    }
+    None
+}
+
+fn merge_command_text(rendered: Option<&str>, buffered: &str) -> String {
+    let rendered = rendered.unwrap_or_default().trim();
+    let buffered = buffered.trim();
+    if rendered.is_empty() {
+        return buffered.to_string();
+    }
+    if buffered.is_empty() {
+        return rendered.to_string();
+    }
+    if rendered.starts_with(buffered) || rendered.ends_with(buffered) {
+        return rendered.to_string();
+    }
+    if buffered.starts_with(rendered) || buffered.ends_with(rendered) {
+        return buffered.to_string();
+    }
+
+    let overlap = buffered
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(buffered.len()))
+        .filter(|index| *index > 0 && rendered.ends_with(&buffered[..*index]))
+        .max()
+        .unwrap_or(0);
+    if overlap > 0 {
+        format!("{rendered}{}", &buffered[overlap..])
+    } else {
+        rendered.to_string()
     }
 }

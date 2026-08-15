@@ -1,4 +1,10 @@
-use std::{fs, path::PathBuf, sync::OnceLock};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    io::Write as _,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use anyhow::{Context, Result};
 use argon2::Argon2;
@@ -11,6 +17,8 @@ use directories::BaseDirs;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::text_encoding::TextEncoding;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -60,6 +68,8 @@ pub struct Session {
     pub protocol: String,
     #[serde(default = "default_baud_rate")]
     pub baud_rate: u32,
+    #[serde(default)]
+    pub terminal_encoding: TextEncoding,
 }
 
 impl Session {
@@ -84,6 +94,7 @@ impl Session {
             proxy_password: String::new(),
             protocol: "ssh".to_string(),
             baud_rate: 115200,
+            terminal_encoding: TextEncoding::Utf8,
         }
     }
 
@@ -115,6 +126,7 @@ impl Session {
             proxy_password: String::new(),
             protocol: "ssh".to_string(),
             baud_rate: 115200,
+            terminal_encoding: TextEncoding::Utf8,
         }
     }
 
@@ -139,6 +151,7 @@ impl Session {
             proxy_password: String::new(),
             protocol: "serial".to_string(),
             baud_rate,
+            terminal_encoding: TextEncoding::Utf8,
         }
     }
 }
@@ -164,6 +177,61 @@ pub enum SavedWindowBounds {
         width: f32,
         height: f32,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SavedPaneLayout {
+    Single {
+        tab_id: String,
+    },
+    Horizontal {
+        children: Vec<SavedPaneLayout>,
+        ratio: f32,
+    },
+    Vertical {
+        children: Vec<SavedPaneLayout>,
+        ratio: f32,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SavedTerminalTab {
+    Local {
+        id: String,
+        #[serde(default)]
+        cwd: Option<PathBuf>,
+        #[serde(default)]
+        terminal_encoding: TextEncoding,
+    },
+    Ssh {
+        id: String,
+        session: Session,
+    },
+    Serial {
+        id: String,
+        session: Session,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedTabGroup {
+    pub id: String,
+    pub title: String,
+    pub pane_root: SavedPaneLayout,
+    #[serde(default)]
+    pub tabs: Vec<SavedTerminalTab>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedTabsState {
+    #[serde(default)]
+    pub groups: Vec<SavedTabGroup>,
+    #[serde(default)]
+    pub active_group: Option<String>,
+    #[serde(default)]
+    pub active_tab: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -214,12 +282,27 @@ pub struct ConfigFile {
     pub cursor_style: CursorStyle,
     #[serde(default)]
     pub sessions: Vec<Session>,
+    /// Shell commands recorded for each SSH session ID.
+    #[serde(default)]
+    pub command_history: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub command_history_revision: u64,
+    #[serde(default)]
+    pub remember_tabs: bool,
+    #[serde(default)]
+    pub saved_tabs: Option<SavedTabsState>,
     #[serde(default)]
     pub window_bounds: Option<SavedWindowBounds>,
     #[serde(default)]
     pub workspace_panels: Option<Vec<f32>>,
     #[serde(default)]
     pub body_panels: Option<Vec<f32>>,
+    #[serde(default)]
+    pub sftp_tree_panels: Option<Vec<f32>>,
+    #[serde(default)]
+    pub sftp_file_columns: Option<Vec<f32>>,
+    #[serde(default)]
+    pub sftp_file_columns_customized: bool,
     #[serde(default)]
     pub transfers: Vec<crate::terminal::Transfer>,
     #[serde(default)]
@@ -316,6 +399,35 @@ fn default_terminal_font_family() -> String {
     "Maple Mono NF CN".to_string()
 }
 
+const MAX_COMMAND_HISTORY: usize = 200;
+
+fn normalize_command_history_entries(history: &mut Vec<String>) -> bool {
+    let mut seen = HashSet::new();
+    let mut changed = false;
+    let mut normalized = history
+        .drain(..)
+        .rev()
+        .filter_map(|command| {
+            let trimmed = command.trim();
+            changed |= trimmed.len() != command.len();
+            let command = trimmed.to_string();
+            if command.is_empty() || !seen.insert(command.clone()) {
+                changed = true;
+                None
+            } else {
+                Some(command)
+            }
+        })
+        .collect::<Vec<_>>();
+    normalized.reverse();
+    if normalized.len() > MAX_COMMAND_HISTORY {
+        changed = true;
+        normalized.drain(..normalized.len() - MAX_COMMAND_HISTORY);
+    }
+    *history = normalized;
+    changed
+}
+
 impl Default for ConfigFile {
     fn default() -> Self {
         Self {
@@ -333,9 +445,16 @@ impl Default for ConfigFile {
             title_bar_style: TitleBarStyle::default(),
             cursor_style: CursorStyle::default(),
             sessions: Vec::new(),
+            command_history: HashMap::new(),
+            command_history_revision: 0,
+            remember_tabs: false,
+            saved_tabs: None,
             window_bounds: None,
             workspace_panels: None,
             body_panels: None,
+            sftp_tree_panels: None,
+            sftp_file_columns: None,
+            sftp_file_columns_customized: false,
             transfers: Vec::new(),
             show_hidden_files: false,
             lock_layout: false,
@@ -368,6 +487,80 @@ impl Default for ConfigFile {
 pub struct ConfigStore {
     pub(crate) path: PathBuf,
     pub(crate) cache: ConfigFile,
+    write_lock: Arc<Mutex<()>>,
+}
+
+fn config_backup_path(path: &Path) -> PathBuf {
+    path.with_extension("json.bak")
+}
+
+fn decode_config_bytes(raw_bytes: &[u8], hardware_uuid: &str) -> Result<ConfigFile> {
+    match decrypt_config(raw_bytes, hardware_uuid) {
+        Ok(cache) => Ok(cache),
+        Err(decrypt_err) => serde_json::from_slice::<ConfigFile>(raw_bytes).map_err(|json_err| {
+            anyhow::anyhow!(
+                "decrypt failed: {decrypt_err:#}; plain JSON parsing failed: {json_err:#}"
+            )
+        }),
+    }
+}
+
+fn persist_config_bytes(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("configuration path has no parent directory")?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".ashell-config-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to create temporary config in {}", parent.display()))?;
+    temporary
+        .write_all(contents)
+        .with_context(|| format!("failed to write temporary config for {}", path.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("failed to sync temporary config for {}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut permissions = temporary
+            .as_file()
+            .metadata()
+            .with_context(|| format!("failed to inspect temporary config for {}", path.display()))?
+            .permissions();
+        permissions.set_mode(0o600);
+        temporary
+            .as_file()
+            .set_permissions(permissions)
+            .with_context(|| {
+                format!("failed to protect temporary config for {}", path.display())
+            })?;
+    }
+
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to replace {} atomically", path.display()))?;
+
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("failed to sync config directory {}", parent.display()))?;
+
+    Ok(())
+}
+
+fn write_config_bytes(path: &Path, contents: &[u8]) -> Result<()> {
+    if path.exists() {
+        let previous = fs::read(path)
+            .with_context(|| format!("failed to read previous config {}", path.display()))?;
+        persist_config_bytes(&config_backup_path(path), &previous)
+            .with_context(|| format!("failed to back up config {}", path.display()))?;
+    }
+    persist_config_bytes(path, contents)
 }
 
 impl ConfigStore {
@@ -395,28 +588,68 @@ impl ConfigStore {
             let raw_bytes =
                 fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
             let hardware_uuid = get_hardware_uuid();
-            match decrypt_config(&raw_bytes, &hardware_uuid) {
-                Ok(cache) => cache,
-                Err(decrypt_err) => {
-                    // Fallback to plain text JSON if decryption/parsing failed
-                    match serde_json::from_slice::<ConfigFile>(&raw_bytes) {
-                        Ok(cache) => cache,
-                        Err(json_err) => {
-                            let backup_path = path.with_extension("json.bak");
-                            if let Err(backup_err) = fs::write(&backup_path, &raw_bytes) {
-                                tracing::warn!(
-                                    "failed to parse config {} (decrypt err: {decrypt_err:#}, json err: {json_err:#}); backup to {} also failed: {backup_err:#}",
+            match decode_config_bytes(&raw_bytes, &hardware_uuid) {
+                Ok(mut cache) => {
+                    let backup_path = config_backup_path(&path);
+                    if let Ok(backup_bytes) = fs::read(&backup_path)
+                        && let Ok(backup_cache) = decode_config_bytes(&backup_bytes, &hardware_uuid)
+                    {
+                        let backup_history_is_newer = backup_cache.command_history_revision
+                            > cache.command_history_revision
+                            || (backup_cache.command_history_revision == 0
+                                && cache.command_history_revision == 0
+                                && cache.command_history.is_empty()
+                                && !backup_cache.command_history.is_empty());
+                        if backup_history_is_newer {
+                            cache.command_history = backup_cache.command_history;
+                            cache.command_history_revision =
+                                backup_cache.command_history_revision.max(1);
+                            let encrypted_bytes = encrypt_config(&cache, &hardware_uuid)?;
+                            persist_config_bytes(&path, &encrypted_bytes).with_context(|| {
+                                format!(
+                                    "failed to restore command history in {} from {}",
                                     path.display(),
-                                    backup_path.display(),
-                                );
-                            } else {
-                                tracing::warn!(
-                                    "failed to parse config {} (decrypt err: {decrypt_err:#}, json err: {json_err:#}); backed up the original to {} and loaded defaults",
+                                    backup_path.display()
+                                )
+                            })?;
+                            tracing::warn!(
+                                "restored newer command history in {} from {}",
+                                path.display(),
+                                backup_path.display(),
+                            );
+                        }
+                    }
+                    cache
+                }
+                Err(primary_err) => {
+                    let backup_path = config_backup_path(&path);
+                    let backup_bytes = fs::read(&backup_path).with_context(|| {
+                        format!("failed to read config backup {}", backup_path.display())
+                    });
+                    match backup_bytes.and_then(|backup_bytes| {
+                        decode_config_bytes(&backup_bytes, &hardware_uuid)
+                            .map(|cache| (backup_bytes, cache))
+                    }) {
+                        Ok((backup_bytes, cache)) => {
+                            tracing::warn!(
+                                "failed to load config {}: {primary_err:#}; restored {}",
+                                path.display(),
+                                backup_path.display(),
+                            );
+                            persist_config_bytes(&path, &backup_bytes).with_context(|| {
+                                format!(
+                                    "failed to restore config {} from {}",
                                     path.display(),
-                                    backup_path.display(),
-                                );
-                            }
-                            ConfigFile::default()
+                                    backup_path.display()
+                                )
+                            })?;
+                            cache
+                        }
+                        Err(backup_err) => {
+                            return Err(anyhow::anyhow!(
+                                "failed to load config {}: {primary_err:#}; backup recovery failed: {backup_err:#}",
+                                path.display()
+                            ));
                         }
                     }
                 }
@@ -428,7 +661,23 @@ impl ConfigStore {
         if cache.sync_device_id.is_empty() {
             cache.sync_device_id = Uuid::new_v4().to_string();
         }
-        Ok(Self { path, cache })
+        let mut history_changed = false;
+        for history in cache.command_history.values_mut() {
+            history_changed |= normalize_command_history_entries(history);
+        }
+        let previous_history_count = cache.command_history.len();
+        cache
+            .command_history
+            .retain(|_, history| !history.is_empty());
+        history_changed |= cache.command_history.len() != previous_history_count;
+        if history_changed {
+            cache.command_history_revision = cache.command_history_revision.saturating_add(1);
+        }
+        Ok(Self {
+            path,
+            cache,
+            write_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     pub fn in_memory() -> Self {
@@ -439,6 +688,7 @@ impl ConfigStore {
         Self {
             path: PathBuf::new(),
             cache,
+            write_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -457,6 +707,92 @@ impl ConfigStore {
 
     pub fn replace_sessions(&mut self, sessions: Vec<Session>) {
         self.cache.sessions = sessions;
+    }
+
+    /// Return persisted command history for all SSH sessions, newest first per session.
+    pub fn all_command_history(&self) -> Vec<(String, usize, String)> {
+        let mut session_ids = self
+            .cache
+            .command_history
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        session_ids.sort();
+
+        let mut entries = Vec::new();
+        for session_id in session_ids {
+            if let Some(history) = self.cache.command_history.get(&session_id) {
+                entries.extend(
+                    history
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .map(|(index, command)| (session_id.clone(), index, command.clone())),
+                );
+            }
+        }
+        entries
+    }
+
+    pub fn add_command_history(&mut self, session_id: &str, command: String) -> bool {
+        let command = command.trim().to_string();
+        if command.is_empty() {
+            return false;
+        }
+
+        let history = self
+            .cache
+            .command_history
+            .entry(session_id.to_string())
+            .or_default();
+        let was_latest = history.last().is_some_and(|previous| previous == &command);
+        let previous_len = history.len();
+        history.retain(|previous| previous != &command);
+        history.push(command);
+        if history.len() > MAX_COMMAND_HISTORY {
+            let excess = history.len() - MAX_COMMAND_HISTORY;
+            history.drain(..excess);
+        }
+        let changed = !was_latest || history.len() != previous_len;
+        if changed {
+            self.cache.command_history_revision =
+                self.cache.command_history_revision.saturating_add(1);
+        }
+        changed
+    }
+
+    pub fn normalize_command_history(&mut self) {
+        let mut changed = false;
+        for history in self.cache.command_history.values_mut() {
+            changed |= normalize_command_history_entries(history);
+        }
+        let previous_history_count = self.cache.command_history.len();
+        self.cache
+            .command_history
+            .retain(|_, history| !history.is_empty());
+        changed |= self.cache.command_history.len() != previous_history_count;
+        if changed {
+            self.cache.command_history_revision =
+                self.cache.command_history_revision.saturating_add(1);
+        }
+    }
+
+    pub fn remove_command_history(&mut self, session_id: &str, index: usize) -> bool {
+        let became_empty = {
+            let Some(history) = self.cache.command_history.get_mut(session_id) else {
+                return false;
+            };
+            if index >= history.len() {
+                return false;
+            }
+            history.remove(index);
+            history.is_empty()
+        };
+        if became_empty {
+            self.cache.command_history.remove(session_id);
+        }
+        self.cache.command_history_revision = self.cache.command_history_revision.saturating_add(1);
+        true
     }
 
     pub fn sync_endpoint(&self) -> &str {
@@ -536,10 +872,6 @@ impl ConfigStore {
         self.cache.sync_etag_backend = self.sync_backend().to_string();
     }
 
-    pub fn tmp_dir(&self) -> Option<PathBuf> {
-        self.path.parent().map(|p| p.join("tmp"))
-    }
-
     pub fn follow_system_theme(&self) -> bool {
         self.cache.follow_system_theme
     }
@@ -615,6 +947,25 @@ impl ConfigStore {
         self.cache.window_bounds.as_ref()
     }
 
+    pub fn remember_tabs(&self) -> bool {
+        self.cache.remember_tabs
+    }
+
+    pub fn set_remember_tabs(&mut self, remember_tabs: bool) {
+        self.cache.remember_tabs = remember_tabs;
+        if !remember_tabs {
+            self.cache.saved_tabs = None;
+        }
+    }
+
+    pub fn saved_tabs(&self) -> Option<&SavedTabsState> {
+        self.cache.saved_tabs.as_ref()
+    }
+
+    pub fn set_saved_tabs(&mut self, saved_tabs: Option<SavedTabsState>) {
+        self.cache.saved_tabs = saved_tabs;
+    }
+
     pub fn workspace_panels(&self) -> Option<&Vec<f32>> {
         self.cache.workspace_panels.as_ref()
     }
@@ -622,6 +973,18 @@ impl ConfigStore {
     #[allow(dead_code)]
     pub fn body_panels(&self) -> Option<&Vec<f32>> {
         self.cache.body_panels.as_ref()
+    }
+
+    pub fn sftp_tree_panels(&self) -> Option<&Vec<f32>> {
+        self.cache.sftp_tree_panels.as_ref()
+    }
+
+    pub fn sftp_file_columns(&self) -> Option<&Vec<f32>> {
+        self.cache.sftp_file_columns.as_ref()
+    }
+
+    pub fn sftp_file_columns_customized(&self) -> bool {
+        self.cache.sftp_file_columns_customized
     }
 
     pub fn transfers(&self) -> Vec<crate::terminal::Transfer> {
@@ -644,6 +1007,18 @@ impl ConfigStore {
         self.cache.window_bounds = window_bounds;
         self.cache.workspace_panels = workspace_panels;
         self.cache.body_panels = body_panels;
+    }
+
+    pub fn set_sftp_tree_panels(&mut self, panels: Option<Vec<f32>>) {
+        self.cache.sftp_tree_panels = panels;
+    }
+
+    pub fn set_sftp_file_columns(&mut self, columns: Option<Vec<f32>>) {
+        self.cache.sftp_file_columns = columns;
+    }
+
+    pub fn set_sftp_file_columns_customized(&mut self, customized: bool) {
+        self.cache.sftp_file_columns_customized = customized;
     }
 
     pub fn set_terminal_font_size(&mut self, terminal_font_size: f32) {
@@ -807,45 +1182,44 @@ impl ConfigStore {
 
     pub fn remove(&mut self, id: &str) {
         self.cache.sessions.retain(|s| s.id != id);
+        if self.cache.command_history.remove(id).is_some() {
+            self.cache.command_history_revision =
+                self.cache.command_history_revision.saturating_add(1);
+        }
     }
 
     pub fn save(&self) -> Result<()> {
         if self.path.as_os_str().is_empty() {
             return Ok(());
         }
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("configuration write lock is poisoned"))?;
         let hardware_uuid = get_hardware_uuid();
         let encrypted_bytes = encrypt_config(&self.cache, &hardware_uuid)?;
-        fs::write(&self.path, encrypted_bytes)
-            .with_context(|| format!("failed to write {}", self.path.display()))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(mut perms) = fs::metadata(&self.path).map(|m| m.permissions()) {
-                perms.set_mode(0o600);
-                let _ = fs::set_permissions(&self.path, perms);
-            }
-        }
-
-        Ok(())
+        write_config_bytes(&self.path, &encrypted_bytes)
     }
 
     pub fn save_merged_preferences(&self, local_config: ConfigFile) -> Result<()> {
         if self.path.as_os_str().is_empty() {
             return Ok(());
         }
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("configuration write lock is poisoned"))?;
         let hardware_uuid = get_hardware_uuid();
 
         let mut disk_config = if self.path.exists() {
-            if let Ok(raw_bytes) = fs::read(&self.path) {
-                match decrypt_config(&raw_bytes, &hardware_uuid) {
-                    Ok(loaded) => loaded,
-                    Err(_) => serde_json::from_slice::<ConfigFile>(&raw_bytes)
-                        .unwrap_or_else(|_| self.cache.clone()),
-                }
-            } else {
-                self.cache.clone()
-            }
+            let raw_bytes = fs::read(&self.path)
+                .with_context(|| format!("failed to read {}", self.path.display()))?;
+            decode_config_bytes(&raw_bytes, &hardware_uuid).with_context(|| {
+                format!(
+                    "refusing to overwrite unreadable config {}",
+                    self.path.display()
+                )
+            })?
         } else {
             self.cache.clone()
         };
@@ -864,29 +1238,34 @@ impl ConfigStore {
         disk_config.terminal_font_family = local_config.terminal_font_family;
         disk_config.title_bar_style = local_config.title_bar_style;
         disk_config.cursor_style = local_config.cursor_style;
+        if local_config.command_history_revision >= disk_config.command_history_revision {
+            disk_config.command_history = local_config.command_history;
+            disk_config.command_history_revision = local_config.command_history_revision;
+        }
+        disk_config.remember_tabs = local_config.remember_tabs;
+        disk_config.saved_tabs = local_config.saved_tabs;
         disk_config.window_bounds = local_config.window_bounds;
         disk_config.workspace_panels = local_config.workspace_panels;
         disk_config.body_panels = local_config.body_panels;
+        disk_config.sftp_tree_panels = local_config.sftp_tree_panels;
+        disk_config.sftp_file_columns = local_config.sftp_file_columns;
+        disk_config.sftp_file_columns_customized = local_config.sftp_file_columns_customized;
         disk_config.show_hidden_files = local_config.show_hidden_files;
         disk_config.lock_layout = local_config.lock_layout;
         disk_config.monitoring_position = local_config.monitoring_position;
         disk_config.sidebar_collapsed = local_config.sidebar_collapsed;
         disk_config.sftp_panel_minimized = local_config.sftp_panel_minimized;
+        disk_config.key_bindings = local_config.key_bindings;
+        disk_config.use_proxy = local_config.use_proxy;
+        disk_config.read_env_proxy = local_config.read_env_proxy;
+        disk_config.global_proxy_type = local_config.global_proxy_type;
+        disk_config.global_proxy_host = local_config.global_proxy_host;
+        disk_config.global_proxy_port = local_config.global_proxy_port;
+        disk_config.global_proxy_user = local_config.global_proxy_user;
+        disk_config.global_proxy_password = local_config.global_proxy_password;
 
         let encrypted_bytes = encrypt_config(&disk_config, &hardware_uuid)?;
-        fs::write(&self.path, encrypted_bytes)
-            .with_context(|| format!("failed to write {}", self.path.display()))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(mut perms) = fs::metadata(&self.path).map(|m| m.permissions()) {
-                perms.set_mode(0o600);
-                let _ = fs::set_permissions(&self.path, perms);
-            }
-        }
-
-        Ok(())
+        write_config_bytes(&self.path, &encrypted_bytes)
     }
 }
 
@@ -1099,7 +1478,7 @@ pub fn get_hardware_uuid() -> String {
             #[cfg(target_os = "macos")]
             {
                 if let Ok(output) = std::process::Command::new("ioreg")
-                    .args(&["-rd1", "-c", "IOPlatformExpertDevice"])
+                    .args(["-rd1", "-c", "IOPlatformExpertDevice"])
                     .output()
                 {
                     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1250,12 +1629,72 @@ mod tests {
     }
 
     #[test]
+    fn test_remember_tabs_defaults_to_disabled_for_older_configs() {
+        let config: ConfigFile = serde_json::from_str("{}").unwrap();
+
+        assert!(!config.remember_tabs);
+        assert!(config.saved_tabs.is_none());
+        assert!(config.sftp_tree_panels.is_none());
+        assert!(config.sftp_file_columns.is_none());
+        assert!(!config.sftp_file_columns_customized);
+    }
+
+    #[test]
+    fn command_history_keeps_only_the_latest_duplicate() {
+        let mut store = ConfigStore::in_memory();
+
+        assert!(store.add_command_history("session-1", "first".to_string()));
+        assert!(store.add_command_history("session-1", "second".to_string()));
+        assert!(store.add_command_history("session-1", "first".to_string()));
+        assert!(!store.add_command_history("session-1", "first".to_string()));
+
+        assert_eq!(
+            store.cache.command_history.get("session-1"),
+            Some(&vec!["second".to_string(), "first".to_string()])
+        );
+        assert_eq!(store.cache.command_history_revision, 3);
+    }
+
+    #[test]
+    fn test_saved_tabs_roundtrip() {
+        let config = ConfigFile {
+            remember_tabs: true,
+            saved_tabs: Some(SavedTabsState {
+                groups: vec![SavedTabGroup {
+                    id: "group-1".to_string(),
+                    title: "~".to_string(),
+                    pane_root: SavedPaneLayout::Single {
+                        tab_id: "tab-1".to_string(),
+                    },
+                    tabs: vec![SavedTerminalTab::Local {
+                        id: "tab-1".to_string(),
+                        cwd: Some(PathBuf::from("/tmp")),
+                        terminal_encoding: TextEncoding::Utf8,
+                    }],
+                }],
+                active_group: Some("group-1".to_string()),
+                active_tab: Some("tab-1".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: ConfigFile = serde_json::from_str(&json).unwrap();
+
+        assert!(restored.remember_tabs);
+        let restored_tabs = restored.saved_tabs.unwrap();
+        assert_eq!(restored_tabs.groups.len(), 1);
+        assert_eq!(restored_tabs.active_tab.as_deref(), Some("tab-1"));
+    }
+
+    #[test]
     fn test_save_merged_preferences() {
-        let temp_dir = std::env::temp_dir();
-        let path = temp_dir.join(format!("ashell-test-config-{}.json", Uuid::new_v4()));
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("sessions.json");
         let mut store = ConfigStore {
             path: path.clone(),
             cache: ConfigFile::default(),
+            write_lock: Arc::new(Mutex::new(())),
         };
 
         let session = Session {
@@ -1277,16 +1716,45 @@ mod tests {
             proxy_password: String::new(),
             protocol: "ssh".to_string(),
             baud_rate: 115200,
+            terminal_encoding: TextEncoding::Utf8,
         };
         store.cache.sessions.push(session.clone());
         store.save().unwrap();
 
-        let mut local_config = ConfigFile::default();
-        local_config.ui_font_size = 18.0;
-        local_config.terminal_font_size = 20.0;
-        local_config.show_hidden_files = true;
+        let mut local_config = ConfigFile {
+            ui_font_size: 18.0,
+            terminal_font_size: 20.0,
+            show_hidden_files: true,
+            sftp_file_columns_customized: true,
+            remember_tabs: true,
+            use_proxy: true,
+            read_env_proxy: false,
+            global_proxy_type: "http".to_string(),
+            global_proxy_host: "proxy.example.com".to_string(),
+            global_proxy_port: Some(8080),
+            global_proxy_user: "proxy-user".to_string(),
+            global_proxy_password: "proxy-password".to_string(),
+            command_history_revision: 2,
+            saved_tabs: Some(SavedTabsState {
+                groups: Vec::new(),
+                active_group: None,
+                active_tab: None,
+            }),
+            ..Default::default()
+        };
+        local_config
+            .key_bindings
+            .insert("QuitApplication".to_string(), "cmd-q".to_string());
+        local_config.command_history.insert(
+            "test-session-id".to_string(),
+            vec!["pwd".to_string(), "ls -la".to_string()],
+        );
 
+        let mut stale_config = local_config.clone();
+        stale_config.command_history.clear();
+        stale_config.command_history_revision = 1;
         store.save_merged_preferences(local_config).unwrap();
+        store.save_merged_preferences(stale_config).unwrap();
 
         let loaded_bytes = fs::read(&path).unwrap();
         let decrypted = decrypt_config(&loaded_bytes, &get_hardware_uuid()).unwrap();
@@ -1294,12 +1762,32 @@ mod tests {
         assert_eq!(decrypted.ui_font_size, 18.0);
         assert_eq!(decrypted.terminal_font_size, 20.0);
         assert!(decrypted.show_hidden_files);
+        assert!(decrypted.sftp_file_columns_customized);
+        assert!(decrypted.remember_tabs);
+        assert!(decrypted.saved_tabs.is_some());
+        assert_eq!(
+            decrypted
+                .key_bindings
+                .get("QuitApplication")
+                .map(String::as_str),
+            Some("cmd-q")
+        );
+        assert!(decrypted.use_proxy);
+        assert!(!decrypted.read_env_proxy);
+        assert_eq!(decrypted.global_proxy_type, "http");
+        assert_eq!(decrypted.global_proxy_host, "proxy.example.com");
+        assert_eq!(decrypted.global_proxy_port, Some(8080));
+        assert_eq!(decrypted.global_proxy_user, "proxy-user");
+        assert_eq!(decrypted.global_proxy_password, "proxy-password");
+        assert_eq!(
+            decrypted.command_history.get("test-session-id"),
+            Some(&vec!["pwd".to_string(), "ls -la".to_string()])
+        );
+        assert_eq!(decrypted.command_history_revision, 2);
 
         assert_eq!(decrypted.sessions.len(), 1);
         assert_eq!(decrypted.sessions[0].name, "Test Session");
         assert_eq!(decrypted.sessions[0].host, "1.2.3.4");
-
-        let _ = fs::remove_file(&path);
     }
 
     #[test]

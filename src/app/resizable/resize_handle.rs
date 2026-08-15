@@ -11,6 +11,8 @@ use gpui_component::{ActiveTheme as _, AxisExt as _, dock::DockPlacement};
 pub(crate) const HANDLE_PADDING: Pixels = px(4.);
 pub(crate) const HANDLE_SIZE: Pixels = px(1.);
 
+type DragCallback<E> = Rc<dyn Fn(&Point<Pixels>, &mut Window, &mut App) -> Entity<E>>;
+
 /// Create a resize handle for a resizable panel.
 pub(crate) fn resize_handle<T: 'static, E: 'static + Render>(
     id: impl Into<ElementId>,
@@ -24,7 +26,7 @@ pub(crate) struct ResizeHandle<T: 'static, E: 'static + Render> {
     axis: Axis,
     drag_value: Option<Rc<T>>,
     placement: Option<DockPlacement>,
-    on_drag: Option<Rc<dyn Fn(&Point<Pixels>, &mut Window, &mut App) -> Entity<E>>>,
+    on_drag: Option<DragCallback<E>>,
 }
 
 impl<T: 'static, E: 'static + Render> ResizeHandle<T, E> {

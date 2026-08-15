@@ -156,6 +156,19 @@ pub struct TerminalElement {
     search_highlights: Option<std::collections::HashMap<(i32, i32), Hsla>>,
 }
 
+pub(crate) struct TerminalElementConfig {
+    pub(crate) view: Entity<Ashell>,
+    pub(crate) focus_handle: FocusHandle,
+    pub(crate) snapshot: RenderSnapshot,
+    pub(crate) marked_text: Option<String>,
+    pub(crate) font_family: SharedString,
+    pub(crate) font_size: Pixels,
+    pub(crate) line_height: Pixels,
+    pub(crate) cell_width: Pixels,
+    pub(crate) tab_id: String,
+    pub(crate) search_highlights: Option<std::collections::HashMap<(i32, i32), Hsla>>,
+}
+
 pub struct PrepaintState {
     bounds: Bounds<Pixels>,
     metrics: TerminalMetrics,
@@ -284,18 +297,19 @@ impl InputHandler for TerminalInputHandler {
 }
 
 impl TerminalElement {
-    pub fn new(
-        view: Entity<Ashell>,
-        focus_handle: FocusHandle,
-        snapshot: RenderSnapshot,
-        marked_text: Option<String>,
-        font_family: SharedString,
-        font_size: Pixels,
-        line_height: Pixels,
-        cell_width: Pixels,
-        tab_id: String,
-        search_highlights: Option<std::collections::HashMap<(i32, i32), Hsla>>,
-    ) -> Self {
+    pub(crate) fn new(config: TerminalElementConfig) -> Self {
+        let TerminalElementConfig {
+            view,
+            focus_handle,
+            snapshot,
+            marked_text,
+            font_family,
+            font_size,
+            line_height,
+            cell_width,
+            tab_id,
+            search_highlights,
+        } = config;
         Self {
             view,
             focus_handle,
@@ -606,7 +620,7 @@ impl Element for TerminalElement {
         // This is 100% accurate because it is recorded during layout prepaint.
         let view = self.view.clone();
         let tab_id = self.tab_id.clone();
-        let _ = view.update(cx, |this, cx| {
+        view.update(cx, |this, cx| {
             let old_bounds = this.terminal_bounds.insert(tab_id.clone(), bounds);
 
             // Sync PTY size unconditionally on every prepaint layout pass to ensure

@@ -14,6 +14,8 @@ use gpui_component::{AxisExt, ElementExt, StyledExt, h_flex, v_flex};
 
 use super::{PANEL_MIN_SIZE, ResizablePanelEvent, ResizableState, resizable_panel, resize_handle};
 
+type ResizeCallback = Rc<dyn Fn(&Entity<ResizableState>, &mut Window, &mut App)>;
+
 #[derive(Clone)]
 pub(crate) struct DragPanel;
 impl Render for DragPanel {
@@ -30,8 +32,9 @@ pub struct ResizablePanelGroup {
     axis: Axis,
     size: Option<Pixels>,
     children: Vec<ResizablePanel>,
-    on_resize: Rc<dyn Fn(&Entity<ResizableState>, &mut Window, &mut App)>,
+    on_resize: ResizeCallback,
     locked: bool,
+    independent_resize: bool,
 }
 
 impl ResizablePanelGroup {
@@ -45,6 +48,7 @@ impl ResizablePanelGroup {
             size: None,
             on_resize: Rc::new(|_, _, _| {}),
             locked: false,
+            independent_resize: false,
         }
     }
 
@@ -65,6 +69,13 @@ impl ResizablePanelGroup {
     /// Set lock status of the resizable panel group.
     pub fn lock(mut self, locked: bool) -> Self {
         self.locked = locked;
+        self
+    }
+
+    /// Resize each panel without redistributing space among its siblings.
+    /// This lets the total group size grow and adds a trailing handle to the last panel.
+    pub fn independent_resize(mut self) -> Self {
+        self.independent_resize = true;
         self
     }
 
@@ -141,7 +152,7 @@ impl RenderOnce for ResizablePanelGroup {
         // Sync panels to the state
         let panels_count = self.children.len();
         state.update(cx, |state, cx| {
-            state.sync_panels_count(self.axis, panels_count, cx);
+            state.sync_panels_count(self.axis, panels_count, !self.independent_resize, cx);
         });
 
         container
@@ -156,6 +167,8 @@ impl RenderOnce for ResizablePanelGroup {
                         panel.axis = self.axis;
                         panel.state = Some(state.clone());
                         panel.locked = self.locked;
+                        panel.trailing_resize_handle =
+                            self.independent_resize && ix + 1 == panels_count;
                         panel
                     }),
             )
@@ -168,7 +181,7 @@ impl RenderOnce for ResizablePanelGroup {
 
                         state.bounds = bounds;
 
-                        if size_changed {
+                        if size_changed && !self.independent_resize {
                             state.adjust_to_container_size(cx);
                         }
                     })
@@ -178,6 +191,7 @@ impl RenderOnce for ResizablePanelGroup {
                 state: state.clone(),
                 axis: self.axis,
                 on_resize: self.on_resize.clone(),
+                independent_resize: self.independent_resize,
             })
     }
 }
@@ -196,6 +210,7 @@ pub struct ResizablePanel {
     visible: bool,
     style: StyleRefinement,
     locked: bool,
+    trailing_resize_handle: bool,
 }
 
 impl ResizablePanel {
@@ -211,6 +226,7 @@ impl ResizablePanel {
             visible: true,
             style: StyleRefinement::default(),
             locked: false,
+            trailing_resize_handle: false,
         }
     }
 
@@ -262,6 +278,8 @@ impl RenderOnce for ResizablePanel {
             .get(self.panel_ix)
             .expect("BUG: The `index` of ResizablePanel should be one of in `state`.");
         let size_range = self.size_range.clone();
+        let leading_handle_state = state.clone();
+        let trailing_handle_state = state.clone();
 
         div()
             .id(("resizable-panel", self.panel_ix))
@@ -305,8 +323,27 @@ impl RenderOnce for ResizablePanel {
                 } else {
                     handle.on_drag(DragPanel, move |drag_panel, _, _, cx| {
                         cx.stop_propagation();
-                        state.update(cx, |state, _| {
+                        leading_handle_state.update(cx, |state, cx| {
                             state.resizing_panel_ix = Some(ix);
+                            cx.notify();
+                        });
+                        cx.new(|_| drag_panel.deref().clone())
+                    })
+                };
+                this.child(handle)
+            })
+            .when(self.trailing_resize_handle, |this| {
+                let ix = self.panel_ix;
+                let handle = resize_handle(("resizable-handle", ix), self.axis)
+                    .placement(gpui_component::dock::DockPlacement::Left);
+                let handle = if self.locked {
+                    handle
+                } else {
+                    handle.on_drag(DragPanel, move |drag_panel, _, _, cx| {
+                        cx.stop_propagation();
+                        trailing_handle_state.update(cx, |state, cx| {
+                            state.resizing_panel_ix = Some(ix);
+                            cx.notify();
                         });
                         cx.new(|_| drag_panel.deref().clone())
                     })
@@ -318,8 +355,9 @@ impl RenderOnce for ResizablePanel {
 
 struct ResizePanelGroupElement {
     state: Entity<ResizableState>,
-    on_resize: Rc<dyn Fn(&Entity<ResizableState>, &mut Window, &mut App)>,
+    on_resize: ResizeCallback,
     axis: Axis,
+    independent_resize: bool,
 }
 
 impl IntoElement for ResizePanelGroupElement {
@@ -361,7 +399,6 @@ impl Element for ResizePanelGroupElement {
         _window: &mut Window,
         _cx: &mut App,
     ) -> Self::PrepaintState {
-        ()
     }
 
     fn paint(
@@ -372,34 +409,31 @@ impl Element for ResizePanelGroupElement {
         _: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
         window: &mut Window,
-        cx: &mut App,
+        _cx: &mut App,
     ) {
         window.on_mouse_event({
             let state = self.state.clone();
             let axis = self.axis;
-            let current_ix = state.read(cx).resizing_panel_ix;
+            let independent_resize = self.independent_resize;
             move |e: &MouseMoveEvent, phase, window, cx| {
                 if !phase.bubble() {
                     return;
                 }
-                let Some(ix) = current_ix else { return };
+                let Some(ix) = state.read(cx).resizing_panel_ix else {
+                    return;
+                };
 
                 state.update(cx, |state, cx| {
                     let panel = state.panels.get(ix).expect("BUG: invalid panel index");
 
-                    match axis {
-                        Axis::Horizontal => state.resize_panel_at_handle(
-                            ix,
-                            e.position.x - panel.bounds.left(),
-                            window,
-                            cx,
-                        ),
-                        Axis::Vertical => state.resize_panel_at_handle(
-                            ix,
-                            e.position.y - panel.bounds.top(),
-                            window,
-                            cx,
-                        ),
+                    let size = match axis {
+                        Axis::Horizontal => e.position.x - panel.bounds.left(),
+                        Axis::Vertical => e.position.y - panel.bounds.top(),
+                    };
+                    if independent_resize {
+                        state.resize_panel_independently(ix, size, window, cx);
+                    } else {
+                        state.resize_panel_at_handle(ix, size, window, cx);
                     }
                     cx.notify();
                 })
@@ -409,10 +443,9 @@ impl Element for ResizePanelGroupElement {
         // When any mouse up, stop dragging
         window.on_mouse_event({
             let state = self.state.clone();
-            let current_ix = state.read(cx).resizing_panel_ix;
             let on_resize = self.on_resize.clone();
             move |_: &MouseUpEvent, phase, window, cx| {
-                if current_ix.is_none() {
+                if state.read(cx).resizing_panel_ix.is_none() {
                     return;
                 }
                 if phase.bubble() {

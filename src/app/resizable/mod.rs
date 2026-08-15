@@ -131,6 +131,7 @@ impl ResizableState {
         &mut self,
         axis: Axis,
         panels_count: usize,
+        fit_to_container: bool,
         cx: &mut Context<Self>,
     ) {
         let mut changed = self.axis != axis;
@@ -150,7 +151,7 @@ impl ResizableState {
             changed = true;
         }
 
-        if changed {
+        if changed && fit_to_container {
             // We need to make sure the total size is in line with the container size.
             self.adjust_to_container_size(cx);
         }
@@ -296,6 +297,29 @@ impl ResizableState {
             self.panels[i].size = Some(size);
         }
         self.sizes = new_sizes;
+        cx.notify();
+    }
+
+    pub(crate) fn resize_panel_independently(
+        &mut self,
+        ix: usize,
+        size: Pixels,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if ix >= self.sizes.len() {
+            return;
+        }
+
+        self.sync_real_panel_sizes(cx);
+        let size_range = self.panel_size_range(ix);
+        let new_size = size.clamp(size_range.start, size_range.end);
+        if new_size == self.sizes[ix] {
+            return;
+        }
+
+        self.sizes[ix] = new_size;
+        self.panels[ix].size = Some(new_size);
         cx.notify();
     }
 

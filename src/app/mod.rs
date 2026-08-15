@@ -1,5 +1,6 @@
 pub mod config_sync;
 pub mod constants;
+pub mod controls;
 pub mod dialogs;
 pub mod keybinding_recorder;
 pub mod resizable;
@@ -10,7 +11,7 @@ pub mod ui;
 
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::Range,
     rc::Rc,
     sync::mpsc,
@@ -33,8 +34,9 @@ use tokio::runtime::Runtime;
 use crate::{
     session::config::{AuthMethod, ConfigStore},
     session::ssh_config::SshConfigEntry,
-    system::{SystemSampler, SystemSnapshot},
+    system::{RemotePort, RemoteProcess, SystemSampler, SystemSnapshot},
     terminal::{self, BackendEvent, TabKind, TerminalTab},
+    text_encoding::TextEncoding,
 };
 
 #[derive(Clone, Debug)]
@@ -50,6 +52,7 @@ pub(crate) struct TabGroup {
     pub(crate) title: String,
     pub(crate) pane_root: PaneLayout,
     pub(crate) sftp: Option<crate::terminal::SftpUiState>,
+    pub(crate) sftp_tab_id: Option<String>,
 }
 
 impl PaneLayout {
@@ -197,8 +200,21 @@ impl ScrollbarHandle for TerminalScrollbarHandle {
 pub(crate) enum DialogKind {
     Settings,
     SessionSelector,
+    ConnectionExport,
     Transfers,
     NewSsh,
+    SftpRename,
+    SftpEditor,
+    Processes,
+    Ports,
+    SshReconnect,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ServerMonitorView {
+    #[default]
+    Cpu,
+    Memory,
 }
 
 pub(crate) struct Ashell {
@@ -214,6 +230,7 @@ pub(crate) struct Ashell {
     pub(crate) passphrase_input: Entity<InputState>,
     pub(crate) baud_rate_input: Entity<InputState>,
     pub(crate) session_protocol: String,
+    pub(crate) ssh_terminal_encoding: TextEncoding,
     pub(crate) ssh_proxy_type: String,
     pub(crate) proxy_host_input: Entity<InputState>,
     pub(crate) proxy_port_input: Entity<InputState>,
@@ -238,6 +255,12 @@ pub(crate) struct Ashell {
     pub(crate) sync_in_progress: bool,
     pub(crate) sync_status: SharedString,
     pub(crate) sftp_path_input: Entity<InputState>,
+    pub(crate) remote_process_filter_input: Entity<InputState>,
+    pub(crate) remote_port_filter_input: Entity<InputState>,
+    pub(crate) connection_filter_input: Entity<InputState>,
+    pub(crate) command_history_filter_input: Entity<InputState>,
+    pub(crate) selected_connection_ids: HashSet<String>,
+    pub(crate) selected_command_history: HashSet<(String, usize)>,
     pub(crate) ssh_auth_method: AuthMethod,
     pub(crate) ssh_config_entries: Vec<SshConfigEntry>,
     pub(crate) ssh_config_selected: Option<usize>,
@@ -258,24 +281,49 @@ pub(crate) struct Ashell {
     pub(crate) selector_selection: usize,
     pub(crate) workspace_panels: Entity<ResizableState>,
     pub(crate) body_panels: Entity<ResizableState>,
+    pub(crate) sftp_tree_panels: Entity<ResizableState>,
+    pub(crate) sftp_file_columns: Entity<ResizableState>,
     pub(crate) is_layout_reset: bool,
     pub(crate) terminal_scrollbars: HashMap<String, TerminalScrollbarHandle>,
     pub(crate) remote_files_scroll_handle: UniformListScrollHandle,
+    pub(crate) remote_files_horizontal_scroll_handle: gpui::ScrollHandle,
+    pub(crate) remote_files_columns_viewport_width: Option<Pixels>,
+    pub(crate) remote_tree_scroll_handle: UniformListScrollHandle,
     pub(crate) disk_scroll_handle: gpui::ScrollHandle,
+    pub(crate) process_scroll_handle: gpui::ScrollHandle,
+    pub(crate) port_scroll_handle: UniformListScrollHandle,
     pub(crate) tabs_scroll_handle: gpui::ScrollHandle,
     pub(crate) selector_scroll_handle: gpui::ScrollHandle,
     pub(crate) saved_scroll_handle: gpui::ScrollHandle,
+    pub(crate) command_history_scroll_handle: gpui::ScrollHandle,
     pub(crate) connection_scroll_handle: gpui::ScrollHandle,
+    pub(crate) saved_sessions_overflowing: bool,
     pub(crate) connection_progress: Option<ConnectionProgress>,
     pub(crate) pending_sftp_path_sync: Option<String>,
     pub(crate) sftp_context_menu: Option<SftpContextMenuState>,
+    pub(crate) sftp_rename_input: Entity<InputState>,
+    pub(crate) sftp_rename_state: Option<SftpRenameState>,
+    pub(crate) sftp_editor_input: Entity<InputState>,
+    pub(crate) sftp_editor_state: Option<SftpEditorState>,
     pub(crate) sftp_creating_folder: bool,
     pub(crate) sftp_new_folder_input: Entity<InputState>,
     pub(crate) sftp_delete_scroll_handle: gpui::ScrollHandle,
     pub(crate) show_hidden_files: bool,
     pub(crate) transfers: Vec<crate::terminal::Transfer>,
     pub(crate) show_transfers_dialog: bool,
+    pub(crate) show_command_history: bool,
+    pub(crate) ssh_command_buffers: HashMap<String, String>,
+    pub(crate) ssh_command_starts: HashMap<String, (usize, usize)>,
     pub(crate) system_status: Option<SharedString>,
+    pub(crate) server_monitor_view: ServerMonitorView,
+    pub(crate) remote_processes: Vec<RemoteProcess>,
+    pub(crate) remote_process_status: Option<SharedString>,
+    pub(crate) remote_processes_in_flight: bool,
+    pub(crate) expanded_process_pid: Option<u32>,
+    pub(crate) remote_ports: Vec<RemotePort>,
+    pub(crate) remote_ports_status: Option<SharedString>,
+    pub(crate) remote_ports_in_flight: bool,
+    pub(crate) terminating_processes: HashSet<u32>,
     pub(crate) pane_root: PaneLayout,
     pub(crate) focused_pane_path: Vec<usize>,
     pub(crate) terminal_panel_bounds: Option<Bounds<Pixels>>,
@@ -327,7 +375,9 @@ pub(crate) struct Ashell {
     pub(crate) hovered_url: Option<HoveredUrl>,
     pub(crate) cmd_ctrl_pressed: bool,
     pub(crate) _subscriptions: Vec<gpui::Subscription>,
-    pub(crate) save_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    pub(crate) last_window_bounds: Option<gpui::WindowBounds>,
+    pub(crate) window_bounds_save_task: Option<gpui::Task<()>>,
+    pub(crate) save_lock: std::sync::Arc<std::sync::Mutex<()>>,
     pub(crate) save_latest_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -358,6 +408,44 @@ pub(crate) struct SftpContextMenuState {
     pub(crate) remote_path: String,
     pub(crate) is_dir: bool,
     pub(crate) position: Point<Pixels>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SftpRenameState {
+    pub(crate) group_id: String,
+    pub(crate) old_path: String,
+    pub(crate) in_flight: bool,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum SftpEditorInteraction {
+    Move {
+        pointer_origin: Point<Pixels>,
+        initial_bounds: Bounds<Pixels>,
+    },
+    Resize {
+        pointer_origin: Point<Pixels>,
+        initial_bounds: Bounds<Pixels>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SftpEditorState {
+    pub(crate) group_id: String,
+    pub(crate) remote_path: String,
+    pub(crate) raw_content: Vec<u8>,
+    pub(crate) original_content: String,
+    pub(crate) encoding: TextEncoding,
+    pub(crate) has_bom: bool,
+    pub(crate) decode_had_errors: bool,
+    pub(crate) loaded: bool,
+    pub(crate) loading: bool,
+    pub(crate) saving: bool,
+    pub(crate) message: Option<String>,
+    pub(crate) error: Option<String>,
+    pub(crate) bounds: Bounds<Pixels>,
+    pub(crate) interaction: Option<SftpEditorInteraction>,
 }
 
 impl Ashell {
@@ -420,8 +508,26 @@ impl Ashell {
         let sftp_path_input = cx.new(|cx| InputState::new(window, cx).default_value("/"));
         let sftp_new_folder_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(t!("new_folder").to_string()));
+        let sftp_rename_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t!("new_name").to_string()));
+        let sftp_editor_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .code_editor("text")
+                .line_number(true)
+                .soft_wrap(false)
+        });
         let search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(t!("search").to_string()));
+        let remote_process_filter_input = cx
+            .new(|cx| InputState::new(window, cx).placeholder(t!("filter_processes").to_string()));
+        let remote_port_filter_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t!("filter_ports").to_string()));
+        let connection_filter_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("filter_connections").to_string())
+        });
+        let command_history_filter_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("filter_command_history").to_string())
+        });
         let config = ConfigStore::load().unwrap_or_else(|err| {
             tracing::warn!("failed to load config: {err:#}");
             ConfigStore::in_memory()
@@ -522,7 +628,13 @@ impl Ashell {
             cx.subscribe_in(&proxy_password_input, window, Self::on_input_event),
             cx.subscribe_in(&sftp_path_input, window, Self::on_input_event),
             cx.subscribe_in(&sftp_new_folder_input, window, Self::on_input_event),
+            cx.subscribe_in(&sftp_rename_input, window, Self::on_input_event),
+            cx.subscribe_in(&sftp_editor_input, window, Self::on_input_event),
             cx.subscribe_in(&search_input, window, Self::on_input_event),
+            cx.subscribe_in(&remote_process_filter_input, window, Self::on_input_event),
+            cx.subscribe_in(&remote_port_filter_input, window, Self::on_input_event),
+            cx.subscribe_in(&connection_filter_input, window, Self::on_input_event),
+            cx.subscribe_in(&command_history_filter_input, window, Self::on_input_event),
             cx.subscribe_in(&sync_endpoint_input, window, Self::on_input_event),
             cx.subscribe_in(&sync_username_input, window, Self::on_input_event),
             cx.subscribe_in(&sync_webdav_password_input, window, Self::on_input_event),
@@ -538,11 +650,15 @@ impl Ashell {
                 window,
                 Self::on_input_event,
             ),
+            cx.observe_window_bounds(window, Self::on_window_bounds_changed),
+            cx.on_app_quit(Self::save_layout_on_app_quit),
         ];
 
         let (events_tx, events_rx) = mpsc::channel();
         let workspace_panels = cx.new(|_| ResizableState::default());
         let body_panels = cx.new(|_| ResizableState::default());
+        let sftp_tree_panels = cx.new(|_| ResizableState::default());
+        let sftp_file_columns = cx.new(|_| ResizableState::default());
         let mut system_sampler = SystemSampler::new();
         let system = system_sampler.sample();
         let default_light_theme_name = ThemeRegistry::global(cx).default_light_theme().name.clone();
@@ -577,6 +693,18 @@ impl Ashell {
         }
         rust_i18n::set_locale(&active_locale);
         gpui_component::set_locale(&active_locale);
+        connection_filter_input.update(cx, |input, cx| {
+            input.set_placeholder(t!("filter_connections").to_string(), window, cx);
+        });
+        command_history_filter_input.update(cx, |input, cx| {
+            input.set_placeholder(t!("filter_command_history").to_string(), window, cx);
+        });
+        remote_process_filter_input.update(cx, |input, cx| {
+            input.set_placeholder(t!("filter_processes").to_string(), window, cx);
+        });
+        remote_port_filter_input.update(cx, |input, cx| {
+            input.set_placeholder(t!("filter_ports").to_string(), window, cx);
+        });
         let ui_font_family: SharedString = config.ui_font_family().into();
         let terminal_font_family: SharedString = config.terminal_font_family().into();
         let last_sidebar_width = Some(px(config
@@ -596,6 +724,7 @@ impl Ashell {
             passphrase_input,
             baud_rate_input,
             session_protocol: "ssh".to_string(),
+            ssh_terminal_encoding: TextEncoding::Utf8,
             ssh_proxy_type: "none".to_string(),
             proxy_host_input,
             proxy_port_input,
@@ -620,6 +749,12 @@ impl Ashell {
             sync_in_progress: false,
             sync_status: t!("sync_not_run").into(),
             sftp_path_input,
+            remote_process_filter_input,
+            remote_port_filter_input,
+            connection_filter_input,
+            command_history_filter_input,
+            selected_connection_ids: HashSet::new(),
+            selected_command_history: HashSet::new(),
             ssh_auth_method: AuthMethod::Password,
             ssh_config_entries: crate::session::ssh_config::parse_ssh_config().unwrap_or_default(),
             ssh_config_selected: None,
@@ -644,17 +779,30 @@ impl Ashell {
             selector_selection: 0,
             workspace_panels,
             body_panels,
+            sftp_tree_panels,
+            sftp_file_columns,
             is_layout_reset: false,
             terminal_scrollbars: HashMap::new(),
             remote_files_scroll_handle: UniformListScrollHandle::new(),
+            remote_files_horizontal_scroll_handle: gpui::ScrollHandle::new(),
+            remote_files_columns_viewport_width: None,
+            remote_tree_scroll_handle: UniformListScrollHandle::new(),
             disk_scroll_handle: gpui::ScrollHandle::new(),
+            process_scroll_handle: gpui::ScrollHandle::new(),
+            port_scroll_handle: UniformListScrollHandle::new(),
             tabs_scroll_handle: gpui::ScrollHandle::new(),
             selector_scroll_handle: gpui::ScrollHandle::new(),
             saved_scroll_handle: gpui::ScrollHandle::new(),
+            command_history_scroll_handle: gpui::ScrollHandle::new(),
             connection_scroll_handle: gpui::ScrollHandle::new(),
+            saved_sessions_overflowing: false,
             connection_progress: None,
             pending_sftp_path_sync: Some("/".into()),
             sftp_context_menu: None,
+            sftp_rename_input,
+            sftp_rename_state: None,
+            sftp_editor_input,
+            sftp_editor_state: None,
             sftp_creating_folder: false,
             sftp_new_folder_input,
             sftp_delete_scroll_handle: gpui::ScrollHandle::new(),
@@ -674,7 +822,19 @@ impl Ashell {
                 transfers
             },
             show_transfers_dialog: false,
+            show_command_history: false,
+            ssh_command_buffers: HashMap::new(),
+            ssh_command_starts: HashMap::new(),
             system_status: None,
+            server_monitor_view: ServerMonitorView::default(),
+            remote_processes: Vec::new(),
+            remote_process_status: None,
+            remote_processes_in_flight: false,
+            expanded_process_pid: None,
+            remote_ports: Vec::new(),
+            remote_ports_status: None,
+            remote_ports_in_flight: false,
+            terminating_processes: HashSet::new(),
             terminal_bounds: HashMap::new(),
             terminal_selecting: false,
             terminal_marked_text: None,
@@ -720,12 +880,14 @@ impl Ashell {
             hovered_url: None,
             cmd_ctrl_pressed: false,
             _subscriptions,
-            save_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            last_window_bounds: Some(window.window_bounds()),
+            window_bounds_save_task: None,
+            save_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             save_latest_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         this.apply_theme_preferences(window, cx);
-        // this.open_local(cx);
+        this.restore_saved_tabs(window, cx);
         this.start_event_pump(cx);
         this
     }
@@ -843,7 +1005,7 @@ impl Ashell {
         } else if input == &self.search_input {
             if let InputEvent::PressEnter { .. } = event {
                 if self.search_query.is_empty()
-                    || self.search_input.read(cx).text().to_string() != self.search_query
+                    || *self.search_input.read(cx).text() != self.search_query
                 {
                     self.perform_search(window, cx);
                 } else {
@@ -864,11 +1026,14 @@ impl Ashell {
         let save_lock = self.save_lock.clone();
 
         self.runtime.spawn(async move {
-            let _guard = save_lock.lock().await;
-            if current_seq < latest_seq.load(std::sync::atomic::Ordering::SeqCst) {
-                return;
-            }
             let _ = tokio::task::spawn_blocking(move || {
+                let Ok(_guard) = save_lock.lock() else {
+                    tracing::error!("failed to lock preferences save state");
+                    return;
+                };
+                if current_seq < latest_seq.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
                 if let Err(err) = config_store.save_merged_preferences(local_config) {
                     tracing::error!("failed to save merged preferences in background: {err:#}");
                 }
@@ -886,7 +1051,7 @@ impl Ashell {
                     .await;
                 if this
                     .update(cx, |this, cx| {
-                        let changed = this.drain_backend_events();
+                        let changed = this.drain_backend_events(cx);
                         let system_sampled = this.sample_system_if_due();
                         this.sync_theme_if_due(cx);
                         let is_blinking = matches!(
@@ -914,21 +1079,23 @@ impl Ashell {
         .detach();
     }
 
-    pub(crate) fn drain_backend_events(&mut self) -> bool {
+    pub(crate) fn drain_backend_events(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         let mut transfers_changed = false;
         while let Ok(event) = self.events_rx.try_recv() {
+            let Some(event) = event.into_current() else {
+                continue;
+            };
             changed = true;
             match event {
+                BackendEvent::Guarded { .. } => unreachable!("guarded events are unwrapped above"),
                 BackendEvent::Output { tab_id, bytes } => {
                     if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        tab.backend_initialized = true;
                         tab.feed(&bytes);
                     }
                 }
                 BackendEvent::Status { tab_id, text } => {
                     if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        tab.backend_initialized = true;
                         tab.status = text.clone();
                     }
                     if let Some(progress) = self.connection_progress.as_mut() {
@@ -943,12 +1110,23 @@ impl Ashell {
                 }
                 BackendEvent::Connected { tab_id } => {
                     if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        tab.backend_initialized = true;
                         tab.connected = true;
                         tab.disconnected_reason = None;
                     }
+                    self.sync_sftp_path_from_terminal_title(&tab_id, cx);
                     self.sync_system_tab_to_active_group();
+                    if self.system_tab_id.as_deref() == Some(tab_id.as_str()) {
+                        self.system_status = None;
+                        self.remote_process_status = None;
+                        self.remote_ports_status = None;
+                    }
                     self.request_active_system_snapshot();
+                    if self.active_dialog == Some(DialogKind::Processes) {
+                        self.request_active_process_snapshot();
+                    }
+                    if self.active_dialog == Some(DialogKind::Ports) {
+                        self.request_active_port_snapshot();
+                    }
                     if self
                         .connection_progress
                         .as_ref()
@@ -962,16 +1140,50 @@ impl Ashell {
                     path,
                     entries,
                 } => {
-                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id) {
+                    let mut active_path = None;
+                    if let Some(group) = self
+                        .tab_groups
+                        .iter_mut()
+                        .find(|group| group.sftp_tab_id.as_deref() == Some(tab_id.as_str()))
+                    {
                         if let Some(sftp) = group.sftp.as_mut() {
-                            sftp.current_path = path;
-                            sftp.entries = entries;
-                            self.pending_sftp_path_sync = Some(sftp.current_path.clone());
+                            let normalized_path =
+                                crate::sftp::normalize_remote_path(&path, "/", &sftp.home_dir);
+                            let is_current = sftp.current_path == normalized_path;
+                            sftp.apply_directory_entries(normalized_path, entries);
+                            if is_current && self.active_group.as_deref() == Some(group.id.as_str())
+                            {
+                                active_path = Some(sftp.current_path.clone());
+                            }
+                        }
+                    }
+                    if let Some(path) = active_path {
+                        self.pending_sftp_path_sync = Some(path);
+                    }
+                }
+                BackendEvent::SftpDirectoryFailed {
+                    tab_id,
+                    path,
+                    reason,
+                } => {
+                    if let Some(group) = self
+                        .tab_groups
+                        .iter_mut()
+                        .find(|group| group.sftp_tab_id.as_deref() == Some(tab_id.as_str()))
+                    {
+                        if let Some(sftp) = group.sftp.as_mut() {
+                            let normalized_path =
+                                crate::sftp::normalize_remote_path(&path, "/", &sftp.home_dir);
+                            sftp.apply_directory_error(normalized_path, reason);
                         }
                     }
                 }
                 BackendEvent::SftpPreview { tab_id, preview } => {
-                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id) {
+                    if let Some(group) = self
+                        .tab_groups
+                        .iter_mut()
+                        .find(|group| group.sftp_tab_id.as_deref() == Some(tab_id.as_str()))
+                    {
                         if let Some(sftp) = group.sftp.as_mut() {
                             sftp.selected_path = Some(preview.path.clone());
                             sftp.preview = Some(preview);
@@ -979,18 +1191,26 @@ impl Ashell {
                     }
                 }
                 BackendEvent::SftpStatus { tab_id, text } => {
-                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id) {
-                        if let Some(sftp) = group.sftp.as_mut() {
-                            sftp.status = text.clone();
-                        }
-                    }
-                    if self.active_group.as_ref() == Some(&tab_id) {
+                    let group_id = self
+                        .tab_groups
+                        .iter_mut()
+                        .find(|group| group.sftp_tab_id.as_deref() == Some(tab_id.as_str()))
+                        .map(|group| {
+                            if let Some(sftp) = group.sftp.as_mut() {
+                                sftp.status = text.clone();
+                            }
+                            group.id.clone()
+                        });
+                    if group_id
+                        .as_ref()
+                        .is_some_and(|group_id| self.active_group.as_ref() == Some(group_id))
+                    {
                         self.status = text.into();
                     }
                 }
                 BackendEvent::RemoteSystem { tab_id, snapshot } => {
-                    self.remote_sample_in_flight = false;
-                    if self.system_tab_id.as_deref() == Some(tab_id.as_str()) {
+                    if self.is_connected_system_tab(&tab_id) {
+                        self.remote_sample_in_flight = false;
                         self.system_status = None;
                         self.system = snapshot.clone();
                         self.cpu_history.push(snapshot.cpu_percent);
@@ -1008,29 +1228,71 @@ impl Ashell {
                     }
                 }
                 BackendEvent::RemoteSystemUnavailable { tab_id, reason } => {
-                    self.remote_sample_in_flight = false;
-                    if self.system_tab_id.as_deref() == Some(tab_id.as_str()) {
+                    if self.is_connected_system_tab(&tab_id) {
+                        self.remote_sample_in_flight = false;
                         self.system_status = Some(reason.clone().into());
                         self.status = reason.into();
                     }
                 }
-                BackendEvent::Closed { tab_id, reason } => {
-                    self.remote_sample_in_flight = false;
-                    let is_stale = self
-                        .tabs
-                        .iter()
-                        .find(|t| t.id == tab_id)
-                        .is_some_and(|tab| {
-                            // After retry_disconnected_tab, the old backend's threads
-                            // may still send Closed events. Skip those — they arrive
-                            // before the new backend sends its first Output/Connected.
-                            // Once backend_initialized is set, any Closed is from the
-                            // current backend and should be processed.
-                            tab.backend_generation > 0 && !tab.backend_initialized
-                        });
-                    if is_stale {
-                        continue;
+                BackendEvent::RemoteProcesses { tab_id, processes } => {
+                    if self.is_connected_system_tab(&tab_id) {
+                        self.remote_processes_in_flight = false;
+                        self.remote_process_status = None;
+                        self.remote_processes = processes;
+                        self.sort_remote_processes();
                     }
+                }
+                BackendEvent::RemoteProcessesUnavailable { tab_id, reason } => {
+                    if self.is_connected_system_tab(&tab_id) {
+                        self.remote_processes_in_flight = false;
+                        self.remote_processes.clear();
+                        self.remote_process_status = Some(reason.clone().into());
+                        self.status = reason.into();
+                    }
+                }
+                BackendEvent::RemotePorts { tab_id, ports } => {
+                    if self.is_connected_system_tab(&tab_id) {
+                        self.remote_ports_in_flight = false;
+                        self.remote_ports_status = None;
+                        self.remote_ports = ports;
+                        self.sort_remote_ports();
+                    }
+                }
+                BackendEvent::RemotePortsUnavailable { tab_id, reason } => {
+                    if self.is_connected_system_tab(&tab_id) {
+                        self.remote_ports_in_flight = false;
+                        self.remote_ports.clear();
+                        self.remote_ports_status = Some(reason.clone().into());
+                        self.status = reason.into();
+                    }
+                }
+                BackendEvent::RemoteProcessTerminated { tab_id, pid } => {
+                    if self.is_connected_system_tab(&tab_id) {
+                        self.terminating_processes.remove(&pid);
+                        self.remote_processes.retain(|process| process.pid != pid);
+                        if self.expanded_process_pid == Some(pid) {
+                            self.expanded_process_pid = None;
+                        }
+                        self.remote_process_status =
+                            Some(t!("process_terminated", pid = pid).to_string().into());
+                        self.status = t!("process_terminated", pid = pid).to_string().into();
+                        self.request_active_process_snapshot();
+                    }
+                }
+                BackendEvent::RemoteProcessTerminateFailed {
+                    tab_id,
+                    pid,
+                    reason,
+                } => {
+                    if self.is_connected_system_tab(&tab_id) {
+                        self.terminating_processes.remove(&pid);
+                        let message =
+                            t!("process_terminate_failed", pid = pid, reason = reason).to_string();
+                        self.remote_process_status = Some(message.clone().into());
+                        self.status = message.into();
+                    }
+                }
+                BackendEvent::Closed { tab_id, reason } => {
                     let is_graceful_exit =
                         reason == "local shell closed" || reason == "ssh session closed";
                     if is_graceful_exit {
@@ -1044,7 +1306,19 @@ impl Ashell {
                         tab.disconnected_reason = Some(reason.clone());
                     }
                     if self.system_tab_id.as_deref() == Some(tab_id.as_str()) {
+                        self.system = SystemSnapshot::default();
+                        self.cpu_history.clear();
+                        self.net_rx_history.clear();
+                        self.net_tx_history.clear();
+                        self.remote_sample_in_flight = false;
+                        self.remote_processes_in_flight = false;
+                        self.remote_processes.clear();
+                        self.remote_ports_in_flight = false;
+                        self.remote_ports.clear();
+                        self.terminating_processes.clear();
                         self.system_status = Some(reason.clone().into());
+                        self.remote_process_status = Some(reason.clone().into());
+                        self.remote_ports_status = Some(reason.clone().into());
                     }
                     if let Some(progress) = self.connection_progress.as_mut() {
                         if progress.tab_id == tab_id {
@@ -1093,16 +1367,60 @@ impl Ashell {
                     transfers_changed = true;
                 }
                 BackendEvent::SftpHome { tab_id, home } => {
-                    if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == tab_id) {
+                    let home = crate::sftp::normalize_remote_path(&home, "/", "/");
+                    let mut group_id = None;
+                    let mut paths_to_load = Vec::new();
+                    let mut sync_active_path = false;
+                    if let Some(group) = self
+                        .tab_groups
+                        .iter_mut()
+                        .find(|group| group.sftp_tab_id.as_deref() == Some(tab_id.as_str()))
+                    {
                         if let Some(sftp) = group.sftp.as_mut() {
-                            sftp.home_dir = home;
+                            sftp.home_dir = home.clone();
+                            sftp.home_dir_resolved = true;
+                            sftp.current_path = home.clone();
+                            sftp.expand_to(&home);
+                            sftp.begin_directory_load(&home);
+                            for path in crate::sftp::remote_path_ancestors(&home) {
+                                if path != home
+                                    && !sftp.directory_cache.contains_key(&path)
+                                    && !sftp.loading_directories.contains(&path)
+                                {
+                                    sftp.begin_directory_load(&path);
+                                    paths_to_load.push(path);
+                                }
+                            }
+                            group_id = Some(group.id.clone());
+                            sync_active_path =
+                                self.active_group.as_deref() == Some(group.id.as_str());
                         }
+                    }
+                    if let Some(handle) = group_id.as_ref().and_then(|id| self.sftp_handles.get(id))
+                    {
+                        for path in paths_to_load {
+                            handle.list_dir(path);
+                        }
+                    }
+                    if sync_active_path {
+                        self.pending_sftp_path_sync = Some(home);
+                        self.sync_sftp_path_from_terminal_title(&tab_id, cx);
                     }
                 }
                 BackendEvent::TerminalTitleChanged { tab_id, title } => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    let local_path = title
+                        .strip_prefix("ASHELL_CWD_B64:")
+                        .and_then(crate::session::decode_local_path_title);
+                    if let Some(path) = local_path {
+                        self.apply_local_directory_change(&tab_id, path);
+                    } else if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                         tab.dynamic_title = title;
+                        tab.terminal_title_received = true;
                     }
+                    self.sync_sftp_path_from_terminal_title(&tab_id, cx);
+                }
+                BackendEvent::LocalDirectoryChanged { tab_id, path } => {
+                    self.apply_local_directory_change(&tab_id, path);
                 }
                 BackendEvent::SyncFinished(result) => {
                     self.sync_in_progress = false;
@@ -1116,6 +1434,7 @@ impl Ashell {
                         }
                         crate::sync::SyncResult::Downloaded { payload, etag } => {
                             self.config.replace_sessions(payload.sessions);
+                            self.selected_connection_ids.clear();
                             self.config.set_sync_etag(etag);
                             match self.config.save() {
                                 Ok(()) => self.sync_status = t!("sync_download_complete").into(),
@@ -1141,15 +1460,22 @@ impl Ashell {
     pub(crate) fn sample_system_if_due(&mut self) -> bool {
         if self.last_system_sample.elapsed() >= SystemSampler::interval() {
             self.last_system_sample = Instant::now();
-            // Use system_tab_id (not active_tab) to decide remote vs local sampling
             if let Some(ref tab_id) = self.system_tab_id.clone() {
-                if self
+                let ssh_connected = self
                     .tabs
                     .iter()
-                    .any(|t| t.id == *tab_id && t.kind == TabKind::Ssh && t.connected)
-                    && self.system_status.is_none()
-                {
-                    self.request_active_system_snapshot();
+                    .find(|tab| tab.id == *tab_id && tab.kind == TabKind::Ssh)
+                    .map(|tab| tab.connected);
+                if let Some(connected) = ssh_connected {
+                    if connected {
+                        self.request_active_system_snapshot();
+                        if self.active_dialog == Some(DialogKind::Processes) {
+                            self.request_active_process_snapshot();
+                        }
+                        if self.active_dialog == Some(DialogKind::Ports) {
+                            self.request_active_port_snapshot();
+                        }
+                    }
                     return false;
                 }
             }
@@ -1197,10 +1523,128 @@ impl Ashell {
         if self.remote_sample_in_flight {
             return;
         }
-        self.remote_sample_in_flight = true;
         if let Ok(backend) = backend.lock() {
+            self.remote_sample_in_flight = true;
             backend.send(crate::terminal::BackendCommand::SampleMetrics);
         }
+    }
+
+    fn is_connected_system_tab(&self, tab_id: &str) -> bool {
+        self.system_tab_id.as_deref() == Some(tab_id)
+            && self
+                .tabs
+                .iter()
+                .any(|tab| tab.id == tab_id && tab.kind == TabKind::Ssh && tab.connected)
+    }
+
+    pub(crate) fn request_active_process_snapshot(&mut self) {
+        let Some(ref tab_id) = self.system_tab_id.clone() else {
+            return;
+        };
+        let Some(backend) = (|| {
+            let tab = self
+                .tabs
+                .iter()
+                .find(|tab| tab.id == *tab_id && tab.kind == TabKind::Ssh && tab.connected)?;
+            Some(tab.backend.clone())
+        })() else {
+            return;
+        };
+        if self.remote_processes_in_flight {
+            return;
+        }
+        if let Ok(backend) = backend.lock() {
+            self.remote_processes_in_flight = true;
+            if self.remote_processes.is_empty() {
+                self.remote_process_status = Some(t!("loading_processes").to_string().into());
+            }
+            backend.send(crate::terminal::BackendCommand::SampleProcesses);
+        }
+    }
+
+    pub(crate) fn request_active_port_snapshot(&mut self) {
+        let Some(ref tab_id) = self.system_tab_id.clone() else {
+            return;
+        };
+        let Some(backend) = (|| {
+            let tab = self
+                .tabs
+                .iter()
+                .find(|tab| tab.id == *tab_id && tab.kind == TabKind::Ssh && tab.connected)?;
+            Some(tab.backend.clone())
+        })() else {
+            return;
+        };
+        if self.remote_ports_in_flight {
+            return;
+        }
+        if let Ok(backend) = backend.lock() {
+            self.remote_ports_in_flight = true;
+            if self.remote_ports.is_empty() {
+                self.remote_ports_status = Some(t!("loading_ports").to_string().into());
+            }
+            backend.send(crate::terminal::BackendCommand::SamplePorts);
+        }
+    }
+
+    fn sort_remote_ports(&mut self) {
+        self.remote_ports.sort_by(|a, b| {
+            a.port
+                .cmp(&b.port)
+                .then_with(|| a.protocol.cmp(&b.protocol))
+                .then_with(|| a.address.cmp(&b.address))
+                .then_with(|| a.pid.cmp(&b.pid))
+        });
+    }
+
+    pub(crate) fn toggle_process_expanded(&mut self, pid: u32, cx: &mut Context<Self>) {
+        self.expanded_process_pid = (self.expanded_process_pid != Some(pid)).then_some(pid);
+        cx.notify();
+    }
+
+    fn sort_remote_processes(&mut self) {
+        match self.server_monitor_view {
+            ServerMonitorView::Cpu => self.remote_processes.sort_by(|a, b| {
+                b.cpu_percent
+                    .total_cmp(&a.cpu_percent)
+                    .then_with(|| a.pid.cmp(&b.pid))
+            }),
+            ServerMonitorView::Memory => self.remote_processes.sort_by(|a, b| {
+                b.memory_bytes
+                    .cmp(&a.memory_bytes)
+                    .then_with(|| a.pid.cmp(&b.pid))
+            }),
+        }
+    }
+
+    pub(crate) fn terminate_remote_process(
+        &mut self,
+        tab_id: String,
+        pid: u32,
+        cx: &mut Context<Self>,
+    ) {
+        if pid <= 1 || self.terminating_processes.contains(&pid) {
+            return;
+        }
+        if self.system_tab_id.as_deref() != Some(tab_id.as_str()) {
+            return;
+        }
+        let Some(backend) = (|| {
+            let tab = self
+                .tabs
+                .iter()
+                .find(|tab| tab.id == tab_id && tab.kind == TabKind::Ssh && tab.connected)?;
+            Some(tab.backend.clone())
+        })() else {
+            return;
+        };
+        if let Ok(backend) = backend.lock() {
+            self.terminating_processes.insert(pid);
+            self.remote_process_status =
+                Some(t!("terminating_process", pid = pid).to_string().into());
+            backend.send(crate::terminal::BackendCommand::TerminateProcess { pid });
+        }
+        cx.notify();
     }
 
     pub(crate) fn terminal_ime_bounds_for_range(
@@ -1246,7 +1690,8 @@ impl Ashell {
         }
 
         for (ix, tab_id, session, tab_kind) in retry_tabs {
-            // Close old backend
+            let backend_events = self.tabs[ix].advance_backend_events();
+            // Invalidate old backend events before requesting shutdown.
             self.tabs[ix].send_backend(crate::terminal::BackendCommand::Close);
 
             // Spawn new backend
@@ -1256,21 +1701,18 @@ impl Ashell {
                         self.runtime.handle(),
                         tab_id.clone(),
                         session.clone(),
-                        self.events_tx.clone(),
+                        backend_events.clone(),
                     );
                     crate::terminal::BackendTx::Serial(b)
                 }
-                crate::terminal::TabKind::Ssh => {
-                    let b = crate::backend::ssh::spawn_ssh_terminal(
-                        self.runtime.handle(),
-                        tab_id.clone(),
-                        session.clone(),
-                        self.tabs[ix].cols,
-                        self.tabs[ix].rows,
-                        self.events_tx.clone(),
-                    );
-                    b
-                }
+                crate::terminal::TabKind::Ssh => crate::backend::ssh::spawn_ssh_terminal(
+                    self.runtime.handle(),
+                    tab_id.clone(),
+                    session.clone(),
+                    self.tabs[ix].cols,
+                    self.tabs[ix].rows,
+                    backend_events.clone(),
+                ),
                 _ => continue,
             };
 
@@ -1279,41 +1721,12 @@ impl Ashell {
             self.tabs[ix].connected = false;
             self.tabs[ix].status = "connecting".into();
             self.tabs[ix].disconnected_reason = None;
-            self.tabs[ix].backend_initialized = false;
+            self.tabs[ix].terminal_title_received = false;
 
-            // Restart SFTP for the group containing this tab
-            if let Some(group) = self
-                .tab_groups
-                .iter()
-                .find(|g| g.pane_root.contains(&tab_id))
+            if tab_kind == crate::terminal::TabKind::Ssh
+                && self.active_tab.as_deref() == Some(tab_id.as_str())
             {
-                let group_id = group.id.clone();
-                let group_session = self
-                    .tabs
-                    .iter()
-                    .find(|t| group.pane_root.contains(&t.id) && t.session.is_some())
-                    .and_then(|t| t.session.clone());
-
-                if let Some(session) = group_session {
-                    if session.protocol != "serial" {
-                        if let Some(old_handle) = self.sftp_handles.remove(&group_id) {
-                            old_handle.close();
-                        }
-                        let sftp_handle = crate::sftp::spawn_sftp(
-                            self.runtime.handle(),
-                            group_id.clone(),
-                            session,
-                            self.events_tx.clone(),
-                        );
-                        self.sftp_handles.insert(group_id.clone(), sftp_handle);
-
-                        if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id) {
-                            if let Some(sftp) = group.sftp.as_mut() {
-                                sftp.status = rust_i18n::t!("sftp_connecting").to_string();
-                            }
-                        }
-                    }
-                }
+                self.restart_active_sftp();
             }
         }
 
@@ -1339,14 +1752,14 @@ impl Ashell {
     pub(crate) fn sync_cwd_from_terminal(
         &mut self,
         _window: &mut gpui::Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         let active_id = self.active_tab.clone();
         let Some(active_id) = active_id else {
             return;
         };
 
-        if let Some(tab) = self.tabs.iter().find(|t| t.id == active_id) {
+        let parsed = if let Some(tab) = self.tabs.iter().find(|t| t.id == active_id) {
             let home_dir = if let Some(group) = self
                 .tab_groups
                 .iter()
@@ -1361,25 +1774,54 @@ impl Ashell {
                 "/"
             };
 
-            let parsed = Self::parse_path_from_title(&tab.dynamic_title, home_dir);
+            Self::parse_path_from_title(&tab.dynamic_title, home_dir)
+        } else {
+            None
+        };
 
-            if let Some(path) = parsed {
-                if let Some(group) = self
-                    .tab_groups
-                    .iter_mut()
-                    .find(|g| g.pane_root.contains(&active_id))
-                {
-                    if let Some(sftp) = group.sftp.as_mut() {
-                        sftp.current_path = path.clone();
-                        self.pending_sftp_path_sync = Some(path.clone());
-                        if let Some(handle) = self.sftp_handles.get(&group.id) {
-                            let _ = handle
-                                .commands
-                                .send(crate::sftp::SftpCommand::ListDir(path));
-                        }
-                    }
-                }
-            }
+        if let Some(path) = parsed {
+            self.navigate_sftp(path, cx);
+        }
+    }
+
+    fn sync_sftp_path_from_terminal_title(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        if self.active_tab.as_deref() != Some(tab_id) {
+            return;
+        }
+
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        if tab.kind != TabKind::Ssh
+            || !tab.connected
+            || !tab.terminal_title_received
+            || tab.is_alternate_screen_active()
+        {
+            return;
+        }
+        let title = tab.dynamic_title.clone();
+
+        let Some((current_path, home_dir)) = self
+            .active_group
+            .as_ref()
+            .and_then(|group_id| {
+                self.tab_groups
+                    .iter()
+                    .find(|group| &group.id == group_id && group.pane_root.contains(tab_id))
+            })
+            .and_then(|group| group.sftp.as_ref())
+            .filter(|sftp| sftp.home_dir_resolved)
+            .map(|sftp| (sftp.current_path.clone(), sftp.home_dir.clone()))
+        else {
+            return;
+        };
+
+        let Some(path) = Self::parse_path_from_title(&title, &home_dir) else {
+            return;
+        };
+        let path = crate::sftp::normalize_remote_path(&path, &current_path, &home_dir);
+        if path != current_path {
+            self.navigate_sftp(path, cx);
         }
     }
 
@@ -1403,10 +1845,10 @@ impl Ashell {
         }
     }
 
-    pub(crate) fn save_layout_state(&self, window: &mut gpui::Window, cx: &gpui::App) {
+    fn capture_layout_state(&mut self, window: &mut gpui::Window, cx: &gpui::App) -> bool {
         if self.is_layout_reset {
             tracing::info!("[ui] layout was reset, skipping save layout state.");
-            return;
+            return false;
         }
         let current_bounds = window.window_bounds();
         let bounds = match current_bounds {
@@ -1416,9 +1858,6 @@ impl Ashell {
         };
         let size = bounds.size;
         if size.width.as_f32() > 400.0 && size.height.as_f32() > 300.0 {
-            self.save_latest_seq
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let mut config = self.config.clone();
             let saved_bounds = match current_bounds {
                 gpui::WindowBounds::Fullscreen(b) => {
                     crate::session::config::SavedWindowBounds::Fullscreen {
@@ -1429,38 +1868,11 @@ impl Ashell {
                     }
                 }
                 gpui::WindowBounds::Maximized(b) => {
-                    let mut restore_bounds = (
-                        b.origin.x.into(),
-                        b.origin.y.into(),
-                        b.size.width.into(),
-                        b.size.height.into(),
-                    );
-                    if let Some(existing_bounds) = config.window_bounds() {
-                        match existing_bounds {
-                            crate::session::config::SavedWindowBounds::Windowed {
-                                x,
-                                y,
-                                width,
-                                height,
-                            } => {
-                                restore_bounds = (*x, *y, *width, *height);
-                            }
-                            crate::session::config::SavedWindowBounds::Maximized {
-                                x,
-                                y,
-                                width,
-                                height,
-                            } => {
-                                restore_bounds = (*x, *y, *width, *height);
-                            }
-                            _ => {}
-                        }
-                    }
                     crate::session::config::SavedWindowBounds::Maximized {
-                        x: restore_bounds.0,
-                        y: restore_bounds.1,
-                        width: restore_bounds.2,
-                        height: restore_bounds.3,
+                        x: b.origin.x.into(),
+                        y: b.origin.y.into(),
+                        width: b.size.width.into(),
+                        height: b.size.height.into(),
                     }
                 }
                 gpui::WindowBounds::Windowed(b) => {
@@ -1487,6 +1899,42 @@ impl Ashell {
                 .map(|s| s.into())
                 .collect();
 
+            if body_sizes.len() < 2 {
+                body_sizes = self.config.body_panels().cloned().unwrap_or_default();
+            }
+
+            let mut sftp_tree_sizes: Vec<f32> = self
+                .sftp_tree_panels
+                .read(cx)
+                .sizes()
+                .iter()
+                .map(|size| size.as_f32())
+                .collect();
+            if sftp_tree_sizes.len() < 2 {
+                sftp_tree_sizes = self.config.sftp_tree_panels().cloned().unwrap_or_default();
+            }
+
+            let current_sftp_file_column_sizes: Vec<f32> = self
+                .sftp_file_columns
+                .read(cx)
+                .sizes()
+                .iter()
+                .map(|size| size.as_f32())
+                .collect();
+            let mut sftp_file_column_sizes = self
+                .config
+                .sftp_file_columns()
+                .filter(|sizes| sizes.len() >= 3)
+                .cloned()
+                .unwrap_or_else(|| vec![200., 64., 128.]);
+            for (index, size) in current_sftp_file_column_sizes
+                .into_iter()
+                .take(3)
+                .enumerate()
+            {
+                sftp_file_column_sizes[index] = size;
+            }
+
             if self.sftp_panel_minimized {
                 if let Some(prev) = self.prev_monitoring_size {
                     if body_sizes.len() > 1 {
@@ -1495,15 +1943,85 @@ impl Ashell {
                 }
             }
 
-            config.set_layout_state(Some(saved_bounds), Some(workspace_sizes), Some(body_sizes));
-            config.set_sidebar_collapsed(self.sidebar_collapsed);
-            config.set_sftp_panel_minimized(self.sftp_panel_minimized);
-            let _ = config.save();
+            let body_sizes = (!body_sizes.is_empty()).then_some(body_sizes);
+            let sftp_tree_sizes = (!sftp_tree_sizes.is_empty()).then_some(sftp_tree_sizes);
+            let sftp_file_column_sizes =
+                (!sftp_file_column_sizes.is_empty()).then_some(sftp_file_column_sizes);
+            self.config
+                .set_layout_state(Some(saved_bounds), Some(workspace_sizes), body_sizes);
+            self.config.set_sftp_tree_panels(sftp_tree_sizes);
+            self.config.set_sftp_file_columns(sftp_file_column_sizes);
+            self.config.set_sidebar_collapsed(self.sidebar_collapsed);
+            self.config
+                .set_sftp_panel_minimized(self.sftp_panel_minimized);
+            true
         } else {
             tracing::warn!(
                 "[ui] window size is too small ({:?}), skipping save layout state to prevent corrupting saved bounds.",
                 size
             );
+            false
         }
+    }
+
+    pub(crate) fn save_layout_state(&mut self, window: &mut gpui::Window, cx: &gpui::App) {
+        let should_save_tabs = self.config.remember_tabs();
+        if should_save_tabs {
+            self.capture_tabs_state();
+        }
+        if self.capture_layout_state(window, cx) || should_save_tabs {
+            let current_seq = self
+                .save_latest_seq
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let Ok(_guard) = self.save_lock.lock() else {
+                tracing::error!("failed to lock window layout save state");
+                return;
+            };
+            if current_seq
+                < self
+                    .save_latest_seq
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return;
+            }
+            if let Err(err) = self.config.save() {
+                tracing::error!("failed to save window layout state: {err:#}");
+            }
+        }
+    }
+
+    fn on_window_bounds_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current_bounds = window.window_bounds();
+
+        // Keep a reset effective until the first actual bounds change. GPUI may
+        // notify observers during a redraw without changing the window geometry.
+        if self.is_layout_reset && self.last_window_bounds != Some(current_bounds) {
+            self.is_layout_reset = false;
+        }
+
+        if self.last_window_bounds == Some(current_bounds) {
+            return;
+        }
+        self.last_window_bounds = Some(current_bounds);
+
+        self.window_bounds_save_task = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.capture_layout_state(window, cx) {
+                    this.save_preferences_background();
+                }
+            });
+        }));
+    }
+
+    fn save_layout_on_app_quit(&mut self, cx: &mut Context<Self>) -> gpui::Task<()> {
+        let entity_id = cx.entity_id();
+        let _ = cx.with_window(entity_id, |window, cx| {
+            self.save_layout_state(window, cx);
+        });
+        gpui::Task::ready(())
     }
 }

@@ -6,26 +6,6 @@ use crate::{
     terminal,
 };
 
-pub(crate) fn is_editable_text_file(filename: &str) -> bool {
-    let lower = filename.to_lowercase();
-    let ext = std::path::Path::new(&lower)
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    let known_exts = [
-        "txt", "conf", "json", "yaml", "yml", "xml", "ini", "sh", "py", "rs", "js", "ts", "html",
-        "css", "md", "toml", "csv", "log", "cfg",
-    ];
-    if known_exts.contains(&ext) {
-        return true;
-    }
-    let known_names = ["dockerfile", "makefile", ".gitignore", ".env"];
-    if known_names.contains(&lower.as_str()) {
-        return true;
-    }
-    false
-}
-
 impl Ashell {
     pub(crate) fn active_sftp(&self) -> Option<&terminal::SftpUiState> {
         self.active_group
@@ -49,13 +29,107 @@ impl Ashell {
     }
 
     pub(crate) fn navigate_sftp(&mut self, path: String, cx: &mut Context<Self>) {
-        if let Some(handle) = self.active_sftp_handle() {
-            tracing::info!("[sftp] navigating to directory: '{}'", path);
-            handle.list_dir(path.clone());
-            if let Some(sftp) = self.active_sftp_mut() {
-                sftp.current_path = path;
-                self.pending_sftp_path_sync = Some(sftp.current_path.clone());
+        let Some((current_path, home_dir)) = self
+            .active_sftp()
+            .map(|sftp| (sftp.current_path.clone(), sftp.home_dir.clone()))
+        else {
+            return;
+        };
+        let path = crate::sftp::normalize_remote_path(&path, &current_path, &home_dir);
+        let Some(handle) = self.active_sftp_handle().cloned() else {
+            return;
+        };
+
+        tracing::info!("[sftp] navigating to directory: '{}'", path);
+        let ancestors = crate::sftp::remote_path_ancestors(&path);
+        let mut paths_to_load = Vec::new();
+        if let Some(sftp) = self.active_sftp_mut() {
+            sftp.current_path = path.clone();
+            sftp.selected_path = None;
+            sftp.preview = None;
+            sftp.selected_entries.clear();
+            sftp.expand_to(&path);
+            sftp.begin_directory_load(&path);
+            for ancestor in ancestors {
+                if ancestor != path
+                    && !sftp.directory_cache.contains_key(&ancestor)
+                    && !sftp.loading_directories.contains(&ancestor)
+                {
+                    sftp.begin_directory_load(&ancestor);
+                    paths_to_load.push(ancestor);
+                }
             }
+        }
+        self.pending_sftp_path_sync = Some(path.clone());
+        for ancestor in paths_to_load {
+            handle.list_dir(ancestor);
+        }
+        handle.list_dir(path);
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_sftp_tree_directory(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(handle) = self.active_sftp_handle().cloned() else {
+            return;
+        };
+        let mut should_load = false;
+        if let Some(sftp) = self.active_sftp_mut() {
+            let has_error = sftp.directory_errors.contains_key(&path);
+            let has_cache = sftp.directory_cache.contains_key(&path);
+            if sftp.expanded_directories.contains(&path) && !has_error && has_cache {
+                sftp.expanded_directories.remove(&path);
+                cx.notify();
+                return;
+            }
+            sftp.expanded_directories.insert(path.clone());
+            should_load = (has_error || !has_cache) && !sftp.loading_directories.contains(&path);
+            if should_load {
+                sftp.begin_directory_load(&path);
+            }
+        }
+        if should_load {
+            handle.list_dir(path);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn reveal_current_sftp_directory(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = self.active_sftp_handle().cloned() else {
+            return;
+        };
+        let Some(current_path) = self.active_sftp().map(|sftp| sftp.current_path.clone()) else {
+            return;
+        };
+        let ancestors = crate::sftp::remote_path_ancestors(&current_path);
+        let mut paths_to_load = Vec::new();
+        if let Some(sftp) = self.active_sftp_mut() {
+            sftp.expand_to(&current_path);
+            for path in ancestors {
+                if !sftp.directory_cache.contains_key(&path)
+                    && !sftp.loading_directories.contains(&path)
+                {
+                    sftp.begin_directory_load(&path);
+                    paths_to_load.push(path);
+                }
+            }
+        }
+        for path in paths_to_load {
+            handle.list_dir(path);
+        }
+        if let Some(index) = self.active_sftp().and_then(|sftp| {
+            sftp.tree_rows(self.show_hidden_files)
+                .iter()
+                .position(|row| row.path == current_path)
+        }) {
+            self.remote_tree_scroll_handle
+                .scroll_to_item(index, gpui::ScrollStrategy::Center);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn collapse_sftp_tree(&mut self, cx: &mut Context<Self>) {
+        if let Some(sftp) = self.active_sftp_mut() {
+            sftp.collapse_all();
             cx.notify();
         }
     }
@@ -144,15 +218,27 @@ impl Ashell {
         cx.notify();
     }
 
-    pub(crate) fn trigger_sftp_context_edit(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn trigger_sftp_context_edit(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(menu) = self.sftp_context_menu.take() else {
             return;
         };
-        if let Some(handle) = self.active_sftp_handle() {
-            tracing::info!("[sftp] triggering edit for file: '{}'", menu.remote_path);
-            handle.edit_file(menu.remote_path);
-        }
-        cx.notify();
+        tracing::info!("[sftp] opening in-app editor for: '{}'", menu.remote_path);
+        self.show_sftp_editor_dialog(menu.remote_path, window, cx);
+    }
+
+    pub(crate) fn trigger_sftp_context_rename(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.sftp_context_menu.take() else {
+            return;
+        };
+        self.show_sftp_rename_dialog(menu.remote_path, window, cx);
     }
 
     pub(crate) fn download_sftp_entry(
@@ -307,7 +393,11 @@ impl Ashell {
     pub(crate) fn toggle_all_sftp_entries(&mut self, checked: bool, cx: &mut Context<Self>) {
         if let Some(sftp) = self.active_sftp_mut() {
             if checked {
-                let paths: Vec<String> = sftp.entries.iter().map(|e| e.full_path.clone()).collect();
+                let paths: Vec<String> = sftp
+                    .current_entries()
+                    .iter()
+                    .map(|entry| entry.full_path.clone())
+                    .collect();
                 for path in paths {
                     sftp.selected_entries.insert(path);
                 }

@@ -1,5 +1,5 @@
 use crate::session::config::Session;
-use crate::terminal::{BackendCommand, BackendEvent};
+use crate::terminal::{BackendCommand, BackendEvent, GuardedBackendEventSender};
 use std::io::{Read, Write};
 
 /// Spawn the serial port backend threads.
@@ -8,7 +8,7 @@ pub fn spawn_serial_client(
     _handle: &tokio::runtime::Handle,
     tab_id: String,
     session: Session,
-    events_tx: std::sync::mpsc::Sender<BackendEvent>,
+    events_tx: GuardedBackendEventSender,
 ) -> tokio::sync::mpsc::UnboundedSender<BackendCommand> {
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<BackendCommand>();
 
@@ -91,7 +91,11 @@ pub fn spawn_serial_client(
                         let _ = port_write.flush();
                     }
                     BackendCommand::Close => break,
-                    _ => {}
+                    BackendCommand::Resize { .. }
+                    | BackendCommand::SampleMetrics
+                    | BackendCommand::SampleProcesses
+                    | BackendCommand::SamplePorts
+                    | BackendCommand::TerminateProcess { .. } => {}
                 }
             }
         });
@@ -173,24 +177,27 @@ mod tests {
         let (events_tx, events_rx) = std::sync::mpsc::channel();
         let handle = tokio::runtime::Handle::current();
         let session = Session::serial(slave_name, 0);
-        let cmd_tx = spawn_serial_client(&handle, "test-tab".to_string(), session, events_tx);
+        let backend_events = GuardedBackendEventSender::new(events_tx);
+        let cmd_tx = spawn_serial_client(&handle, "test-tab".to_string(), session, backend_events);
 
         // Wait for the Status event
-        let status_event = events_rx.recv_timeout(std::time::Duration::from_secs(2));
-        assert!(status_event.is_ok(), "Failed to receive Status event");
-        if let Ok(BackendEvent::Status { tab_id, .. }) = status_event {
-            assert_eq!(tab_id, "test-tab");
-        } else {
-            panic!("Expected Status event, got: {:?}", status_event);
+        let status_event = events_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("Failed to receive Status event")
+            .into_current();
+        match status_event {
+            Some(BackendEvent::Status { tab_id, .. }) => assert_eq!(tab_id, "test-tab"),
+            event => panic!("Expected Status event, got: {event:?}"),
         }
 
         // Wait for the Connected event
-        let connected_event = events_rx.recv_timeout(std::time::Duration::from_secs(2));
-        assert!(connected_event.is_ok(), "Failed to receive Connected event");
-        if let Ok(BackendEvent::Connected { tab_id }) = connected_event {
-            assert_eq!(tab_id, "test-tab");
-        } else {
-            panic!("Expected Connected event, got: {:?}", connected_event);
+        let connected_event = events_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("Failed to receive Connected event")
+            .into_current();
+        match connected_event {
+            Some(BackendEvent::Connected { tab_id }) => assert_eq!(tab_id, "test-tab"),
+            event => panic!("Expected Connected event, got: {event:?}"),
         }
 
         // 3. Test Reading: Write to PTY master, verify serial backend outputs it to UI
@@ -198,13 +205,16 @@ mod tests {
         master_writer.write_all(b"hello serial simulator").unwrap();
         master_writer.flush().unwrap();
 
-        let output_event = events_rx.recv_timeout(std::time::Duration::from_secs(2));
-        assert!(output_event.is_ok(), "Failed to receive Output event");
-        if let Ok(BackendEvent::Output { tab_id, bytes }) = output_event {
-            assert_eq!(tab_id, "test-tab");
-            assert_eq!(bytes, b"hello serial simulator");
-        } else {
-            panic!("Expected Output event");
+        let output_event = events_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("Failed to receive Output event")
+            .into_current();
+        match output_event {
+            Some(BackendEvent::Output { tab_id, bytes }) => {
+                assert_eq!(tab_id, "test-tab");
+                assert_eq!(bytes, b"hello serial simulator");
+            }
+            event => panic!("Expected Output event, got: {event:?}"),
         }
 
         // 4. Test Writing: Send BackendCommand::Input to backend, verify PTY master reads it

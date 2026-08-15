@@ -877,10 +877,10 @@ fn find_urls(text: &str) -> Vec<usize> {
     while let Some(pos) = text[start..].find("http") {
         let abs = start + pos;
         let remaining = &text[abs..];
-        if remaining.starts_with("https://") || remaining.starts_with("http://") {
-            if abs == 0 || is_boundary(text.as_bytes()[abs - 1] as char) {
-                positions.push(abs);
-            }
+        if (remaining.starts_with("https://") || remaining.starts_with("http://"))
+            && (abs == 0 || is_boundary(text.as_bytes()[abs - 1] as char))
+        {
+            positions.push(abs);
         }
         start = abs + 4;
     }
@@ -967,8 +967,8 @@ pub fn build_logical_lines<'a>(cells: &'a [RenderCell], rows: usize) -> Vec<Logi
         }
 
         let wraps_from_prev = row_idx > 0 && {
-            current_line.as_ref().map_or(false, |line| {
-                line.row_cells.last().map_or(false, |rc| {
+            current_line.as_ref().is_some_and(|line| {
+                line.row_cells.last().is_some_and(|rc| {
                     rc.cell
                         .flags
                         .contains(alacritty_terminal::term::cell::Flags::WRAPLINE)

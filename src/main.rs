@@ -10,6 +10,7 @@ mod sftp;
 mod sync;
 mod system;
 mod terminal;
+mod text_encoding;
 
 rust_i18n::i18n!("locales", fallback = "en");
 
@@ -17,8 +18,8 @@ gpui::actions!(ashell_terminal, [TerminalTabKey, TerminalBacktabKey]);
 
 pub(crate) use app::keybinding_recorder::{
     ClosePane, Copy, FocusPaneDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp, NewSsh, OpenSearch,
-    OpenSession, OpenSettings, OpenTransfers, Paste, SplitPaneDown, SplitPaneLeft, SplitPaneRight,
-    SplitPaneUp, ToggleSftpZoom, ToggleSidebar,
+    OpenSession, OpenSettings, OpenTransfers, Paste, QuitApplication, SplitPaneDown, SplitPaneLeft,
+    SplitPaneRight, SplitPaneUp, ToggleSftpZoom, ToggleSidebar,
 };
 
 pub(crate) use app::{Ashell, PaneLayout, SelectorEntry, SftpContextMenuState, TabGroup};
@@ -42,6 +43,8 @@ fn main() {
     });
     app.run(move |cx| {
         gpui_component::init(cx);
+        cx.on_action(|_: &QuitApplication, cx| cx.quit());
+
         cx.bind_keys([
             KeyBinding::new(
                 "tab",

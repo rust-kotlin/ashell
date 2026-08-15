@@ -13,7 +13,9 @@ tokio-socks = "0.5"
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "fcf32feacb367b75ec84dd40f041e4fd411d3cc1" }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+csv = "1"
 directories = "5"
+encoding_rs = "0.8"
 flate2 = "1"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
@@ -32,6 +34,7 @@ serde_json = "1"
 ssh-key = "0.6"
 sysinfo = "0.33"
 tar = "0.4"
+tempfile = "3"
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "net", "time", "fs"] }
 tracing = "0.1"
@@ -81,3 +84,8 @@ strip = true
 
 [build-dependencies]
 winres = "0.1.12"
+
+# Remove these overrides after GPUI moves off block 0.1 and stacksafe 0.1.
+[patch.crates-io]
+block = { git = "https://github.com/Dicklesworthstone/rust-block", rev = "b39ae859d1ee8e8cb5eef6a516471f1578d26b96" }
+stacksafe-macro = { path = "patches/stacksafe-macro" }

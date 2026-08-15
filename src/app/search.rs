@@ -6,13 +6,11 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, IconName, Sizable as _,
-    button::{Button, ButtonVariants as _},
-    h_flex,
-    input::Input,
+    button::ButtonVariants as _, h_flex, input::Input,
 };
 use rust_i18n::t;
 
-use crate::Ashell;
+use crate::{Ashell, app::controls::pointer_button};
 
 impl Ashell {
     pub(crate) fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -272,9 +270,7 @@ impl Ashell {
 
         let tab = tab.or_else(|| self.tabs.first());
 
-        let Some(tab) = tab else {
-            return None;
-        };
+        let tab = tab?;
         let snapshot = tab.render_snapshot(false);
         let display_offset = snapshot.display_offset as i32;
         let rows = snapshot.rows as i32;
@@ -327,7 +323,7 @@ impl Ashell {
     pub(crate) fn render_search_button(&self, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         // Wrap in a div so .hover() doesn't conflict with Button's internal hover.
         div().child(
-            Button::new("search-btn")
+            pointer_button("search-btn")
                 .ghost()
                 .small()
                 .rounded(px(999.))
@@ -362,7 +358,7 @@ impl Ashell {
             .top(px(8.))
             .right(px(24.))
             .on_prepaint(move |bounds, _window, cx| {
-                let _ = view.update(cx, |this, _| {
+                view.update(cx, |this, _| {
                     this.search_bar_bounds = Some(bounds);
                 });
             })
@@ -407,7 +403,7 @@ impl Ashell {
                         )
                     })
                     .child(
-                        Button::new("search-prev")
+                        pointer_button("search-prev")
                             .ghost()
                             .xsmall()
                             .icon(IconName::ChevronUp)
@@ -417,7 +413,7 @@ impl Ashell {
                             })),
                     )
                     .child(
-                        Button::new("search-next")
+                        pointer_button("search-next")
                             .ghost()
                             .xsmall()
                             .icon(IconName::ChevronDown)
@@ -427,7 +423,7 @@ impl Ashell {
                             })),
                     )
                     .child(
-                        Button::new("search-close")
+                        pointer_button("search-close")
                             .ghost()
                             .xsmall()
                             .icon(IconName::Close)

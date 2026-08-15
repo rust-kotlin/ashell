@@ -16,10 +16,13 @@ use russh::{
     client::{self, Handler},
     keys::{PrivateKey, decode_secret_key, load_secret_key},
 };
-use russh_sftp::client::SftpSession;
+use russh_sftp::{client::SftpSession, protocol::FileAttributes};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    sync::{
+        mpsc::{self, UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -66,15 +69,22 @@ pub enum SftpCommand {
         remote: String,
         local_dir: String,
     },
-    EditFile {
+    ReadTextFile {
         remote_path: String,
+        reply: oneshot::Sender<std::result::Result<Vec<u8>, String>>,
+    },
+    WriteTextFile {
+        remote_path: String,
+        content: Vec<u8>,
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    RenamePath {
+        old_path: String,
+        new_path: String,
+        reply: oneshot::Sender<std::result::Result<(), String>>,
     },
     CreateDir(String),
     DeletePaths(Vec<String>),
-    UploadEditedFile {
-        local_path: String,
-        remote_path: String,
-    },
     UploadPaths {
         locals: Vec<String>,
         remote_dir: String,
@@ -89,6 +99,14 @@ pub enum SftpCommand {
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 pub struct TransferStateFlag(pub Arc<AtomicU8>);
+
+#[derive(Clone, Copy)]
+struct TransferContext<'a> {
+    flag: &'a TransferStateFlag,
+    events: &'a std::sync::mpsc::Sender<BackendEvent>,
+    tab_id: &'a str,
+    id: &'a str,
+}
 
 impl TransferStateFlag {
     pub fn new() -> Self {
@@ -184,8 +202,43 @@ impl SftpHandle {
             .send(SftpCommand::UploadPaths { locals, remote_dir });
     }
 
-    pub fn edit_file(&self, remote_path: String) {
-        let _ = self.commands.send(SftpCommand::EditFile { remote_path });
+    pub fn read_text_file(
+        &self,
+        remote_path: String,
+    ) -> oneshot::Receiver<std::result::Result<Vec<u8>, String>> {
+        let (reply, response) = oneshot::channel();
+        let _ = self
+            .commands
+            .send(SftpCommand::ReadTextFile { remote_path, reply });
+        response
+    }
+
+    pub fn write_text_file(
+        &self,
+        remote_path: String,
+        content: Vec<u8>,
+    ) -> oneshot::Receiver<std::result::Result<(), String>> {
+        let (reply, response) = oneshot::channel();
+        let _ = self.commands.send(SftpCommand::WriteTextFile {
+            remote_path,
+            content,
+            reply,
+        });
+        response
+    }
+
+    pub fn rename_path(
+        &self,
+        old_path: String,
+        new_path: String,
+    ) -> oneshot::Receiver<std::result::Result<(), String>> {
+        let (reply, response) = oneshot::channel();
+        let _ = self.commands.send(SftpCommand::RenamePath {
+            old_path,
+            new_path,
+            reply,
+        });
+        response
     }
 
     pub fn close(&self) {
@@ -227,10 +280,6 @@ pub fn spawn_sftp(
                 tab_id: tab_id.clone(),
                 text: format!("sftp error: {err:#}"),
             });
-            let _ = events.send(BackendEvent::Closed {
-                tab_id,
-                reason: format!("sftp error: {err:#}"),
-            });
         }
     });
     SftpHandle {
@@ -252,17 +301,7 @@ async fn run_sftp(
     });
 
     let handle = connect_and_authenticate(&session).await?;
-    let channel = handle
-        .channel_open_session()
-        .await
-        .context("open sftp channel")?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .context("request sftp subsystem")?;
-    let sftp = SftpSession::new(channel.into_stream())
-        .await
-        .context("sftp handshake")?;
+    let sftp = open_sftp_session(&handle).await?;
 
     let home = sftp
         .canonicalize(".")
@@ -310,9 +349,15 @@ async fn run_sftp(
                 };
 
                 if let Err(err) = emit_entries(&events, &tab_id, &sftp, &actual_path).await {
+                    let reason = format!("list failed: {err:#}");
+                    let _ = events.send(BackendEvent::SftpDirectoryFailed {
+                        tab_id: tab_id.clone(),
+                        path: actual_path,
+                        reason: reason.clone(),
+                    });
                     let _ = events.send(BackendEvent::SftpStatus {
                         tab_id: tab_id.clone(),
-                        text: format!("list failed: {err:#}"),
+                        text: reason,
                     });
                 }
             }
@@ -354,33 +399,30 @@ async fn run_sftp(
                 let commands_tx_clone = commands_tx.clone();
 
                 tokio::spawn(async move {
-                    let Ok(channel) = handle_clone.channel_open_session().await else {
-                        return;
-                    };
-                    let Ok(_) = channel.request_subsystem(true, "sftp").await else {
-                        return;
-                    };
-                    let Ok(sftp_session) = SftpSession::new(channel.into_stream()).await else {
-                        return;
-                    };
+                    let result = async {
+                        let sftp_session = open_sftp_session(&handle_clone).await?;
+                        let _ = events_clone.send(BackendEvent::SftpStatus {
+                            tab_id: tab_id_clone.clone(),
+                            text: t!("downloading_file", base = base_name(&remote)).to_string(),
+                        });
+                        let transfer = TransferContext {
+                            flag: &flag,
+                            events: &events_clone,
+                            tab_id: &tab_id_clone,
+                            id: &id,
+                        };
+                        download_path_impl(
+                            &handle_clone,
+                            &sftp_session,
+                            &remote,
+                            Path::new(&local_dir),
+                            transfer,
+                        )
+                        .await
+                    }
+                    .await;
 
-                    let _ = events_clone.send(BackendEvent::SftpStatus {
-                        tab_id: tab_id_clone.clone(),
-                        text: t!("downloading_file", base = base_name(&remote)).to_string(),
-                    });
-
-                    match download_path_impl(
-                        &handle_clone,
-                        &sftp_session,
-                        &remote,
-                        Path::new(&local_dir),
-                        flag,
-                        &events_clone,
-                        &tab_id_clone,
-                        &id,
-                    )
-                    .await
-                    {
+                    match result {
                         Ok(summary) => {
                             let _ = events_clone.send(BackendEvent::SftpStatus {
                                 tab_id: tab_id_clone,
@@ -467,32 +509,26 @@ async fn run_sftp(
                 let commands_tx_clone = commands_tx.clone();
 
                 tokio::spawn(async move {
-                    let Ok(channel) = handle_clone.channel_open_session().await else {
-                        return;
-                    };
-                    let Ok(_) = channel.request_subsystem(true, "sftp").await else {
-                        return;
-                    };
-                    let Ok(sftp_session) = SftpSession::new(channel.into_stream()).await else {
-                        return;
-                    };
+                    let result = async {
+                        let sftp_session = open_sftp_session(&handle_clone).await?;
+                        let _ = events_clone.send(BackendEvent::SftpStatus {
+                            tab_id: tab_id_clone.clone(),
+                            text: t!("uploading").to_string(),
+                        });
+                        upload_paths_impl(
+                            &sftp_session,
+                            &locals,
+                            &remote_dir,
+                            flag,
+                            &events_clone,
+                            &tab_id_clone,
+                            &id,
+                        )
+                        .await
+                    }
+                    .await;
 
-                    let _ = events_clone.send(BackendEvent::SftpStatus {
-                        tab_id: tab_id_clone.clone(),
-                        text: t!("uploading").to_string(),
-                    });
-
-                    match upload_paths_impl(
-                        &sftp_session,
-                        &locals,
-                        &remote_dir,
-                        flag,
-                        &events_clone,
-                        &tab_id_clone,
-                        &id,
-                    )
-                    .await
-                    {
+                    match result {
                         Ok(summary) => {
                             let _ = events_clone.send(BackendEvent::SftpStatus {
                                 tab_id: tab_id_clone.clone(),
@@ -530,150 +566,41 @@ async fn run_sftp(
                     let _ = commands_tx_clone.send(SftpCommand::TransferFinished(id));
                 });
             }
-            SftpCommand::EditFile { remote_path } => {
-                let id = uuid::Uuid::new_v4().to_string();
-                let config = crate::session::config::ConfigStore::load().unwrap();
-                let tmp_dir = config.tmp_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-                let base = base_name(&remote_path);
-                let local_path = tmp_dir.join(format!("{}-{}", id, base));
-
-                let handle_clone = handle.clone();
-                let commands_tx_clone = commands_tx.clone();
-                let events_clone = events.clone();
-                let tab_id_clone = tab_id.clone();
-
-                tokio::spawn(async move {
-                    let flag = TransferStateFlag::new();
-                    let Ok(channel) = handle_clone.channel_open_session().await else {
-                        return;
-                    };
-                    let Ok(_) = channel.request_subsystem(true, "sftp").await else {
-                        return;
-                    };
-                    let Ok(sftp_session) = SftpSession::new(channel.into_stream()).await else {
-                        return;
-                    };
-
-                    let _ = events_clone.send(BackendEvent::SftpStatus {
-                        tab_id: tab_id_clone.clone(),
-                        text: t!("downloading_file", base = base).to_string(),
-                    });
-
-                    if let Err(err) = download_file_impl(
-                        &sftp_session,
-                        &remote_path,
-                        &local_path,
-                        &flag,
-                        &events_clone,
-                        &tab_id_clone,
-                        "edit-download",
-                    )
+            SftpCommand::ReadTextFile { remote_path, reply } => {
+                let result = read_text_file_impl(&sftp, &remote_path)
                     .await
-                    {
-                        let _ = events_clone.send(BackendEvent::SftpStatus {
-                            tab_id: tab_id_clone.clone(),
-                            text: format!("Edit download failed: {err:#}"),
-                        });
-                        return;
-                    }
-
-                    if let Err(err) = open::that(&local_path) {
-                        let _ = events_clone.send(BackendEvent::SftpStatus {
-                            tab_id: tab_id_clone.clone(),
-                            text: format!("Failed to open editor: {err:#}"),
-                        });
-                        return;
-                    }
-
-                    use notify::Watcher;
-                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-                    let mut watcher = match notify::recommended_watcher(
-                        move |res: notify::Result<notify::Event>| {
-                            if let Ok(event) = res {
-                                if event.kind.is_modify() {
-                                    let _ = tx.send(());
-                                }
-                            }
-                        },
-                    ) {
-                        Ok(w) => w,
-                        Err(_) => return,
-                    };
-
-                    if let Err(_) = watcher.watch(&local_path, notify::RecursiveMode::NonRecursive)
-                    {
-                        return;
-                    }
-
-                    while let Some(_) = rx.recv().await {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        while let Ok(_) = rx.try_recv() {} // drain pending
-
-                        if commands_tx_clone
-                            .send(SftpCommand::UploadEditedFile {
-                                local_path: local_path.to_string_lossy().to_string(),
-                                remote_path: remote_path.clone(),
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                });
+                    .map_err(|err| format!("{err:#}"));
+                let _ = reply.send(result);
             }
-            SftpCommand::UploadEditedFile {
-                local_path,
+            SftpCommand::WriteTextFile {
                 remote_path,
+                content,
+                reply,
             } => {
-                let handle_clone = handle.clone();
-                let events_clone = events.clone();
-                let tab_id_clone = tab_id.clone();
-
-                tokio::spawn(async move {
-                    let flag = TransferStateFlag::new();
-                    let Ok(channel) = handle_clone.channel_open_session().await else {
-                        return;
-                    };
-                    let Ok(_) = channel.request_subsystem(true, "sftp").await else {
-                        return;
-                    };
-                    let Ok(sftp_session) = SftpSession::new(channel.into_stream()).await else {
-                        return;
-                    };
-
-                    let transferred = Arc::new(AtomicU64::new(0));
-                    match upload_file_impl(
-                        &sftp_session,
-                        Path::new(&local_path),
-                        &remote_path,
-                        &flag,
-                        &events_clone,
-                        &tab_id_clone,
-                        "edit-upload",
-                        transferred,
-                        None,
-                    )
+                let result = write_text_file_impl(&sftp, &remote_path, &content)
                     .await
-                    {
-                        Ok(_) => {
-                            let now = chrono::Local::now().format("%H:%M:%S");
-                            let _ = events_clone.send(BackendEvent::SftpStatus {
-                                tab_id: tab_id_clone.clone(),
-                                text: format!(
-                                    "{} ({})",
-                                    t!("auto_saved_and_uploaded", base = base_name(&remote_path)),
-                                    now
-                                ),
-                            });
-                        }
-                        Err(err) => {
-                            let _ = events_clone.send(BackendEvent::SftpStatus {
-                                tab_id: tab_id_clone.clone(),
-                                text: format!("Auto-upload failed: {err:#}"),
-                            });
-                        }
+                    .map_err(|err| format!("{err:#}"));
+                if result.is_ok() {
+                    if let Some(parent) = parent_dir(&remote_path) {
+                        let _ = commands_tx.send(SftpCommand::ListDir(parent));
                     }
-                });
+                }
+                let _ = reply.send(result);
+            }
+            SftpCommand::RenamePath {
+                old_path,
+                new_path,
+                reply,
+            } => {
+                let result = rename_path_impl(&sftp, &old_path, &new_path)
+                    .await
+                    .map_err(|err| format!("{err:#}"));
+                if result.is_ok() {
+                    if let Some(parent) = parent_dir(&old_path) {
+                        let _ = commands_tx.send(SftpCommand::ListDir(parent));
+                    }
+                }
+                let _ = reply.send(result);
             }
             SftpCommand::CreateDir(path) => {
                 let actual_path = if path == "~" {
@@ -767,6 +694,22 @@ async fn run_sftp(
     Ok(())
 }
 
+async fn open_sftp_session(
+    handle: &russh::client::Handle<SftpClientHandler>,
+) -> Result<SftpSession> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .context("open sftp channel")?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .context("request sftp subsystem")?;
+    SftpSession::new(channel.into_stream())
+        .await
+        .context("sftp handshake")
+}
+
 use std::future::Future;
 use std::pin::Pin;
 
@@ -851,7 +794,7 @@ async fn connect_and_authenticate(
             .context("password authentication failed")?,
         AuthMethod::Key => {
             let has_explicit_key = session_has_explicit_key(session);
-            let success = if has_explicit_key {
+            if has_explicit_key {
                 let keypair = load_session_private_key(session)?;
                 let keys = private_keys_with_algs(keypair).context("invalid private key")?;
                 let mut success = false;
@@ -896,8 +839,7 @@ async fn connect_and_authenticate(
                     ));
                 }
                 success
-            };
-            success
+            }
         }
         AuthMethod::Config => {
             // For Config auth, try the identity file from config entry, or default keys
@@ -1017,13 +959,57 @@ fn expand_key_path(value: &str) -> Option<PathBuf> {
     Some(Path::new(value).to_path_buf())
 }
 
-fn base_name(path: &str) -> String {
+pub(crate) fn base_name(path: &str) -> String {
     let sep = |c: char| c == '/' || c == '\\';
     path.trim_end_matches(sep)
         .rsplit(sep)
         .next()
         .unwrap_or(path)
         .to_string()
+}
+
+pub(crate) fn editor_language(path: &str) -> &'static str {
+    let name = base_name(path).to_lowercase();
+    if name == "dockerfile" {
+        return "bash";
+    }
+    if name == "makefile" {
+        return "make";
+    }
+
+    match Path::new(&name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+    {
+        "bash" | "zsh" | "sh" => "bash",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" => "cpp",
+        "cs" => "csharp",
+        "css" | "scss" => "css",
+        "go" => "go",
+        "html" | "htm" => "html",
+        "java" => "java",
+        "js" | "mjs" | "cjs" => "javascript",
+        "json" | "jsonc" => "json",
+        "kt" | "kts" => "kotlin",
+        "lua" => "lua",
+        "md" | "markdown" => "markdown",
+        "php" => "php",
+        "proto" => "proto",
+        "py" => "python",
+        "rb" => "ruby",
+        "rs" => "rust",
+        "sql" => "sql",
+        "svelte" => "svelte",
+        "swift" => "swift",
+        "toml" => "toml",
+        "ts" => "typescript",
+        "tsx" => "tsx",
+        "yaml" | "yml" => "yaml",
+        "zig" => "zig",
+        _ => "text",
+    }
 }
 
 pub(crate) fn parent_dir(path: &str) -> Option<String> {
@@ -1048,6 +1034,53 @@ pub(crate) fn join_remote(parent: &str, child: &str) -> String {
     } else {
         format!("{}/{}", parent.trim_end_matches('/'), child)
     }
+}
+
+pub(crate) fn normalize_remote_path(input: &str, current: &str, home: &str) -> String {
+    let input = input.trim();
+    let expanded = if input.is_empty() {
+        current.to_string()
+    } else if input == "~" {
+        home.to_string()
+    } else if let Some(rest) = input.strip_prefix("~/") {
+        join_remote(home, rest)
+    } else if input.starts_with('/') {
+        input.to_string()
+    } else {
+        join_remote(current, input)
+    };
+
+    let mut components = Vec::new();
+    for component in expanded.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            value => components.push(value),
+        }
+    }
+
+    if components.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", components.join("/"))
+    }
+}
+
+pub(crate) fn remote_path_ancestors(path: &str) -> Vec<String> {
+    let normalized = normalize_remote_path(path, "/", "/");
+    let mut ancestors = vec!["/".to_string()];
+    let mut current = String::new();
+    for component in normalized.trim_start_matches('/').split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        current.push('/');
+        current.push_str(component);
+        ancestors.push(current.clone());
+    }
+    ancestors
 }
 
 #[allow(dead_code)]
@@ -1119,6 +1152,97 @@ async fn list_dir_impl(sftp: &SftpSession, path: &str) -> Result<Vec<RemoteEntry
     Ok(entries)
 }
 
+pub(crate) const MAX_INLINE_EDIT_BYTES: usize = 2 * 1024 * 1024;
+
+async fn read_text_file_impl(sftp: &SftpSession, path: &str) -> Result<Vec<u8>> {
+    let metadata = sftp
+        .metadata(path)
+        .await
+        .with_context(|| format!("read metadata for {path}"))?;
+    if metadata.size.unwrap_or(0) > MAX_INLINE_EDIT_BYTES as u64 {
+        return Err(anyhow!("file exceeds the 2 MB in-app editing limit"));
+    }
+
+    let remote_file = sftp
+        .open(path)
+        .await
+        .with_context(|| format!("open remote {path}"))?;
+    let mut limited = remote_file.take((MAX_INLINE_EDIT_BYTES + 1) as u64);
+    let mut content = Vec::new();
+    limited
+        .read_to_end(&mut content)
+        .await
+        .with_context(|| format!("read remote {path}"))?;
+    if content.len() > MAX_INLINE_EDIT_BYTES {
+        return Err(anyhow!("file exceeds the 2 MB in-app editing limit"));
+    }
+
+    Ok(content)
+}
+
+async fn write_text_file_impl(sftp: &SftpSession, path: &str, content: &[u8]) -> Result<()> {
+    if content.len() > MAX_INLINE_EDIT_BYTES {
+        return Err(anyhow!("file exceeds the 2 MB in-app editing limit"));
+    }
+
+    let permissions = sftp
+        .metadata(path)
+        .await
+        .ok()
+        .and_then(|meta| meta.permissions);
+    let temporary_path = format!("{path}.ashell-{}.tmp", Uuid::new_v4());
+    let write_result = async {
+        let mut remote_file = sftp
+            .create(temporary_path.as_str())
+            .await
+            .with_context(|| format!("open remote temporary file {temporary_path}"))?;
+        remote_file
+            .write_all(content)
+            .await
+            .with_context(|| format!("write remote temporary file {temporary_path}"))?;
+        remote_file
+            .flush()
+            .await
+            .with_context(|| format!("flush remote temporary file {temporary_path}"))?;
+        drop(remote_file);
+
+        if let Some(permissions) = permissions {
+            sftp.set_metadata(
+                temporary_path.as_str(),
+                FileAttributes {
+                    permissions: Some(permissions),
+                    ..FileAttributes::default()
+                },
+            )
+            .await
+            .with_context(|| format!("preserve permissions for {path}"))?;
+        }
+
+        sftp.rename(temporary_path.as_str(), path)
+            .await
+            .with_context(|| format!("replace remote {path}"))
+    }
+    .await;
+
+    if let Err(err) = write_result {
+        let _ = sftp.remove_file(temporary_path.as_str()).await;
+        return Err(err);
+    }
+    Ok(())
+}
+
+async fn rename_path_impl(sftp: &SftpSession, old_path: &str, new_path: &str) -> Result<()> {
+    if old_path == new_path {
+        return Ok(());
+    }
+    if sftp.metadata(new_path).await.is_ok() {
+        return Err(anyhow!("target already exists: {new_path}"));
+    }
+    sftp.rename(old_path, new_path)
+        .await
+        .with_context(|| format!("rename {old_path} to {new_path}"))
+}
+
 async fn preview_impl(sftp: &SftpSession, path: &str) -> Result<PreviewData> {
     let metadata = sftp
         .metadata(path)
@@ -1183,17 +1307,14 @@ async fn download_path_impl(
     sftp: &SftpSession,
     remote: &str,
     local_dir: &Path,
-    flag: TransferStateFlag,
-    events: &std::sync::mpsc::Sender<BackendEvent>,
-    tab_id: &str,
-    id: &str,
+    transfer: TransferContext<'_>,
 ) -> Result<String> {
     tokio::fs::create_dir_all(local_dir)
         .await
         .with_context(|| format!("create {}", local_dir.display()))?;
 
     // Check for cancellation after initial setup
-    let state = flag.0.load(Ordering::SeqCst);
+    let state = transfer.flag.0.load(Ordering::SeqCst);
     if state == 2 {
         return Err(anyhow::anyhow!("transfer cancelled"));
     }
@@ -1213,22 +1334,14 @@ async fn download_path_impl(
             base_name(remote),
             Uuid::new_v4()
         ));
-        let extracted_to = download_remote_directory_archive(
-            handle,
-            sftp,
-            remote,
-            &local_archive,
-            &flag,
-            events,
-            tab_id,
-            id,
-        )
-        .await?;
+        let extracted_to =
+            download_remote_directory_archive(handle, sftp, remote, &local_archive, transfer)
+                .await?;
         return Ok(t!("downloaded_folder", path = extracted_to.display()).to_string());
     }
 
     let local_path = local_dir.join(base_name(remote));
-    download_file_impl(sftp, remote, &local_path, &flag, events, tab_id, id).await?;
+    download_file_impl(sftp, remote, &local_path, transfer).await?;
     Ok(t!("downloaded_file", path = local_path.display()).to_string())
 }
 
@@ -1237,10 +1350,7 @@ async fn download_dir_recursive(
     sftp: &SftpSession,
     remote_dir: &str,
     local_dir: &Path,
-    flag: &TransferStateFlag,
-    events: &std::sync::mpsc::Sender<BackendEvent>,
-    tab_id: &str,
-    id: &str,
+    transfer: TransferContext<'_>,
 ) -> Result<()> {
     tokio::fs::create_dir_all(local_dir)
         .await
@@ -1253,23 +1363,11 @@ async fn download_dir_recursive(
                 sftp,
                 &entry.full_path,
                 &local_path,
-                flag,
-                events,
-                tab_id,
-                id,
+                transfer,
             ))
             .await?;
         } else {
-            download_file_impl(
-                sftp,
-                &entry.full_path,
-                &local_path,
-                flag,
-                events,
-                tab_id,
-                id,
-            )
-            .await?;
+            download_file_impl(sftp, &entry.full_path, &local_path, transfer).await?;
             let _ = maybe_extract_archive(&local_path).await;
         }
     }
@@ -1281,10 +1379,7 @@ async fn download_remote_directory_archive(
     sftp: &SftpSession,
     remote_dir: &str,
     local_archive: &Path,
-    flag: &TransferStateFlag,
-    events: &std::sync::mpsc::Sender<BackendEvent>,
-    tab_id: &str,
-    id: &str,
+    transfer: TransferContext<'_>,
 ) -> Result<PathBuf> {
     let remote_archive = format!(
         "/tmp/ashell-{}-{}.tar.gz",
@@ -1293,7 +1388,7 @@ async fn download_remote_directory_archive(
     );
 
     // Check for cancellation before creating remote archive
-    let state = flag.0.load(Ordering::SeqCst);
+    let state = transfer.flag.0.load(Ordering::SeqCst);
     if state == 2 {
         return Err(anyhow::anyhow!("transfer cancelled"));
     }
@@ -1306,16 +1401,7 @@ async fn download_remote_directory_archive(
         .join(base_name(remote_dir));
 
     let archive_download = async {
-        download_file_impl(
-            sftp,
-            &remote_archive,
-            local_archive,
-            flag,
-            events,
-            tab_id,
-            id,
-        )
-        .await?;
+        download_file_impl(sftp, &remote_archive, local_archive, transfer).await?;
         extract_archive_to(
             local_archive,
             local_archive.parent().unwrap_or_else(|| Path::new(".")),
@@ -1342,10 +1428,7 @@ async fn download_file_impl(
     sftp: &SftpSession,
     remote: &str,
     local: &Path,
-    flag: &TransferStateFlag,
-    events: &std::sync::mpsc::Sender<BackendEvent>,
-    tab_id: &str,
-    id: &str,
+    transfer: TransferContext<'_>,
 ) -> Result<()> {
     let mut remote_file = sftp
         .open(remote)
@@ -1360,7 +1443,15 @@ async fn download_file_impl(
 
     let mut buffer = vec![0u8; 128 * 1024];
     loop {
-        flag.yield_if_paused(events, tab_id, id, transferred, total)
+        transfer
+            .flag
+            .yield_if_paused(
+                transfer.events,
+                transfer.tab_id,
+                transfer.id,
+                transferred,
+                total,
+            )
             .await?;
         let read = remote_file
             .read(&mut buffer)
@@ -1375,9 +1466,9 @@ async fn download_file_impl(
             .with_context(|| format!("write {}", local.display()))?;
 
         transferred += read as u64;
-        let _ = events.send(BackendEvent::TransferProgress {
-            tab_id: tab_id.to_string(),
-            id: id.to_string(),
+        let _ = transfer.events.send(BackendEvent::TransferProgress {
+            tab_id: transfer.tab_id.to_string(),
+            id: transfer.id.to_string(),
             transferred,
             total,
             state: crate::terminal::TransferState::Running,
@@ -1385,9 +1476,9 @@ async fn download_file_impl(
     }
     local_file.flush().await.context("flush local file")?;
 
-    let _ = events.send(BackendEvent::TransferProgress {
-        tab_id: tab_id.to_string(),
-        id: id.to_string(),
+    let _ = transfer.events.send(BackendEvent::TransferProgress {
+        tab_id: transfer.tab_id.to_string(),
+        id: transfer.id.to_string(),
         transferred,
         total,
         state: crate::terminal::TransferState::Completed,
@@ -1490,14 +1581,17 @@ async fn upload_paths_impl(
         let transferred_clone = Arc::clone(&transferred);
 
         futures.push(async move {
+            let transfer = TransferContext {
+                flag: &flag_clone,
+                events: &events_clone,
+                tab_id: &tab_id_clone,
+                id: &id_clone,
+            };
             upload_file_impl(
                 sftp,
                 &local_path,
                 &remote_path,
-                &flag_clone,
-                &events_clone,
-                &tab_id_clone,
-                &id_clone,
+                transfer,
                 transferred_clone,
                 Some(total_bytes),
             )
@@ -1542,10 +1636,7 @@ async fn upload_file_impl(
     sftp: &SftpSession,
     local_file: &Path,
     remote_path: &str,
-    flag: &TransferStateFlag,
-    events: &std::sync::mpsc::Sender<BackendEvent>,
-    tab_id: &str,
-    id: &str,
+    transfer: TransferContext<'_>,
     transferred: Arc<AtomicU64>,
     total: Option<u64>,
 ) -> Result<()> {
@@ -1560,7 +1651,10 @@ async fn upload_file_impl(
     let mut buffer = vec![0u8; 128 * 1024];
     loop {
         let cur = transferred.load(Ordering::Relaxed);
-        flag.yield_if_paused(events, tab_id, id, cur, total).await?;
+        transfer
+            .flag
+            .yield_if_paused(transfer.events, transfer.tab_id, transfer.id, cur, total)
+            .await?;
         let read = local.read(&mut buffer).await.context("read local file")?;
         if read == 0 {
             break;
@@ -1571,9 +1665,9 @@ async fn upload_file_impl(
             .with_context(|| format!("write remote {remote_path}"))?;
 
         let new_cur = transferred.fetch_add(read as u64, Ordering::Relaxed) + read as u64;
-        let _ = events.send(BackendEvent::TransferProgress {
-            tab_id: tab_id.to_string(),
-            id: id.to_string(),
+        let _ = transfer.events.send(BackendEvent::TransferProgress {
+            tab_id: transfer.tab_id.to_string(),
+            id: transfer.id.to_string(),
             transferred: new_cur,
             total,
             state: crate::terminal::TransferState::Running,
@@ -1843,5 +1937,34 @@ impl Handler for SftpClientHandler {
         _server_public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::{normalize_remote_path, remote_path_ancestors};
+
+    #[test]
+    fn normalizes_remote_paths_without_platform_separators() {
+        assert_eq!(
+            normalize_remote_path("~", "/tmp", "/home/demo"),
+            "/home/demo"
+        );
+        assert_eq!(
+            normalize_remote_path("../logs", "/srv/app/current", "/home/demo"),
+            "/srv/app/logs"
+        );
+        assert_eq!(
+            normalize_remote_path("/var//log/", "/", "/home/demo"),
+            "/var/log"
+        );
+    }
+
+    #[test]
+    fn builds_remote_path_ancestors_from_root() {
+        assert_eq!(
+            remote_path_ancestors("/home/demo/projects"),
+            vec!["/", "/home", "/home/demo", "/home/demo/projects"]
+        );
     }
 }

@@ -3,7 +3,15 @@ pub mod element;
 pub mod highlight;
 pub mod input;
 
-use std::sync::mpsc::Sender;
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+        mpsc::{SendError, Sender},
+    },
+};
 
 use alacritty_terminal::{
     event::{Event, EventListener},
@@ -17,7 +25,8 @@ use gpui::Keystroke;
 
 use crate::session::config::Session;
 use crate::sftp::{PreviewData, RemoteEntry};
-use crate::system::SystemSnapshot;
+use crate::system::{RemotePort, RemoteProcess, SystemSnapshot};
+use crate::text_encoding::{StreamingDecoder, TextEncoding};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabKind {
@@ -31,11 +40,19 @@ pub enum BackendCommand {
     Input(Vec<u8>),
     Resize { cols: u16, rows: u16 },
     SampleMetrics,
+    SampleProcesses,
+    SamplePorts,
+    TerminateProcess { pid: u32 },
     Close,
 }
 
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
+    Guarded {
+        current_generation: Arc<AtomicU32>,
+        generation: u32,
+        event: Box<BackendEvent>,
+    },
     Output {
         tab_id: String,
         bytes: Vec<u8>,
@@ -52,6 +69,11 @@ pub enum BackendEvent {
         path: String,
         entries: Vec<RemoteEntry>,
     },
+    SftpDirectoryFailed {
+        tab_id: String,
+        path: String,
+        reason: String,
+    },
     SftpPreview {
         tab_id: String,
         preview: PreviewData,
@@ -66,6 +88,31 @@ pub enum BackendEvent {
     },
     RemoteSystemUnavailable {
         tab_id: String,
+        reason: String,
+    },
+    RemoteProcesses {
+        tab_id: String,
+        processes: Vec<RemoteProcess>,
+    },
+    RemoteProcessesUnavailable {
+        tab_id: String,
+        reason: String,
+    },
+    RemotePorts {
+        tab_id: String,
+        ports: Vec<RemotePort>,
+    },
+    RemotePortsUnavailable {
+        tab_id: String,
+        reason: String,
+    },
+    RemoteProcessTerminated {
+        tab_id: String,
+        pid: u32,
+    },
+    RemoteProcessTerminateFailed {
+        tab_id: String,
+        pid: u32,
         reason: String,
     },
     SftpHome {
@@ -92,7 +139,76 @@ pub enum BackendEvent {
         tab_id: String,
         title: String,
     },
+    LocalDirectoryChanged {
+        tab_id: String,
+        path: std::path::PathBuf,
+    },
     SyncFinished(crate::sync::SyncResult),
+}
+
+impl BackendEvent {
+    pub(crate) fn into_current(self) -> Option<Self> {
+        match self {
+            Self::Guarded {
+                current_generation,
+                generation,
+                event,
+            } if current_generation.load(Ordering::Acquire) == generation => Some(*event),
+            Self::Guarded { .. } => None,
+            event => Some(event),
+        }
+    }
+}
+
+/// Filters events emitted by superseded terminal backends.
+///
+/// Every backend instance captures the tab generation that was current when it
+/// was spawned. Reconnecting advances the shared generation before the old
+/// backend is closed, so late events from that backend never reach the UI.
+#[derive(Clone)]
+pub struct GuardedBackendEventSender {
+    events: Sender<BackendEvent>,
+    current_generation: Arc<AtomicU32>,
+    generation: u32,
+}
+
+impl GuardedBackendEventSender {
+    pub fn new(events: Sender<BackendEvent>) -> Self {
+        Self {
+            events,
+            current_generation: Arc::new(AtomicU32::new(0)),
+            generation: 0,
+        }
+    }
+
+    pub fn send(&self, event: BackendEvent) -> Result<(), Box<SendError<BackendEvent>>> {
+        if self.current_generation.load(Ordering::Acquire) != self.generation {
+            return Ok(());
+        }
+        self.events
+            .send(BackendEvent::Guarded {
+                current_generation: self.current_generation.clone(),
+                generation: self.generation,
+                event: Box::new(event),
+            })
+            .map_err(Box::new)
+    }
+
+    fn next_generation(&self) -> Self {
+        let generation = self
+            .current_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        Self {
+            events: self.events.clone(),
+            current_generation: self.current_generation.clone(),
+            generation,
+        }
+    }
+
+    fn unguarded_sender(&self) -> Sender<BackendEvent> {
+        self.events.clone()
+    }
 }
 
 #[derive(Clone)]
@@ -100,6 +216,8 @@ pub enum BackendTx {
     Local(Sender<BackendCommand>),
     Ssh(tokio::sync::mpsc::UnboundedSender<BackendCommand>),
     Serial(tokio::sync::mpsc::UnboundedSender<BackendCommand>),
+    /// A restored session that is waiting for the user to confirm reconnecting.
+    Pending,
 }
 
 impl BackendTx {
@@ -114,6 +232,7 @@ impl BackendTx {
             Self::Serial(tx) => {
                 let _ = tx.send(command);
             }
+            Self::Pending => {}
         }
     }
 }
@@ -122,31 +241,31 @@ pub struct TerminalTab {
     pub id: String,
     pub title: String,
     pub dynamic_title: String,
+    pub terminal_title_received: bool,
+    pub local_cwd: Option<PathBuf>,
     pub kind: TabKind,
     pub status: String,
     pub connected: bool,
     pub disconnected_reason: Option<String>,
-    /// Incremented each time the tab is reconnected. Used to ignore stale
-    /// `BackendEvent::Closed` from the previous backend after a retry.
-    pub backend_generation: u32,
-    /// Set to `true` when the current backend sends its first `Output` or
-    /// `Connected` event. Used to skip stale `Closed` events that arrive
-    /// before the new backend has started producing output.
-    pub backend_initialized: bool,
     pub session: Option<Session>,
+    text_encoding: TextEncoding,
+    output_decoder: StreamingDecoder,
     processor: Processor,
     term: Term<TerminalListener>,
     pub cols: u16,
     pub rows: u16,
     pub backend: std::sync::Arc<std::sync::Mutex<BackendTx>>,
+    backend_events: GuardedBackendEventSender,
     pub scroll_pixel_y: f32,
-    pub(crate) highlight_cache: std::cell::RefCell<
-        Option<(
-            Vec<RenderCell>,
-            std::collections::HashMap<(i32, i32), gpui::Hsla>,
-        )>,
-    >,
+    pub(crate) highlight_cache: HighlightCache,
 }
+
+type HighlightCache = std::cell::RefCell<
+    Option<(
+        Vec<RenderCell>,
+        std::collections::HashMap<(i32, i32), gpui::Hsla>,
+    )>,
+>;
 
 #[derive(Clone, Copy)]
 pub struct CursorState {
@@ -183,15 +302,218 @@ pub struct ViewportSelection {
     pub is_block: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct SftpTreeRow {
+    pub(crate) path: String,
+    pub(crate) label: String,
+    pub(crate) depth: usize,
+    pub(crate) expanded: bool,
+    pub(crate) loading: bool,
+    pub(crate) error: Option<String>,
+}
+
 #[derive(Clone, Default)]
 pub struct SftpUiState {
     pub current_path: String,
     pub status: String,
-    pub entries: Vec<RemoteEntry>,
+    pub directory_cache: HashMap<String, Vec<RemoteEntry>>,
+    pub expanded_directories: HashSet<String>,
+    pub loading_directories: HashSet<String>,
+    pub directory_errors: HashMap<String, String>,
     pub selected_path: Option<String>,
     pub preview: Option<PreviewData>,
-    pub selected_entries: std::collections::HashSet<String>,
+    pub selected_entries: HashSet<String>,
     pub home_dir: String,
+    pub home_dir_resolved: bool,
+}
+
+impl SftpUiState {
+    pub(crate) fn current_entries(&self) -> &[RemoteEntry] {
+        self.directory_cache
+            .get(&self.current_path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub(crate) fn begin_directory_load(&mut self, path: &str) {
+        self.loading_directories.insert(path.to_string());
+        self.directory_errors.remove(path);
+    }
+
+    pub(crate) fn apply_directory_entries(&mut self, path: String, entries: Vec<RemoteEntry>) {
+        self.loading_directories.remove(&path);
+        self.directory_errors.remove(&path);
+        self.directory_cache.insert(path, entries);
+    }
+
+    pub(crate) fn apply_directory_error(&mut self, path: String, reason: String) {
+        self.loading_directories.remove(&path);
+        self.directory_errors.insert(path, reason);
+    }
+
+    pub(crate) fn expand_to(&mut self, path: &str) {
+        self.expanded_directories
+            .extend(crate::sftp::remote_path_ancestors(path));
+    }
+
+    pub(crate) fn collapse_all(&mut self) {
+        self.expanded_directories.clear();
+        self.expanded_directories.insert("/".to_string());
+    }
+
+    pub(crate) fn tree_rows(&self, show_hidden: bool) -> Vec<SftpTreeRow> {
+        fn append_rows(
+            rows: &mut Vec<SftpTreeRow>,
+            state: &SftpUiState,
+            path: String,
+            label: String,
+            depth: usize,
+            show_hidden: bool,
+        ) {
+            let visible_directories = state.directory_cache.get(&path).map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| entry.is_dir && (show_hidden || !entry.name.starts_with('.')))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+            let expanded = state.expanded_directories.contains(&path);
+
+            rows.push(SftpTreeRow {
+                path: path.clone(),
+                label,
+                depth,
+                expanded,
+                loading: state.loading_directories.contains(&path),
+                error: state.directory_errors.get(&path).cloned(),
+            });
+
+            if !expanded {
+                return;
+            }
+            if let Some(directories) = visible_directories {
+                for directory in directories {
+                    append_rows(
+                        rows,
+                        state,
+                        directory.full_path,
+                        directory.name,
+                        depth + 1,
+                        show_hidden,
+                    );
+                }
+            }
+        }
+
+        let mut rows = Vec::new();
+        append_rows(
+            &mut rows,
+            self,
+            "/".to_string(),
+            "/".to_string(),
+            0,
+            show_hidden,
+        );
+        rows
+    }
+}
+
+#[cfg(test)]
+mod sftp_ui_tests {
+    use super::SftpUiState;
+    use crate::sftp::RemoteEntry;
+
+    fn directory(name: &str, path: &str) -> RemoteEntry {
+        RemoteEntry {
+            name: name.to_string(),
+            full_path: path.to_string(),
+            is_dir: true,
+            size: 0,
+            modified: 0,
+        }
+    }
+
+    #[test]
+    fn directory_responses_do_not_replace_the_current_path() {
+        let mut state = SftpUiState {
+            current_path: "/home/demo".to_string(),
+            ..SftpUiState::default()
+        };
+
+        state.apply_directory_entries("/var".to_string(), vec![directory("log", "/var/log")]);
+
+        assert_eq!(state.current_path, "/home/demo");
+        assert_eq!(state.directory_cache["/var"][0].full_path, "/var/log");
+    }
+
+    #[test]
+    fn tree_rows_follow_expansion_and_hidden_directory_preferences() {
+        let mut state = SftpUiState::default();
+        state.expanded_directories.insert("/".to_string());
+        state.expanded_directories.insert("/home".to_string());
+        state.apply_directory_entries(
+            "/".to_string(),
+            vec![
+                directory(".internal", "/.internal"),
+                directory("home", "/home"),
+            ],
+        );
+        state.apply_directory_entries("/home".to_string(), vec![directory("demo", "/home/demo")]);
+
+        let visible_paths = state
+            .tree_rows(false)
+            .into_iter()
+            .map(|row| row.path)
+            .collect::<Vec<_>>();
+        assert_eq!(visible_paths, vec!["/", "/home", "/home/demo"]);
+
+        let visible_with_hidden = state
+            .tree_rows(true)
+            .into_iter()
+            .map(|row| row.path)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visible_with_hidden,
+            vec!["/", "/.internal", "/home", "/home/demo"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod backend_event_tests {
+    use super::{BackendEvent, GuardedBackendEventSender};
+
+    #[test]
+    fn superseded_backend_events_are_discarded() {
+        let (events, received) = std::sync::mpsc::channel();
+        let first = GuardedBackendEventSender::new(events);
+        first
+            .send(BackendEvent::Closed {
+                tab_id: "tab-1".to_string(),
+                reason: "queued stale close".to_string(),
+            })
+            .unwrap();
+
+        let second = first.next_generation();
+        first
+            .send(BackendEvent::Output {
+                tab_id: "tab-1".to_string(),
+                bytes: b"late stale output".to_vec(),
+            })
+            .unwrap();
+        second
+            .send(BackendEvent::Connected {
+                tab_id: "tab-1".to_string(),
+            })
+            .unwrap();
+
+        assert!(received.recv().unwrap().into_current().is_none());
+        assert!(matches!(
+            received.recv().unwrap().into_current(),
+            Some(BackendEvent::Connected { .. })
+        ));
+        assert!(received.try_recv().is_err());
+    }
 }
 
 impl TerminalTab {
@@ -199,7 +521,7 @@ impl TerminalTab {
         id: String,
         title: String,
         backend: BackendTx,
-        events: std::sync::mpsc::Sender<BackendEvent>,
+        backend_events: GuardedBackendEventSender,
     ) -> Self {
         Self::new(
             id,
@@ -207,7 +529,7 @@ impl TerminalTab {
             TabKind::Local,
             "local shell".into(),
             backend,
-            events,
+            backend_events,
         )
     }
 
@@ -215,7 +537,7 @@ impl TerminalTab {
         id: String,
         session: &Session,
         backend: BackendTx,
-        events: std::sync::mpsc::Sender<BackendEvent>,
+        backend_events: GuardedBackendEventSender,
     ) -> Self {
         let mut tab = Self::new(
             id,
@@ -226,9 +548,10 @@ impl TerminalTab {
                 session.user, session.host, session.port
             ),
             backend,
-            events,
+            backend_events,
         );
         tab.session = Some(session.clone());
+        tab.set_text_encoding(session.terminal_encoding);
         tab.connected = false;
         tab
     }
@@ -237,7 +560,7 @@ impl TerminalTab {
         id: String,
         session: &Session,
         backend: BackendTx,
-        events: std::sync::mpsc::Sender<BackendEvent>,
+        backend_events: GuardedBackendEventSender,
     ) -> Self {
         let mut tab = Self::new(
             id,
@@ -245,7 +568,7 @@ impl TerminalTab {
             TabKind::Serial,
             format!("connecting serial://{}@{}", session.host, session.baud_rate),
             backend,
-            events,
+            backend_events,
         );
         tab.session = Some(session.clone());
         tab.connected = false;
@@ -258,32 +581,56 @@ impl TerminalTab {
         kind: TabKind,
         status: String,
         backend: BackendTx,
-        events: std::sync::mpsc::Sender<BackendEvent>,
+        backend_events: GuardedBackendEventSender,
     ) -> Self {
         let shared_backend = std::sync::Arc::new(std::sync::Mutex::new(backend));
+        let events = backend_events.unguarded_sender();
         Self {
             id: id.clone(),
             title: title.clone(),
             dynamic_title: title,
+            terminal_title_received: false,
+            local_cwd: None,
             kind,
             status,
             connected: matches!(kind, TabKind::Local),
             disconnected_reason: None,
-            backend_generation: 0,
-            backend_initialized: true,
             session: None,
+            text_encoding: TextEncoding::Utf8,
+            output_decoder: StreamingDecoder::new(TextEncoding::Utf8),
             processor: Processor::new(),
             term: new_term(100, 30, shared_backend.clone(), id, events.clone()),
             cols: 100,
             rows: 30,
             backend: shared_backend,
+            backend_events,
             scroll_pixel_y: 0.0,
             highlight_cache: std::cell::RefCell::new(None),
         }
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.processor.advance(&mut self.term, bytes);
+        let decoded = self.output_decoder.decode(bytes);
+        self.processor.advance(&mut self.term, &decoded);
+    }
+
+    pub(crate) fn text_encoding(&self) -> TextEncoding {
+        self.text_encoding
+    }
+
+    pub(crate) fn set_text_encoding(&mut self, encoding: TextEncoding) {
+        if self.text_encoding == encoding {
+            return;
+        }
+        self.text_encoding = encoding;
+        self.output_decoder = StreamingDecoder::new(encoding);
+        if let Some(session) = self.session.as_mut() {
+            session.terminal_encoding = encoding;
+        }
+    }
+
+    pub(crate) fn encode_input(&self, bytes: &[u8]) -> Vec<u8> {
+        self.text_encoding.encode_terminal_input(bytes).into_owned()
     }
 
     /// Send a command to the backend. Thread-safe via the shared Arc<Mutex>.
@@ -300,6 +647,15 @@ impl TerminalTab {
         if let Ok(mut backend) = self.backend.lock() {
             *backend = new_backend;
         }
+    }
+
+    /// Advances this tab to a new backend generation and returns its sender.
+    /// Call this before closing the old backend so all of its remaining events
+    /// are discarded immediately.
+    pub fn advance_backend_events(&mut self) -> GuardedBackendEventSender {
+        let next = self.backend_events.next_generation();
+        self.backend_events = next.clone();
+        next
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -341,6 +697,10 @@ impl TerminalTab {
 
     pub fn app_cursor_mode(&self) -> bool {
         self.term.mode().contains(TermMode::APP_CURSOR)
+    }
+
+    pub fn is_alternate_screen_active(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
     pub fn render_snapshot(&self, keyword_highlight: bool) -> RenderSnapshot {
@@ -510,7 +870,7 @@ impl TerminalTab {
         if bracketed {
             bytes.extend_from_slice(b"\x1b[200~");
         }
-        bytes.extend_from_slice(paste_text.as_bytes());
+        bytes.extend_from_slice(&self.encode_input(paste_text.as_bytes()));
         if bracketed {
             bytes.extend_from_slice(b"\x1b[201~");
         }

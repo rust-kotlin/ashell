@@ -1,6 +1,7 @@
 use anyhow::{Context as _, Result};
 use gpui::{App, Context, SharedString, Window, px};
 use gpui_component::{ActiveTheme as _, Theme, ThemeMode, ThemeRegistry};
+use rust_i18n::t;
 
 use crate::Ashell;
 
@@ -126,6 +127,18 @@ impl Ashell {
         }
         rust_i18n::set_locale(&active_locale);
         gpui_component::set_locale(&active_locale);
+        self.connection_filter_input.update(cx, |input, cx| {
+            input.set_placeholder(t!("filter_connections").to_string(), window, cx);
+        });
+        self.command_history_filter_input.update(cx, |input, cx| {
+            input.set_placeholder(t!("filter_command_history").to_string(), window, cx);
+        });
+        self.remote_process_filter_input.update(cx, |input, cx| {
+            input.set_placeholder(t!("filter_processes").to_string(), window, cx);
+        });
+        self.remote_port_filter_input.update(cx, |input, cx| {
+            input.set_placeholder(t!("filter_ports").to_string(), window, cx);
+        });
         self.save_preferences_background();
         window.refresh();
         cx.notify();
