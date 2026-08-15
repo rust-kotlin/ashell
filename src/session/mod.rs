@@ -501,6 +501,7 @@ impl Ashell {
     pub(crate) fn connect_ssh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.session_protocol == "serial" {
             let session_name = self.session_name_input.read(cx).value().trim().to_string();
+            let session_group = self.session_group.trim().to_string();
             let port_name = self.host_input.read(cx).value().trim().to_string();
             let baud_rate = self
                 .baud_rate_input
@@ -531,6 +532,7 @@ impl Ashell {
 
             let mut session = Session::serial(port_name, baud_rate);
             session.name = name;
+            session.group = session_group;
             if let Some(id) = existing_id {
                 session.id = id;
             }
@@ -553,6 +555,7 @@ impl Ashell {
 
         tracing::info!("[ui] user initiating new ssh connection from form");
         let session_name = self.session_name_input.read(cx).value().trim().to_string();
+        let session_group = self.session_group.trim().to_string();
         let host = self.host_input.read(cx).value().trim().to_string();
         let port = self
             .port_input
@@ -609,6 +612,7 @@ impl Ashell {
             }
         };
         session.name = name;
+        session.group = session_group;
         if let Some(id) = existing_id {
             session.id = id;
         }
@@ -654,6 +658,7 @@ impl Ashell {
         self.ssh_config_selected = None;
         self.session_protocol = "ssh".to_string();
         self.ssh_terminal_encoding = TextEncoding::Utf8;
+        self.session_group.clear();
         Self::set_input_value(&self.session_name_input, "", window, cx);
         Self::set_input_value(&self.host_input, "", window, cx);
         Self::set_input_value(&self.port_input, "22", window, cx);
@@ -680,6 +685,7 @@ impl Ashell {
         self.ssh_auth_method = session.auth;
         self.session_protocol = session.protocol.clone();
         self.ssh_terminal_encoding = session.terminal_encoding;
+        self.session_group = session.group.clone();
         Self::set_input_value(&self.session_name_input, session.name.clone(), window, cx);
         Self::set_input_value(&self.host_input, session.host.clone(), window, cx);
         Self::set_input_value(&self.port_input, session.port.to_string(), window, cx);
@@ -896,6 +902,11 @@ impl Ashell {
 
     pub(crate) fn set_session_protocol(&mut self, protocol: String, cx: &mut Context<Self>) {
         self.session_protocol = protocol;
+        cx.notify();
+    }
+
+    pub(crate) fn set_session_group(&mut self, group: String, cx: &mut Context<Self>) {
+        self.session_group = group;
         cx.notify();
     }
 
@@ -1252,12 +1263,19 @@ impl Ashell {
         cx.notify();
     }
 
-    pub(crate) fn select_all_connections(
+    pub(crate) fn set_connection_selection(
         &mut self,
         session_ids: Vec<String>,
+        selected: bool,
         cx: &mut Context<Self>,
     ) {
-        self.selected_connection_ids.extend(session_ids);
+        if selected {
+            self.selected_connection_ids.extend(session_ids);
+        } else {
+            for session_id in session_ids {
+                self.selected_connection_ids.remove(&session_id);
+            }
+        }
         cx.notify();
     }
 
@@ -1285,6 +1303,56 @@ impl Ashell {
             tracing::warn!("failed to save selected sessions: {err:#}");
         }
         self.status = t!("connections_deleted", count = count).into();
+        cx.notify();
+    }
+
+    pub(crate) fn move_selected_connections_to_group(
+        &mut self,
+        group: String,
+        cx: &mut Context<Self>,
+    ) {
+        let previous_config = self.config.cache.clone();
+        let count = self
+            .config
+            .move_connections_to_group(&self.selected_connection_ids, &group);
+        if let Err(err) = self.config.save() {
+            self.config.cache = previous_config;
+            tracing::warn!("failed to save connection groups: {err:#}");
+            self.status = format!("{}: {err:#}", t!("save")).into();
+            cx.notify();
+            return;
+        }
+        let group_name = if group.trim().is_empty() {
+            t!("ungrouped").to_string()
+        } else {
+            group.trim().to_string()
+        };
+        self.status = t!(
+            "connections_moved_to_group",
+            count = count,
+            name = group_name
+        )
+        .into();
+        cx.notify();
+    }
+
+    pub(crate) fn delete_connection_group(&mut self, group: String, cx: &mut Context<Self>) {
+        let previous_config = self.config.cache.clone();
+        let count = self.config.delete_connection_group(&group);
+        if let Err(err) = self.config.save() {
+            self.config.cache = previous_config;
+            tracing::warn!("failed to save deleted connection group: {err:#}");
+            self.status = format!("{}: {err:#}", t!("save")).into();
+            cx.notify();
+            return;
+        }
+        self.status = t!("connection_group_deleted", count = count).into();
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_connection_group(&mut self, group: String, cx: &mut Context<Self>) {
+        self.config.toggle_connection_group_collapsed(&group);
+        self.save_preferences_background();
         cx.notify();
     }
 

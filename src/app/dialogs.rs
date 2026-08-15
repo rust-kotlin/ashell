@@ -1,8 +1,8 @@
 use gpui::{
-    Anchor, AppContext as _, Bounds, Context, DragMoveEvent, Empty, Focusable as _, FontWeight,
-    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Pixels,
-    Point, Render, SharedString, Size, StatefulInteractiveElement as _, Styled as _, Window, div,
-    point, prelude::FluentBuilder as _, px, rems, size,
+    Anchor, AppContext as _, Bounds, Context, DragMoveEvent, ElementId, Empty, Entity,
+    Focusable as _, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement as _, Pixels, Point, Render, SharedString, Size, StatefulInteractiveElement as _,
+    Styled as _, Window, div, point, prelude::FluentBuilder as _, px, rems, size,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, WindowExt as _,
@@ -29,6 +29,50 @@ use crate::{
 enum SftpEditorDrag {
     Move,
     Resize,
+}
+
+fn session_group_dropdown(
+    id: impl Into<ElementId>,
+    tab_index: isize,
+    selected_group: String,
+    connection_groups: Vec<String>,
+    view: Entity<Ashell>,
+) -> impl IntoElement {
+    let display_group = if selected_group.trim().is_empty() {
+        t!("ungrouped").to_string()
+    } else {
+        selected_group.clone()
+    };
+
+    pointer_button(id)
+        .w_full()
+        .outline()
+        .dropdown_caret(true)
+        .tab_index(tab_index)
+        .label(display_group)
+        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, window, _| {
+            let ungrouped_view = view.clone();
+            let menu = menu.min_w(0.).item(
+                PopupMenuItem::new(t!("ungrouped").to_string())
+                    .checked(selected_group.trim().is_empty())
+                    .on_click(window.listener_for(&ungrouped_view, |this, _, _, cx| {
+                        this.set_session_group(String::new(), cx);
+                    })),
+            );
+
+            connection_groups.iter().fold(menu, |menu, group| {
+                let group_value = group.clone();
+                let group_label = group.clone();
+                let group_view = view.clone();
+                menu.item(
+                    PopupMenuItem::new(group_label)
+                        .checked(group.eq_ignore_ascii_case(&selected_group))
+                        .on_click(window.listener_for(&group_view, move |this, _, _, cx| {
+                            this.set_session_group(group_value.clone(), cx);
+                        })),
+                )
+            })
+        })
 }
 
 impl Render for SftpEditorDrag {
@@ -116,6 +160,10 @@ impl Ashell {
                         let is_ssh = protocol == "ssh";
                         let is_serial = protocol == "serial";
                         let terminal_encoding = view.read(cx).ssh_terminal_encoding;
+                        let (session_group, connection_groups) = {
+                            let this = view.read(cx);
+                            (this.session_group.clone(), this.config.connection_groups())
+                        };
                         content.child(
                             v_flex()
                                 .gap_3()
@@ -156,14 +204,26 @@ impl Ashell {
                                     .child(
                                         v_flex()
                                             .gap_1()
+                                            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(t!("connection_group").to_string()))
+                                            .child(session_group_dropdown(
+                                                "serial-connection-group-select",
+                                                1,
+                                                session_group.clone(),
+                                                connection_groups.clone(),
+                                                view.clone(),
+                                            ))
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_1()
                                             .child(div().text_sm().text_color(cx.theme().muted_foreground).child(t!("serial_port").to_string()))
-                                            .child(Input::new(&host_input).tab_index(1))
+                                            .child(Input::new(&host_input).tab_index(2))
                                     )
                                     .child(
                                         v_flex()
                                             .gap_1()
                                             .child(div().text_sm().text_color(cx.theme().muted_foreground).child(t!("baud_rate").to_string()))
-                                            .child(Input::new(&baud_rate_input).tab_index(2))
+                                            .child(Input::new(&baud_rate_input).tab_index(3))
                                     )
                                 })
                                 .when(is_ssh, |this| {
@@ -216,6 +276,18 @@ impl Ashell {
                                     .when(!is_config, |this| {
                                         this.child(Input::new(&session_name_input).tab_index(0))
                                             .child(
+                                                v_flex()
+                                                    .gap_1()
+                                                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child(t!("connection_group").to_string()))
+                                                    .child(session_group_dropdown(
+                                                        "ssh-connection-group-select",
+                                                        1,
+                                                        session_group.clone(),
+                                                        connection_groups.clone(),
+                                                        view.clone(),
+                                                    )),
+                                            )
+                                            .child(
                                                 h_flex()
                                                     .w_full()
                                                     .gap_2()
@@ -223,12 +295,12 @@ impl Ashell {
                                                         Input::new(&host_input)
                                                             .flex_1()
                                                             .min_w(px(0.))
-                                                            .tab_index(1),
+                                                            .tab_index(2),
                                                     )
                                                     .child(
                                                         Input::new(&port_input)
                                                             .w(px(96.))
-                                                            .tab_index(2),
+                                                            .tab_index(3),
                                                     ),
                                             )
                                             .when(is_password, |this| {
@@ -240,20 +312,20 @@ impl Ashell {
                                                             Input::new(&user_input)
                                                                 .flex_1()
                                                                 .min_w(px(0.))
-                                                                .tab_index(3),
+                                                                .tab_index(4),
                                                         )
                                                         .child(
                                                             Input::new(&password_input)
                                                                 .flex_1()
                                                                 .min_w(px(0.))
                                                                 .mask_toggle()
-                                                                .tab_index(4),
+                                                                .tab_index(5),
                                                         ),
                                                 )
                                             })
                                             .when(is_key, |this| {
                                                 this.child(
-                                                    Input::new(&user_input).w_full().tab_index(3),
+                                                    Input::new(&user_input).w_full().tab_index(4),
                                                 )
                                             })
                                     })
@@ -275,7 +347,7 @@ impl Ashell {
                                                             ),
                                                         )
                                                         .child(
-                                                            Input::new(&key_path_input).tab_index(4),
+                                                            Input::new(&key_path_input).tab_index(6),
                                                         ),
                                                 )
                                                 .child(
@@ -295,10 +367,22 @@ impl Ashell {
                                                         )),
                                                 ),
                                         )
-                                        .child(Input::new(&key_inline_input).h(px(128.)).tab_index(5))
-                                        .child(Input::new(&passphrase_input).mask_toggle().tab_index(6))
+                                        .child(Input::new(&key_inline_input).h(px(128.)).tab_index(7))
+                                        .child(Input::new(&passphrase_input).mask_toggle().tab_index(8))
                                     })
                                     .when(is_config, |this| {
+                                        let this = this.child(
+                                            v_flex()
+                                                .gap_1()
+                                                .child(div().text_sm().text_color(cx.theme().muted_foreground).child(t!("connection_group").to_string()))
+                                                .child(session_group_dropdown(
+                                                    "ssh-config-connection-group-select",
+                                                    0,
+                                                    session_group.clone(),
+                                                    connection_groups.clone(),
+                                                    view.clone(),
+                                                )),
+                                        );
                                         let entries = view.read(cx).ssh_config_entries.clone();
                                         let selected = view.read(cx).ssh_config_selected;
                                         let theme = cx.theme();
@@ -1655,6 +1739,182 @@ impl Ashell {
                         )
                 })
         });
+    }
+
+    pub(crate) fn show_connection_group_dialog(
+        &mut self,
+        group: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_dialog.is_some() {
+            return;
+        }
+        let editing_group = group.clone();
+        let is_editing = editing_group.is_some();
+        let existing_groups = self.config.connection_groups();
+        self.active_dialog = Some(crate::app::DialogKind::ConnectionGroup);
+        self.editing_connection_group = editing_group.clone();
+        Self::set_input_value(
+            &self.connection_group_name_input,
+            group.unwrap_or_default(),
+            window,
+            cx,
+        );
+
+        let view = cx.entity();
+        let group_input = self.connection_group_name_input.clone();
+        let focus_input = group_input.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _window, _cx| {
+            dialog
+                .title(if is_editing {
+                    t!("rename_connection_group").to_string()
+                } else {
+                    t!("new_connection_group").to_string()
+                })
+                .w(px(360.))
+                .close_button(false)
+                .overlay_closable(false)
+                .on_close({
+                    let view = view.clone();
+                    move |_, _, cx| {
+                        view.update(cx, |this, cx| {
+                            if this.active_dialog == Some(crate::app::DialogKind::ConnectionGroup) {
+                                this.active_dialog = None;
+                                this.editing_connection_group = None;
+                            }
+                            cx.notify();
+                        });
+                    }
+                })
+                .content({
+                    let view = view.clone();
+                    let group_input = group_input.clone();
+                    let editing_group = editing_group.clone();
+                    let existing_groups = existing_groups.clone();
+                    move |content, window, cx| {
+                        let name = group_input.read(cx).value().trim().to_string();
+                        let duplicate = existing_groups.iter().any(|group| {
+                            group.eq_ignore_ascii_case(&name)
+                                && editing_group
+                                    .as_ref()
+                                    .is_none_or(|old| !group.eq_ignore_ascii_case(old))
+                        });
+                        let unchanged = editing_group.as_ref().is_some_and(|old| old == &name);
+                        let error = if name.is_empty() {
+                            Some(t!("group_name_required").to_string())
+                        } else if duplicate {
+                            Some(t!("group_name_exists").to_string())
+                        } else {
+                            None
+                        };
+
+                        content.child(
+                            v_flex()
+                                .gap_3()
+                                .child(Input::new(&group_input).w_full().tab_index(0))
+                                .when_some(error.clone(), |this, message| {
+                                    this.child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(cx.theme().danger)
+                                            .child(message),
+                                    )
+                                })
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .justify_end()
+                                        .gap_2()
+                                        .child(
+                                            pointer_button("connection-group-cancel")
+                                                .ghost()
+                                                .label(t!("cancel").to_string())
+                                                .on_click(window.listener_for(
+                                                    &view,
+                                                    |this, _, window, cx| {
+                                                        this.active_dialog = None;
+                                                        this.editing_connection_group = None;
+                                                        window.close_dialog(cx);
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            pointer_button("connection-group-save")
+                                                .primary()
+                                                .label(t!("save").to_string())
+                                                .disabled(error.is_some() || unchanged)
+                                                .on_click(window.listener_for(
+                                                    &view,
+                                                    |this, _, window, cx| {
+                                                        this.submit_connection_group_dialog(
+                                                            window, cx,
+                                                        );
+                                                    },
+                                                )),
+                                        ),
+                                ),
+                        )
+                    }
+                })
+        });
+        window.defer(cx, move |window, cx| {
+            focus_input.read(cx).focus_handle(cx).focus(window, cx);
+        });
+    }
+
+    pub(crate) fn submit_connection_group_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self
+            .connection_group_name_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            return;
+        }
+        let editing = self.editing_connection_group.clone();
+        let duplicate = self.config.connection_groups().iter().any(|group| {
+            group.eq_ignore_ascii_case(&name)
+                && editing
+                    .as_ref()
+                    .is_none_or(|old| !group.eq_ignore_ascii_case(old))
+        });
+        if duplicate || editing.as_ref().is_some_and(|old| old == &name) {
+            return;
+        }
+
+        let previous_config = self.config.cache.clone();
+        let changed = if let Some(old_name) = editing.as_deref() {
+            self.config.rename_connection_group(old_name, &name)
+        } else {
+            self.config.add_connection_group(&name)
+        };
+        if !changed {
+            return;
+        }
+        if let Err(err) = self.config.save() {
+            self.config.cache = previous_config;
+            tracing::warn!("failed to save connection group: {err:#}");
+            self.status = format!("{}: {err:#}", t!("save")).into();
+            cx.notify();
+            return;
+        }
+
+        self.status = if editing.is_some() {
+            t!("connection_group_renamed", name = name).into()
+        } else {
+            t!("connection_group_created", name = name).into()
+        };
+        self.active_dialog = None;
+        self.editing_connection_group = None;
+        window.close_dialog(cx);
+        cx.notify();
     }
 
     fn active_sftp_dialog_target(&self) -> Option<(String, crate::sftp::SftpHandle)> {

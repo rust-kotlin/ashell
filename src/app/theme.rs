@@ -130,6 +130,9 @@ impl Ashell {
         self.connection_filter_input.update(cx, |input, cx| {
             input.set_placeholder(t!("filter_connections").to_string(), window, cx);
         });
+        self.connection_group_name_input.update(cx, |input, cx| {
+            input.set_placeholder(t!("connection_group_name").to_string(), window, cx);
+        });
         self.command_history_filter_input.update(cx, |input, cx| {
             input.set_placeholder(t!("filter_command_history").to_string(), window, cx);
         });

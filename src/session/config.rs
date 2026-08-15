@@ -40,6 +40,8 @@ fn default_baud_rate() -> u32 {
 pub struct Session {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub group: String,
     pub host: String,
     pub port: u16,
     pub user: String,
@@ -78,6 +80,7 @@ impl Session {
         Self {
             id: Uuid::new_v4().to_string(),
             name,
+            group: String::new(),
             host,
             port,
             user,
@@ -110,6 +113,7 @@ impl Session {
         Self {
             id: Uuid::new_v4().to_string(),
             name,
+            group: String::new(),
             host,
             port,
             user,
@@ -135,6 +139,7 @@ impl Session {
         Self {
             id: Uuid::new_v4().to_string(),
             name,
+            group: String::new(),
             host: port_name,
             port: 0,
             user: String::new(),
@@ -282,6 +287,10 @@ pub struct ConfigFile {
     pub cursor_style: CursorStyle,
     #[serde(default)]
     pub sessions: Vec<Session>,
+    #[serde(default)]
+    pub connection_groups: Vec<String>,
+    #[serde(default)]
+    pub collapsed_connection_groups: HashSet<String>,
     /// Shell commands recorded for each SSH session ID.
     #[serde(default)]
     pub command_history: HashMap<String, Vec<String>>,
@@ -445,6 +454,8 @@ impl Default for ConfigFile {
             title_bar_style: TitleBarStyle::default(),
             cursor_style: CursorStyle::default(),
             sessions: Vec::new(),
+            connection_groups: Vec::new(),
+            collapsed_connection_groups: HashSet::new(),
             command_history: HashMap::new(),
             command_history_revision: 0,
             remember_tabs: false,
@@ -673,11 +684,13 @@ impl ConfigStore {
         if history_changed {
             cache.command_history_revision = cache.command_history_revision.saturating_add(1);
         }
-        Ok(Self {
+        let mut store = Self {
             path,
             cache,
             write_lock: Arc::new(Mutex::new(())),
-        })
+        };
+        store.sync_connection_groups_from_sessions();
+        Ok(store)
     }
 
     pub fn in_memory() -> Self {
@@ -707,6 +720,217 @@ impl ConfigStore {
 
     pub fn replace_sessions(&mut self, sessions: Vec<Session>) {
         self.cache.sessions = sessions;
+        self.cache.connection_groups.clear();
+        self.sync_connection_groups_from_sessions();
+    }
+
+    pub fn connection_groups(&self) -> Vec<String> {
+        let mut groups = Vec::new();
+        for group in self
+            .cache
+            .connection_groups
+            .iter()
+            .chain(self.cache.sessions.iter().map(|session| &session.group))
+        {
+            let group = group.trim();
+            if group.is_empty()
+                || groups
+                    .iter()
+                    .any(|existing: &String| existing.to_lowercase() == group.to_lowercase())
+            {
+                continue;
+            }
+            groups.push(group.to_string());
+        }
+        groups
+    }
+
+    pub fn connection_group_exists(&self, name: &str) -> bool {
+        let key = name.trim().to_lowercase();
+        !key.is_empty()
+            && self
+                .connection_groups()
+                .iter()
+                .any(|group| group.to_lowercase() == key)
+    }
+
+    pub fn add_connection_group(&mut self, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() || self.connection_group_exists(name) {
+            return false;
+        }
+        self.cache.connection_groups.push(name.to_string());
+        true
+    }
+
+    pub fn rename_connection_group(&mut self, old_name: &str, new_name: &str) -> bool {
+        let old_key = old_name.trim().to_lowercase();
+        let new_name = new_name.trim();
+        let new_key = new_name.to_lowercase();
+        if old_key.is_empty() || new_key.is_empty() {
+            return false;
+        }
+        let groups = self.connection_groups();
+        let Some(old_group) = groups
+            .iter()
+            .find(|group| group.to_lowercase() == old_key)
+            .cloned()
+        else {
+            return false;
+        };
+        if groups
+            .iter()
+            .any(|group| group.to_lowercase() == new_key && group.to_lowercase() != old_key)
+        {
+            return false;
+        }
+
+        for group in &mut self.cache.connection_groups {
+            if group.trim().to_lowercase() == old_key {
+                *group = new_name.to_string();
+            }
+        }
+        if !self
+            .cache
+            .connection_groups
+            .iter()
+            .any(|group| group.to_lowercase() == new_key)
+        {
+            self.cache.connection_groups.push(new_name.to_string());
+        }
+        for session in &mut self.cache.sessions {
+            if session.group.trim().to_lowercase() == old_key {
+                session.group = new_name.to_string();
+            }
+        }
+        if self.cache.collapsed_connection_groups.remove(&old_group) {
+            self.cache
+                .collapsed_connection_groups
+                .insert(new_name.to_string());
+        }
+        self.sync_connection_groups_from_sessions();
+        true
+    }
+
+    pub fn delete_connection_group(&mut self, name: &str) -> usize {
+        let key = name.trim().to_lowercase();
+        if key.is_empty() {
+            return 0;
+        }
+        self.cache
+            .connection_groups
+            .retain(|group| group.trim().to_lowercase() != key);
+        self.cache
+            .collapsed_connection_groups
+            .retain(|group| group.trim().to_lowercase() != key);
+        let mut moved = 0;
+        for session in &mut self.cache.sessions {
+            if session.group.trim().to_lowercase() == key {
+                session.group.clear();
+                moved += 1;
+            }
+        }
+        moved
+    }
+
+    pub fn move_connections_to_group(
+        &mut self,
+        session_ids: &HashSet<String>,
+        group: &str,
+    ) -> usize {
+        let group = group.trim();
+        let canonical_group = if group.is_empty() {
+            String::new()
+        } else if let Some(existing) = self
+            .connection_groups()
+            .into_iter()
+            .find(|existing| existing.to_lowercase() == group.to_lowercase())
+        {
+            existing
+        } else {
+            self.cache.connection_groups.push(group.to_string());
+            group.to_string()
+        };
+        let mut moved = 0;
+        for session in &mut self.cache.sessions {
+            if session_ids.contains(&session.id) && session.group != canonical_group {
+                session.group = canonical_group.clone();
+                moved += 1;
+            }
+        }
+        moved
+    }
+
+    pub fn is_connection_group_collapsed(&self, name: &str) -> bool {
+        let key = name.trim().to_lowercase();
+        self.cache
+            .collapsed_connection_groups
+            .iter()
+            .any(|group| group.trim().to_lowercase() == key)
+    }
+
+    pub fn toggle_connection_group_collapsed(&mut self, name: &str) {
+        let canonical = if name.trim().is_empty() {
+            String::new()
+        } else {
+            self.connection_groups()
+                .into_iter()
+                .find(|group| group.to_lowercase() == name.trim().to_lowercase())
+                .unwrap_or_else(|| name.trim().to_string())
+        };
+        if self.is_connection_group_collapsed(&canonical) {
+            let key = canonical.to_lowercase();
+            self.cache
+                .collapsed_connection_groups
+                .retain(|group| group.to_lowercase() != key);
+        } else {
+            self.cache.collapsed_connection_groups.insert(canonical);
+        }
+    }
+
+    pub fn sync_connection_groups_from_sessions(&mut self) {
+        let mut groups = Vec::<String>::new();
+        for group in self.cache.connection_groups.iter().map(String::as_str) {
+            let group = group.trim();
+            if !group.is_empty()
+                && !groups
+                    .iter()
+                    .any(|existing| existing.to_lowercase() == group.to_lowercase())
+            {
+                groups.push(group.to_string());
+            }
+        }
+        for session in &mut self.cache.sessions {
+            session.group = session.group.trim().to_string();
+            if session.group.is_empty() {
+                continue;
+            }
+            if let Some(canonical) = groups
+                .iter()
+                .find(|group| group.to_lowercase() == session.group.to_lowercase())
+            {
+                session.group = canonical.clone();
+            } else {
+                groups.push(session.group.clone());
+            }
+        }
+        self.cache.connection_groups = groups;
+
+        let collapsed = std::mem::take(&mut self.cache.collapsed_connection_groups);
+        for collapsed_group in collapsed {
+            if collapsed_group.trim().is_empty() {
+                self.cache.collapsed_connection_groups.insert(String::new());
+            } else if let Some(canonical) = self
+                .cache
+                .connection_groups
+                .iter()
+                .find(|group| group.to_lowercase() == collapsed_group.trim().to_lowercase())
+            {
+                self.cache
+                    .collapsed_connection_groups
+                    .insert(canonical.clone());
+            }
+        }
     }
 
     /// Return persisted command history for all SSH sessions, newest first per session.
@@ -1173,6 +1397,19 @@ impl ConfigStore {
     }
 
     pub fn upsert(&mut self, session: Session) {
+        let mut session = session;
+        session.group = session.group.trim().to_string();
+        if !session.group.is_empty() {
+            if let Some(group) = self
+                .connection_groups()
+                .into_iter()
+                .find(|group| group.to_lowercase() == session.group.to_lowercase())
+            {
+                session.group = group;
+            } else {
+                self.cache.connection_groups.push(session.group.clone());
+            }
+        }
         if let Some(existing) = self.cache.sessions.iter_mut().find(|s| s.id == session.id) {
             *existing = session;
         } else {
@@ -1238,6 +1475,7 @@ impl ConfigStore {
         disk_config.terminal_font_family = local_config.terminal_font_family;
         disk_config.title_bar_style = local_config.title_bar_style;
         disk_config.cursor_style = local_config.cursor_style;
+        disk_config.collapsed_connection_groups = local_config.collapsed_connection_groups;
         if local_config.command_history_revision >= disk_config.command_history_revision {
             disk_config.command_history = local_config.command_history;
             disk_config.command_history_revision = local_config.command_history_revision;
@@ -1637,6 +1875,63 @@ mod tests {
         assert!(config.sftp_tree_panels.is_none());
         assert!(config.sftp_file_columns.is_none());
         assert!(!config.sftp_file_columns_customized);
+        assert!(config.connection_groups.is_empty());
+        assert!(config.collapsed_connection_groups.is_empty());
+    }
+
+    #[test]
+    fn legacy_sessions_default_to_the_ungrouped_section() {
+        let session: Session = serde_json::from_str(
+            r#"{"id":"legacy","name":"Legacy","host":"example.test","port":22,"user":"root","auth":"password"}"#,
+        )
+        .unwrap();
+
+        assert!(session.group.is_empty());
+    }
+
+    #[test]
+    fn connection_groups_rename_move_and_delete_without_removing_sessions() {
+        let mut store = ConfigStore::in_memory();
+        let mut first = Session::password(
+            "one.test".to_string(),
+            22,
+            "root".to_string(),
+            String::new(),
+        );
+        first.id = "one".to_string();
+        first.group = "Production".to_string();
+        let mut second = Session::password(
+            "two.test".to_string(),
+            22,
+            "root".to_string(),
+            String::new(),
+        );
+        second.id = "two".to_string();
+        store.replace_sessions(vec![first, second]);
+
+        assert_eq!(store.connection_groups(), vec!["Production"]);
+        store.toggle_connection_group_collapsed("Production");
+        assert!(store.is_connection_group_collapsed("Production"));
+        assert!(store.rename_connection_group("Production", "Servers"));
+        assert!(store.is_connection_group_collapsed("Servers"));
+        let selected = HashSet::from(["two".to_string()]);
+        assert_eq!(store.move_connections_to_group(&selected, "Servers"), 1);
+        assert!(
+            store
+                .sessions()
+                .iter()
+                .all(|session| session.group == "Servers")
+        );
+
+        assert_eq!(store.delete_connection_group("Servers"), 2);
+        assert!(!store.is_connection_group_collapsed("Servers"));
+        assert_eq!(store.sessions().len(), 2);
+        assert!(
+            store
+                .sessions()
+                .iter()
+                .all(|session| session.group.is_empty())
+        );
     }
 
     #[test]
@@ -1700,6 +1995,7 @@ mod tests {
         let session = Session {
             id: "test-session-id".to_string(),
             name: "Test Session".to_string(),
+            group: String::new(),
             host: "1.2.3.4".to_string(),
             port: 22,
             user: "root".to_string(),

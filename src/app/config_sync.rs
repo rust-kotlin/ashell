@@ -21,11 +21,12 @@ use crate::{
     terminal::BackendEvent,
 };
 
-const CONNECTION_CSV_HEADERS: [&str; 5] = ["name", "host", "port", "username", "password"];
+const CONNECTION_CSV_HEADERS: [&str; 6] = ["name", "group", "host", "port", "username", "password"];
 
 #[derive(Debug, Serialize)]
 struct ConnectionCsvExportRow<'a> {
     name: &'a str,
+    group: &'a str,
     host: &'a str,
     port: u16,
     username: &'a str,
@@ -36,6 +37,8 @@ struct ConnectionCsvExportRow<'a> {
 struct ConnectionCsvRow {
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    group: String,
     #[serde(default)]
     host: String,
     #[serde(default)]
@@ -57,6 +60,7 @@ struct ConnectionCsvRow {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ConnectionCsvColumns {
     name: bool,
+    group: bool,
     auth_type: bool,
     password: bool,
     private_key_path: bool,
@@ -100,6 +104,7 @@ fn normalize_csv_header(header: &str) -> String {
 fn canonical_csv_header(header: &str) -> Option<&'static str> {
     match normalize_csv_header(header).as_str() {
         "name" | "title" | "session" | "session_name" | "connection_name" => Some("name"),
+        "group" | "folder" | "category" | "connection_group" => Some("group"),
         "host" | "hostname" | "host_name" | "ip" | "ip_address" | "address" | "server" => {
             Some("host")
         }
@@ -140,6 +145,7 @@ impl ConnectionCsvColumns {
     fn from_headers(headers: &HashSet<&'static str>) -> Self {
         Self {
             name: headers.contains("name"),
+            group: headers.contains("group"),
             auth_type: headers.contains("auth_type"),
             password: headers.contains("password"),
             private_key_path: headers.contains("private_key_path"),
@@ -157,6 +163,7 @@ impl ConnectionCsvRow {
     ) -> Result<ImportedCsvConnection> {
         let Self {
             name,
+            group,
             host,
             port,
             username,
@@ -199,6 +206,7 @@ impl ConnectionCsvRow {
         let auth = parse_auth_method(&auth_type, inferred_auth, line)?;
 
         let mut session = Session::password(host, port, username, password);
+        session.group = group.trim().to_string();
         session.auth = auth;
         session.private_key_path = if private_key_content.is_empty() {
             private_key_path
@@ -284,6 +292,7 @@ fn encode_connection_csv(sessions: &[Session]) -> Result<Vec<u8>> {
         for session in sessions {
             let row = ConnectionCsvExportRow {
                 name: &session.name,
+                group: &session.group,
                 host: &session.host,
                 port: session.port,
                 username: &session.user,
@@ -368,6 +377,9 @@ fn update_csv_session(existing: &mut Session, imported: ImportedCsvConnection) {
     let ImportedCsvConnection { session, columns } = imported;
     if columns.name {
         existing.name = session.name;
+    }
+    if columns.group {
+        existing.group = session.group;
     }
     existing.host = session.host;
     existing.port = session.port;
@@ -788,6 +800,7 @@ impl Ashell {
                                 let previous_config = this.config.cache.clone();
                                 let summary =
                                     merge_csv_sessions(&mut this.config.cache.sessions, sessions);
+                                this.config.sync_connection_groups_from_sessions();
 
                                 match this.config.save() {
                                     Ok(()) => {
@@ -849,6 +862,7 @@ mod tests {
     fn csv_export_uses_minimal_columns_and_preserves_quoted_passwords() {
         let mut password = password_session("password-id", "Primary, server", "one.test", "root");
         password.password = "line one,\nline two".to_string();
+        password.group = "Production".to_string();
 
         let mut key = Session::key(
             "two.test".to_string(),
@@ -867,7 +881,7 @@ mod tests {
         assert!(text.contains("\r\n"));
         assert_eq!(
             text.trim_start_matches('\u{feff}').split("\r\n").next(),
-            Some("name,host,port,username,password")
+            Some("name,group,host,port,username,password")
         );
         assert!(!text.contains("auth_type"));
         assert!(!text.contains("private_key_path"));
@@ -879,6 +893,7 @@ mod tests {
 
         let connections = decode_connection_csv(&bytes).expect("decode CSV");
         assert_eq!(connections.len(), 2);
+        assert_eq!(connections[0].session.group, "Production");
         assert_eq!(connections[0].session.password, "line one,\nline two");
         assert_eq!(connections[0].session.auth, AuthMethod::Password);
         assert_eq!(connections[1].session.auth, AuthMethod::Key);
@@ -976,6 +991,7 @@ mod tests {
         );
         identity_match.id = "local-id".to_string();
         identity_match.name = "Identity".to_string();
+        identity_match.group = "Existing group".to_string();
         identity_match.proxy_type = "socks5".to_string();
         identity_match.proxy_host = "proxy.test".to_string();
         identity_match.last_used = Some("2026-08-14T10:00:00Z".to_string());
@@ -1005,6 +1021,7 @@ mod tests {
             .find(|session| session.id == "local-id")
             .expect("identity match");
         assert_eq!(identity.name, "Matched");
+        assert_eq!(identity.group, "Existing group");
         assert_eq!(identity.auth, AuthMethod::Key);
         assert_eq!(identity.private_key_path, "/keys/local");
         assert_eq!(identity.passphrase, "local phrase");
@@ -1030,5 +1047,26 @@ mod tests {
         assert_eq!(sessions[0].id, "local-id");
         assert_eq!(sessions[0].name, "Custom name");
         assert_eq!(sessions[0].password, "new password");
+    }
+
+    #[test]
+    fn csv_import_updates_group_only_when_the_column_is_present() {
+        let mut local = password_session("local-id", "Local", "same.test", "root");
+        local.group = "Old group".to_string();
+        let mut sessions = vec![local];
+
+        let without_group = decode_connection_csv(
+            b"name,host,port,username,password\r\nUpdated,same.test,22,root,new\r\n",
+        )
+        .expect("decode CSV without group");
+        merge_csv_sessions(&mut sessions, without_group);
+        assert_eq!(sessions[0].group, "Old group");
+
+        let with_group = decode_connection_csv(
+            b"name,group,host,port,username,password\r\nUpdated,New group,same.test,22,root,new\r\n",
+        )
+        .expect("decode CSV with group");
+        merge_csv_sessions(&mut sessions, with_group);
+        assert_eq!(sessions[0].group, "New group");
     }
 }

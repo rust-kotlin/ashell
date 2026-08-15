@@ -26,8 +26,13 @@ use crate::{
     Ashell, PaneLayout,
     app::{
         ServerMonitorView,
-        constants::{COLLAPSED_SIDEBAR_WIDTH, SIDEBAR_WIDTH, TERMINAL_KEY_CONTEXT},
-        controls::{PointerClipboard, pointer_button, pointer_checkbox},
+        constants::{
+            COLLAPSED_SIDEBAR_WIDTH, SIDEBAR_WIDTH, TERMINAL_KEY_CONTEXT, TERMINAL_SCROLLBAR_GUTTER,
+        },
+        controls::{
+            PointerClipboard, PointerSelectionCheckbox, SelectionState, pointer_button,
+            pointer_checkbox,
+        },
     },
     sftp::format_mtime,
     system::{RemotePort, RemoteProcess, format_bytes},
@@ -80,9 +85,15 @@ fn connection_matches_filter(session: &crate::session::config::Session, filter: 
     } else {
         format!("ssh {} {} {}", session.user, session.host, session.port)
     };
-    format!("{} {}", session.name, detail)
+    format!("{} {} {}", session.name, session.group, detail)
         .to_lowercase()
         .contains(filter)
+}
+
+#[derive(Clone)]
+struct ConnectionGroupSection {
+    name: String,
+    sessions: Vec<crate::session::config::Session>,
 }
 
 fn compact_menu_width(labels: &[&str]) -> Pixels {
@@ -2355,6 +2366,7 @@ impl Ashell {
                     .flex_none()
                     .items_center()
                     .px_2()
+                    .pr(px(24.))
                     .gap_2()
                     .border_b_1()
                     .border_color(cx.theme().border)
@@ -2448,6 +2460,7 @@ impl Ashell {
                                         .track_scroll(&self.process_scroll_handle)
                                         .overflow_y_scroll()
                                         .size_full()
+                                        .pr(px(TERMINAL_SCROLLBAR_GUTTER))
                                         .children(
                                             processes.iter().enumerate().map(|(index, process)| {
                                                 let pid = process.pid;
@@ -2476,6 +2489,8 @@ impl Ashell {
                                                 let row_theme = theme;
                                                 v_flex()
                                                     .w_full()
+                                                    .min_w(px(0.))
+                                                    .max_w_full()
                                                     .px_2()
                                                     .py_1()
                                                     .gap_1()
@@ -2633,12 +2648,17 @@ impl Ashell {
                                                         this.child(
                                                             v_flex()
                                                                 .w_full()
+                                                                .min_w(px(0.))
+                                                                .max_w_full()
+                                                                .overflow_hidden()
                                                                 .gap_1()
                                                                 .p_2()
                                                                 .rounded_md()
                                                                 .bg(row_theme.background.opacity(0.6))
                                                                 .child(
                                                                     div()
+                                                                        .w_full()
+                                                                        .min_w(px(0.))
                                                                         .whitespace_normal()
                                                                         .text_size(rems(0.833))
                                                                         .child(format!(
@@ -2685,7 +2705,7 @@ impl Ashell {
                                         .top_0()
                                         .right_0()
                                         .bottom_0()
-                                        .w(px(8.))
+                                        .w(px(TERMINAL_SCROLLBAR_GUTTER))
                                         .child(
                                             Scrollbar::vertical(&self.process_scroll_handle)
                                                 .scrollbar_show(ScrollbarShow::Scrolling),
@@ -2925,6 +2945,408 @@ impl Ashell {
             .into_any_element()
     }
 
+    fn connection_group_sections(&self, filter: &str) -> Vec<ConnectionGroupSection> {
+        let ungrouped_matches_filter =
+            !filter.is_empty() && t!("ungrouped").to_string().to_lowercase().contains(filter);
+        let mut sections = self
+            .config
+            .connection_groups()
+            .into_iter()
+            .map(|name| ConnectionGroupSection {
+                name,
+                sessions: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut ungrouped = Vec::new();
+
+        for session in self
+            .config
+            .sessions()
+            .iter()
+            .filter(|session| {
+                connection_matches_filter(session, filter)
+                    || (session.group.trim().is_empty() && ungrouped_matches_filter)
+            })
+            .cloned()
+        {
+            if session.group.trim().is_empty() {
+                ungrouped.push(session);
+                continue;
+            }
+            if let Some(section) = sections
+                .iter_mut()
+                .find(|section| section.name.eq_ignore_ascii_case(&session.group))
+            {
+                section.sessions.push(session);
+            } else {
+                sections.push(ConnectionGroupSection {
+                    name: session.group.clone(),
+                    sessions: vec![session],
+                });
+            }
+        }
+
+        if !filter.is_empty() {
+            sections.retain(|section| {
+                !section.sessions.is_empty() || section.name.to_lowercase().contains(filter)
+            });
+        }
+        if !ungrouped.is_empty() {
+            sections.push(ConnectionGroupSection {
+                name: String::new(),
+                sessions: ungrouped,
+            });
+        }
+        sections
+    }
+
+    fn render_connection_row(
+        &self,
+        session: crate::session::config::Session,
+        active_session_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let connect_id = session.id.clone();
+        let edit_id = session.id.clone();
+        let delete_id = session.id.clone();
+        let is_active = active_session_id == Some(session.id.as_str());
+        let is_selected = self.selected_connection_ids.contains(&session.id);
+        let name = session.name.clone();
+        let detail = self.session_detail(&session);
+        let selection_id = session.id.clone();
+        let row_selection_id = selection_id.clone();
+        let row_id = ElementId::Name(format!("saved-connect-{}", session.id).into());
+        let connect_button_id =
+            ElementId::Name(format!("connect-saved-session-{}", session.id).into());
+
+        div()
+            .id(row_id)
+            .w_full()
+            .min_w(px(0.))
+            .px_1()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(if is_active {
+                cx.theme().primary
+            } else {
+                cx.theme().border
+            })
+            .bg(if is_active {
+                cx.theme().tab_active
+            } else {
+                cx.theme().muted
+            })
+            .hover(|this| this.bg(cx.theme().secondary))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    let selected = !this.selected_connection_ids.contains(&row_selection_id);
+                    this.toggle_connection_selection(row_selection_id.clone(), selected, cx);
+                }),
+            )
+            .context_menu({
+                let view = cx.entity();
+                move |menu, window, _| {
+                    let edit_value = edit_id.clone();
+                    let clone_value = edit_id.clone();
+                    let delete_value = delete_id.clone();
+                    menu.item(PopupMenuItem::new(t!("clone").to_string()).on_click(
+                        window.listener_for(&view, move |this, _, window, cx| {
+                            this.clone_saved_session(clone_value.clone(), window, cx)
+                        }),
+                    ))
+                    .item(
+                        PopupMenuItem::new(t!("edit").to_string()).on_click(window.listener_for(
+                            &view,
+                            move |this, _, window, cx| {
+                                this.edit_saved_session(edit_value.clone(), window, cx)
+                            },
+                        )),
+                    )
+                    .item(
+                        PopupMenuItem::new(t!("delete").to_string()).on_click(window.listener_for(
+                            &view,
+                            move |this, _, _, cx| {
+                                this.remove_saved_session(delete_value.clone(), cx)
+                            },
+                        )),
+                    )
+                }
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w(px(0.))
+                    .items_center()
+                    .gap_0()
+                    .child(
+                        h_flex()
+                            .w(px(16.))
+                            .mr_1()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                pointer_checkbox(ElementId::Name(
+                                    format!("connection-check-{selection_id}").into(),
+                                ))
+                                .small()
+                                .checked(is_selected)
+                                .tab_stop(false)
+                                .on_click(cx.listener({
+                                    let selection_id = selection_id.clone();
+                                    move |this, checked, _, cx| {
+                                        this.toggle_connection_selection(
+                                            selection_id.clone(),
+                                            *checked,
+                                            cx,
+                                        );
+                                    }
+                                })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex_basis(relative(0.5))
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(rems(0.833))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex_basis(relative(0.5))
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_right()
+                            .text_size(rems(0.75))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(detail),
+                    )
+                    .child(
+                        h_flex()
+                            .w(px(24.))
+                            .ml_1()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                pointer_button(connect_button_id)
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::ExternalLink)
+                                    .tooltip(t!("connect").to_string())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.connect_saved_session(connect_id.clone(), cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_connection_group_section(
+        &self,
+        section: ConnectionGroupSection,
+        force_expanded: bool,
+        active_session_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let group = section.name.clone();
+        let display_name = if group.is_empty() {
+            t!("ungrouped").to_string()
+        } else {
+            group.clone()
+        };
+        let count = section.sessions.len();
+        let group_session_ids = section
+            .sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        let selected_count = group_session_ids
+            .iter()
+            .filter(|session_id| self.selected_connection_ids.contains(*session_id))
+            .count();
+        let selection_state = SelectionState::from_counts(selected_count, count);
+        let has_sessions = !group_session_ids.is_empty();
+        let select_group_session_ids = group_session_ids.clone();
+        let collapsed = !force_expanded && self.config.is_connection_group_collapsed(&group);
+        let toggle_group = group.clone();
+        let group_id = if group.is_empty() {
+            "section-ungrouped".to_string()
+        } else {
+            format!("section-group-{group}")
+        };
+
+        v_flex()
+            .w_full()
+            .min_w(px(0.))
+            .gap_1()
+            .child(
+                h_flex()
+                    .id(ElementId::Name(
+                        format!("connection-group-header-{group_id}").into(),
+                    ))
+                    .w_full()
+                    .min_w(px(0.))
+                    .h(px(28.))
+                    .px_1()
+                    .items_center()
+                    .gap_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|this| this.bg(cx.theme().secondary))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.toggle_connection_group(toggle_group.clone(), cx);
+                        }),
+                    )
+                    .child(
+                        h_flex()
+                            .w(px(16.))
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                PointerSelectionCheckbox::new(ElementId::Name(
+                                    format!("connection-group-check-{group_id}").into(),
+                                ))
+                                .state(selection_state)
+                                .disabled(!has_sessions)
+                                .on_click(cx.listener(
+                                    move |this, checked, _, cx| {
+                                        this.set_connection_selection(
+                                            select_group_session_ids.clone(),
+                                            *checked,
+                                            cx,
+                                        );
+                                    },
+                                )),
+                            ),
+                    )
+                    .child(
+                        Icon::new(if collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .with_size(Size::XSmall)
+                        .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(
+                        Icon::new(if collapsed {
+                            IconName::FolderClosed
+                        } else {
+                            IconName::FolderOpen
+                        })
+                        .with_size(Size::Small)
+                        .text_color(cx.theme().primary),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(rems(0.8))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(display_name),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(rems(0.7))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(count.to_string()),
+                    )
+                    .when(!group.is_empty(), |this| {
+                        let rename_group = group.clone();
+                        let delete_group = group.clone();
+                        this.child(
+                            div()
+                                .flex_none()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .child(
+                                    pointer_button(ElementId::Name(
+                                        format!("connection-group-menu-{group_id}").into(),
+                                    ))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Ellipsis)
+                                    .tooltip(t!("more").to_string())
+                                    .dropdown_menu_with_anchor(Anchor::BottomRight, {
+                                        let view = cx.entity();
+                                        move |menu, window, _| {
+                                            let rename_group = rename_group.clone();
+                                            let delete_group = delete_group.clone();
+                                            menu.min_w(0.)
+                                                .item(
+                                                    PopupMenuItem::new(
+                                                        t!("rename_connection_group").to_string(),
+                                                    )
+                                                    .on_click(window.listener_for(
+                                                        &view,
+                                                        move |this, _, window, cx| {
+                                                            this.show_connection_group_dialog(
+                                                                Some(rename_group.clone()),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
+                                                )
+                                                .item(
+                                                    PopupMenuItem::new(
+                                                        t!("delete_connection_group").to_string(),
+                                                    )
+                                                    .on_click(window.listener_for(
+                                                        &view,
+                                                        move |this, _, _, cx| {
+                                                            this.delete_connection_group(
+                                                                delete_group.clone(),
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
+                                                )
+                                        }
+                                    }),
+                                ),
+                        )
+                    }),
+            )
+            .when(!collapsed, |this| {
+                this.child(
+                    v_flex().w_full().min_w(px(0.)).gap_2().children(
+                        section.sessions.into_iter().map(|session| {
+                            self.render_connection_row(session, active_session_id, cx)
+                        }),
+                    ),
+                )
+            })
+            .into_any_element()
+    }
+
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let connection_filter = self
             .connection_filter_input
@@ -2932,23 +3354,19 @@ impl Ashell {
             .value()
             .trim()
             .to_lowercase();
-        let sessions = self
-            .config
-            .sessions()
-            .iter()
-            .filter(|session| connection_matches_filter(session, &connection_filter))
-            .cloned()
-            .collect::<Vec<_>>();
+        let group_sections = self.connection_group_sections(&connection_filter);
         let empty_connections_message = if self.config.sessions().is_empty() {
             t!("no_connections").to_string()
         } else {
             t!("no_matching_connections").to_string()
         };
-        let has_connections = !sessions.is_empty();
-        let visible_session_ids = sessions
+        let has_group_sections = !group_sections.is_empty();
+        let visible_session_ids = group_sections
             .iter()
+            .flat_map(|section| section.sessions.iter())
             .map(|session| session.id.clone())
             .collect::<Vec<_>>();
+        let has_connections = !visible_session_ids.is_empty();
         let all_connections_selected = has_connections
             && visible_session_ids
                 .iter()
@@ -2961,6 +3379,7 @@ impl Ashell {
             .filter(|session| self.selected_connection_ids.contains(&session.id))
             .count();
         let has_selected_connections = selected_connections > 0;
+        let connection_groups = self.config.connection_groups();
         let saved_sessions_overflowing = self.saved_sessions_overflowing;
         let saved_sessions_scroll_handle = self.saved_scroll_handle.clone();
         let sidebar_view = cx.entity();
@@ -3133,20 +3552,14 @@ impl Ashell {
                                             .disabled(!has_connections)
                                             .tab_stop(false)
                                             .on_click(cx.listener({
-                                                let visible_session_ids = visible_session_ids.clone();
+                                                let visible_session_ids =
+                                                    visible_session_ids.clone();
                                                 move |this, checked, _, cx| {
-                                                    if *checked {
-                                                        this.select_all_connections(
-                                                            visible_session_ids.clone(),
-                                                            cx,
-                                                        );
-                                                    } else {
-                                                        for session_id in &visible_session_ids {
-                                                            this.selected_connection_ids
-                                                                .remove(session_id);
-                                                        }
-                                                        cx.notify();
-                                                    }
+                                                    this.set_connection_selection(
+                                                        visible_session_ids.clone(),
+                                                        *checked,
+                                                        cx,
+                                                    );
                                                 }
                                             })),
                                     ),
@@ -3158,6 +3571,57 @@ impl Ashell {
                                     .child(format!("{selected_connections}/{total_connections}")),
                             )
                             .child(div().flex_1())
+                            .child(
+                                pointer_button("new-connection-group")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::Plus)
+                                    .tooltip(t!("new_connection_group").to_string())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.show_connection_group_dialog(None, window, cx);
+                                    })),
+                            )
+                            .child({
+                                let groups = connection_groups.clone();
+                                pointer_button("move-selected-connections")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::FolderClosed)
+                                    .tooltip(t!("move_to_group").to_string())
+                                    .disabled(!has_selected_connections)
+                                    .dropdown_menu_with_anchor(Anchor::BottomRight, {
+                                        let view = cx.entity();
+                                        move |menu, window, _| {
+                                            let menu = menu.min_w(0.).item(
+                                                PopupMenuItem::new(t!("ungrouped").to_string())
+                                                    .on_click(window.listener_for(
+                                                        &view,
+                                                        |this, _, _, cx| {
+                                                            this.move_selected_connections_to_group(
+                                                                String::new(),
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            );
+                                            groups.iter().fold(menu, |menu, group| {
+                                                let group = group.clone();
+                                                let label = group.clone();
+                                                menu.item(PopupMenuItem::new(label).on_click(
+                                                    window.listener_for(
+                                                        &view,
+                                                        move |this, _, _, cx| {
+                                                            this.move_selected_connections_to_group(
+                                                                group.clone(),
+                                                                cx,
+                                                            );
+                                                        },
+                                                    ),
+                                                ))
+                                            })
+                                        }
+                                    })
+                            })
                             .child(
                                 pointer_button("delete-selected-connections")
                                     .danger()
@@ -3177,7 +3641,7 @@ impl Ashell {
                             .min_h(px(0.))
                             .w_full()
                             .h_full()
-                            .when(!has_connections, |this| {
+                            .when(!has_group_sections, |this| {
                                 this.child(
                                     div()
                                         .absolute()
@@ -3212,225 +3676,18 @@ impl Ashell {
                                         });
                                     })
                                     .gap_2()
-                                    .children(sessions.into_iter().enumerate().map(
-                                        |(ix, session)| {
-                                            let connect_id = session.id.clone();
-                                            let edit_id = session.id.clone();
-                                            let delete_id = session.id.clone();
-                                            let is_active = active_session_id.as_deref()
-                                                == Some(session.id.as_str());
-                                            let is_selected = self
-                                                .selected_connection_ids
-                                                .contains(&session.id);
-                                            let name = session.name.clone();
-                                            let detail = self.session_detail(&session);
-                                            let selection_id = session.id.clone();
-                                            let row_selection_id = selection_id.clone();
-                                            div()
-                                                .id(("saved-connect", ix))
-                                                .w_full()
-                                                .px_1()
-                                                .py_1()
-                                                .rounded_md()
-                                                .border_1()
-                                                .border_color(if is_active {
-                                                    cx.theme().primary
-                                                } else {
-                                                    cx.theme().border
-                                                })
-                                                .bg(if is_active {
-                                                    cx.theme().tab_active
-                                                } else {
-                                                    cx.theme().muted
-                                                })
-                                                .hover(|this| this.bg(cx.theme().secondary))
-                                                .cursor_pointer()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |this, _, _, cx| {
-                                                        let selected = !this
-                                                            .selected_connection_ids
-                                                            .contains(&row_selection_id);
-                                                        this.toggle_connection_selection(
-                                                            row_selection_id.clone(),
-                                                            selected,
-                                                            cx,
-                                                        );
-                                                    }),
-                                                )
-                                                .context_menu({
-                                                    let view = cx.entity();
-                                                    move |menu, window, _| {
-                                                        let edit_value = edit_id.clone();
-                                                        let clone_value = edit_id.clone();
-                                                        let delete_value = delete_id.clone();
-                                                        menu.item(
-                                                            PopupMenuItem::new(
-                                                                t!("clone").to_string(),
-                                                            )
-                                                            .on_click(window.listener_for(
-                                                                &view,
-                                                                move |this, _, window, cx| {
-                                                                    this.clone_saved_session(
-                                                                        clone_value.clone(),
-                                                                        window,
-                                                                        cx,
-                                                                    )
-                                                                },
-                                                            )),
-                                                        )
-                                                        .item(
-                                                            PopupMenuItem::new(
-                                                                t!("edit").to_string(),
-                                                            )
-                                                            .on_click(window.listener_for(
-                                                                &view,
-                                                                move |this, _, window, cx| {
-                                                                    this.edit_saved_session(
-                                                                        edit_value.clone(),
-                                                                        window,
-                                                                        cx,
-                                                                    )
-                                                                },
-                                                            )),
-                                                        )
-                                                        .item(
-                                                            PopupMenuItem::new(
-                                                                t!("delete").to_string(),
-                                                            )
-                                                            .on_click(window.listener_for(
-                                                                &view,
-                                                                move |this, _, _, cx| {
-                                                                    this.remove_saved_session(
-                                                                        delete_value.clone(),
-                                                                        cx,
-                                                                    )
-                                                                },
-                                                            )),
-                                                        )
-                                                    }
-                                                })
-                                                .child(
-                                                    h_flex()
-                                                    .w_full()
-                                                    .min_w(px(0.))
-                                                    .items_center()
-                                                    .gap_0()
-                                                    .child(
-                                                        h_flex()
-                                                                .w(px(16.))
-                                                                .mr_1()
-                                                                .flex_none()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .on_mouse_down(
-                                                                    MouseButton::Left,
-                                                                    |_, _, cx| {
-                                                                        cx.stop_propagation();
-                                                                    },
-                                                                )
-                                                                .on_mouse_down(
-                                                                    MouseButton::Right,
-                                                                    |_, _, cx| {
-                                                                        cx.stop_propagation();
-                                                                    },
-                                                                )
-                                                                .child(
-                                                                    pointer_checkbox(ElementId::Name(
-                                                                        format!(
-                                                                            "connection-check-{}",
-                                                                            selection_id
-                                                                        )
-                                                                        .into(),
-                                                                    ))
-                                                                    .small()
-                                                                    .checked(is_selected)
-                                                                    .tab_stop(false)
-                                                                    .on_click(cx.listener({
-                                                                        let selection_id =
-                                                                            selection_id.clone();
-                                                                        move |this, checked, _, cx| {
-                                                                            this.toggle_connection_selection(
-                                                                                selection_id.clone(),
-                                                                                *checked,
-                                                                                cx,
-                                                                            );
-                                                                        }
-                                                                    })),
-                                                                ),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .flex_1()
-                                                                .flex_basis(relative(0.5))
-                                                                .min_w(px(0.))
-                                                                .truncate()
-                                                                .text_size(rems(0.833))
-                                                                .font_weight(FontWeight::SEMIBOLD)
-                                                                .child(name),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .flex_1()
-                                                                .flex_basis(relative(0.5))
-                                                                .min_w(px(0.))
-                                                                .truncate()
-                                                                .text_right()
-                                                                .text_size(rems(0.75))
-                                                                .text_color(
-                                                                    cx.theme().muted_foreground,
-                                                                )
-                                                                .child(detail),
-                                                        )
-                                                        .child(
-                                                            h_flex()
-                                                                .w(px(24.))
-                                                                .ml_1()
-                                                                .flex_none()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .on_mouse_down(
-                                                                    MouseButton::Left,
-                                                                    |_, _, cx| {
-                                                                        cx.stop_propagation();
-                                                                    },
-                                                                )
-                                                                .on_mouse_down(
-                                                                    MouseButton::Right,
-                                                                    |_, _, cx| {
-                                                                        cx.stop_propagation();
-                                                                    },
-                                                                )
-                                                                .child(
-                                                                    pointer_button((
-                                                                        "connect-saved-session",
-                                                                        ix,
-                                                                    ))
-                                                                    .ghost()
-                                                                    .xsmall()
-                                                                    .icon(IconName::ExternalLink)
-                                                                    .tooltip(t!("connect").to_string())
-                                                                    .on_click(cx.listener(
-                                                                        move |this, _, _, cx| {
-                                                                            this.connect_saved_session(
-                                                                                connect_id.clone(),
-                                                                                cx,
-                                                                            );
-                                                                        },
-                                                                    )),
-                                                                ),
-                                                        ),
-                                                )
-                                        },
-                                    )),
+                                    .children(group_sections.into_iter().map(|section| {
+                                        self.render_connection_group_section(
+                                            section,
+                                            !connection_filter.is_empty(),
+                                            active_session_id.as_deref(),
+                                            cx,
+                                        )
+                                    })),
                             )
-                            .when(saved_sessions_overflowing, |this| this.child(
-                                div()
-                                    .relative()
-                                    .w(px(16.))
-                                    .h_full()
-                                    .flex_none()
-                                    .child(
+                            .when(saved_sessions_overflowing, |this| {
+                                this.child(
+                                    div().relative().w(px(16.)).h_full().flex_none().child(
                                         gpui_component::scroll::Scrollbar::new(
                                             &self.saved_scroll_handle,
                                         )
@@ -3440,9 +3697,142 @@ impl Ashell {
                                             gpui_component::scroll::ScrollbarShow::Always,
                                         ),
                                     ),
-                            )),
+                                )
+                            }),
                     ),
             )
+    }
+
+    fn render_collapsed_connection_row(
+        &self,
+        session: crate::session::config::Session,
+        active_session_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let connect_id = session.id.clone();
+        let is_active = active_session_id == Some(session.id.as_str());
+        let name = session.name.clone();
+        let edit_id = session.id.clone();
+        let delete_id = session.id.clone();
+        let row_id = ElementId::Name(format!("collapsed-saved-{}", session.id).into());
+        let button_id = ElementId::Name(format!("connect-collapsed-session-{}", session.id).into());
+
+        div()
+            .id(row_id)
+            .w(px(36.))
+            .h(px(36.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .border_1()
+            .border_color(if is_active {
+                cx.theme().primary
+            } else {
+                cx.theme().border
+            })
+            .bg(if is_active {
+                cx.theme().tab_active
+            } else {
+                cx.theme().muted
+            })
+            .hover(|this| this.bg(cx.theme().secondary))
+            .tooltip({
+                let tooltip_text = format!("{} {}", name, session.user);
+                move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(tooltip_text.clone()).build(window, cx)
+                }
+            })
+            .context_menu({
+                let view = cx.entity();
+                move |menu, window, _| {
+                    let edit_value = edit_id.clone();
+                    let clone_value = edit_id.clone();
+                    let delete_value = delete_id.clone();
+                    menu.item(PopupMenuItem::new(t!("clone").to_string()).on_click(
+                        window.listener_for(&view, move |this, _, window, cx| {
+                            this.clone_saved_session(clone_value.clone(), window, cx)
+                        }),
+                    ))
+                    .item(
+                        PopupMenuItem::new(t!("edit").to_string()).on_click(window.listener_for(
+                            &view,
+                            move |this, _, window, cx| {
+                                this.edit_saved_session(edit_value.clone(), window, cx)
+                            },
+                        )),
+                    )
+                    .item(
+                        PopupMenuItem::new(t!("delete").to_string()).on_click(window.listener_for(
+                            &view,
+                            move |this, _, _, cx| {
+                                this.remove_saved_session(delete_value.clone(), cx)
+                            },
+                        )),
+                    )
+                }
+            })
+            .child(
+                pointer_button(button_id)
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ExternalLink)
+                    .tooltip(t!("connect").to_string())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.connect_saved_session(connect_id.clone(), cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn render_collapsed_connection_group_section(
+        &self,
+        section: ConnectionGroupSection,
+        force_expanded: bool,
+        active_session_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let group = section.name.clone();
+        let display_name = if group.is_empty() {
+            t!("ungrouped").to_string()
+        } else {
+            group.clone()
+        };
+        let collapsed = !force_expanded && self.config.is_connection_group_collapsed(&group);
+        let tooltip = format!("{} ({})", display_name, section.sessions.len());
+        let toggle_group = group.clone();
+        let group_id = if group.is_empty() {
+            "section-ungrouped".to_string()
+        } else {
+            format!("section-group-{group}")
+        };
+
+        v_flex()
+            .w_full()
+            .items_center()
+            .gap_1()
+            .child(
+                pointer_button(ElementId::Name(
+                    format!("collapsed-connection-group-{group_id}").into(),
+                ))
+                .ghost()
+                .xsmall()
+                .icon(if collapsed {
+                    IconName::FolderClosed
+                } else {
+                    IconName::FolderOpen
+                })
+                .tooltip(tooltip)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_connection_group(toggle_group.clone(), cx);
+                })),
+            )
+            .when(!collapsed, |this| {
+                this.children(section.sessions.into_iter().map(|session| {
+                    self.render_collapsed_connection_row(session, active_session_id, cx)
+                }))
+            })
+            .into_any_element()
     }
 
     fn render_collapsed_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3452,13 +3842,7 @@ impl Ashell {
             .value()
             .trim()
             .to_lowercase();
-        let sessions = self
-            .config
-            .sessions()
-            .iter()
-            .filter(|session| connection_matches_filter(session, &connection_filter))
-            .cloned()
-            .collect::<Vec<_>>();
+        let group_sections = self.connection_group_sections(&connection_filter);
         let active_session_id = self.active_session_id().map(ToOwned::to_owned);
 
         v_flex()
@@ -3508,99 +3892,13 @@ impl Ashell {
                             .pr(px(12.))
                             .gap_2()
                             .items_center()
-                            .children(sessions.into_iter().enumerate().map(|(ix, session)| {
-                                let connect_id = session.id.clone();
-                                let is_active =
-                                    active_session_id.as_deref() == Some(session.id.as_str());
-                                let name = session.name.clone();
-
-                                let edit_id = session.id.clone();
-                                let delete_id = session.id.clone();
-                                div()
-                                    .id(("collapsed-saved", ix))
-                                    .w(px(36.))
-                                    .h(px(36.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(if is_active {
-                                        cx.theme().primary
-                                    } else {
-                                        cx.theme().border
-                                    })
-                                    .bg(if is_active {
-                                        cx.theme().tab_active
-                                    } else {
-                                        cx.theme().muted
-                                    })
-                                    .hover(|this| this.bg(cx.theme().secondary))
-                                    .tooltip({
-                                        let tooltip_text = format!("{} {}", name, session.user);
-                                        move |window, cx| {
-                                            gpui_component::tooltip::Tooltip::new(
-                                                tooltip_text.clone(),
-                                            )
-                                            .build(window, cx)
-                                        }
-                                    })
-                                    .context_menu({
-                                        let view = cx.entity();
-                                        move |menu, window, _| {
-                                            let edit_value = edit_id.clone();
-                                            let clone_value = edit_id.clone();
-                                            let delete_value = delete_id.clone();
-                                            menu.item(
-                                                PopupMenuItem::new(t!("clone").to_string())
-                                                    .on_click(window.listener_for(
-                                                        &view,
-                                                        move |this, _, window, cx| {
-                                                            this.clone_saved_session(
-                                                                clone_value.clone(),
-                                                                window,
-                                                                cx,
-                                                            )
-                                                        },
-                                                    )),
-                                            )
-                                            .item(
-                                                PopupMenuItem::new(t!("edit").to_string())
-                                                    .on_click(window.listener_for(
-                                                        &view,
-                                                        move |this, _, window, cx| {
-                                                            this.edit_saved_session(
-                                                                edit_value.clone(),
-                                                                window,
-                                                                cx,
-                                                            )
-                                                        },
-                                                    )),
-                                            )
-                                            .item(
-                                                PopupMenuItem::new(t!("delete").to_string())
-                                                    .on_click(window.listener_for(
-                                                        &view,
-                                                        move |this, _, _, cx| {
-                                                            this.remove_saved_session(
-                                                                delete_value.clone(),
-                                                                cx,
-                                                            )
-                                                        },
-                                                    )),
-                                            )
-                                        }
-                                    })
-                                    .child(
-                                        pointer_button(("connect-collapsed-session", ix))
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(IconName::ExternalLink)
-                                            .tooltip(t!("connect").to_string())
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.connect_saved_session(connect_id.clone(), cx);
-                                            })),
-                                    )
+                            .children(group_sections.into_iter().map(|section| {
+                                self.render_collapsed_connection_group_section(
+                                    section,
+                                    !connection_filter.is_empty(),
+                                    active_session_id.as_deref(),
+                                    cx,
+                                )
                             })),
                     )
                     .child(
@@ -4469,6 +4767,7 @@ impl Ashell {
                     .is_some_and(|hu| hu.tab_id == *tab_id);
                 let mut el = div()
                     .size_full()
+                    .pr(px(TERMINAL_SCROLLBAR_GUTTER))
                     .overflow_hidden()
                     .when(is_url_hovered, |d| d.cursor_pointer())
                     .on_mouse_down(

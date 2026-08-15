@@ -203,6 +203,7 @@ pub(crate) enum DialogKind {
     ConnectionExport,
     Transfers,
     NewSsh,
+    ConnectionGroup,
     SftpRename,
     SftpEditor,
     Processes,
@@ -222,6 +223,7 @@ pub(crate) struct Ashell {
     pub(crate) selector_focus_handle: FocusHandle,
     pub(crate) host_input: Entity<InputState>,
     pub(crate) session_name_input: Entity<InputState>,
+    pub(crate) session_group: String,
     pub(crate) port_input: Entity<InputState>,
     pub(crate) user_input: Entity<InputState>,
     pub(crate) password_input: Entity<InputState>,
@@ -258,6 +260,7 @@ pub(crate) struct Ashell {
     pub(crate) remote_process_filter_input: Entity<InputState>,
     pub(crate) remote_port_filter_input: Entity<InputState>,
     pub(crate) connection_filter_input: Entity<InputState>,
+    pub(crate) connection_group_name_input: Entity<InputState>,
     pub(crate) command_history_filter_input: Entity<InputState>,
     pub(crate) selected_connection_ids: HashSet<String>,
     pub(crate) selected_command_history: HashSet<(String, usize)>,
@@ -265,6 +268,7 @@ pub(crate) struct Ashell {
     pub(crate) ssh_config_entries: Vec<SshConfigEntry>,
     pub(crate) ssh_config_selected: Option<usize>,
     pub(crate) editing_session_id: Option<String>,
+    pub(crate) editing_connection_group: Option<String>,
     pub(crate) follow_system_theme: bool,
     pub(crate) theme_mode: ThemeMode,
     pub(crate) light_theme_name: SharedString,
@@ -525,6 +529,9 @@ impl Ashell {
         let connection_filter_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(t!("filter_connections").to_string())
         });
+        let connection_group_name_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("connection_group_name").to_string())
+        });
         let command_history_filter_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(t!("filter_command_history").to_string())
         });
@@ -634,6 +641,7 @@ impl Ashell {
             cx.subscribe_in(&remote_process_filter_input, window, Self::on_input_event),
             cx.subscribe_in(&remote_port_filter_input, window, Self::on_input_event),
             cx.subscribe_in(&connection_filter_input, window, Self::on_input_event),
+            cx.subscribe_in(&connection_group_name_input, window, Self::on_input_event),
             cx.subscribe_in(&command_history_filter_input, window, Self::on_input_event),
             cx.subscribe_in(&sync_endpoint_input, window, Self::on_input_event),
             cx.subscribe_in(&sync_username_input, window, Self::on_input_event),
@@ -696,6 +704,9 @@ impl Ashell {
         connection_filter_input.update(cx, |input, cx| {
             input.set_placeholder(t!("filter_connections").to_string(), window, cx);
         });
+        connection_group_name_input.update(cx, |input, cx| {
+            input.set_placeholder(t!("connection_group_name").to_string(), window, cx);
+        });
         command_history_filter_input.update(cx, |input, cx| {
             input.set_placeholder(t!("filter_command_history").to_string(), window, cx);
         });
@@ -716,6 +727,7 @@ impl Ashell {
             selector_focus_handle: cx.focus_handle(),
             host_input,
             session_name_input,
+            session_group: String::new(),
             port_input,
             user_input,
             password_input,
@@ -752,6 +764,7 @@ impl Ashell {
             remote_process_filter_input,
             remote_port_filter_input,
             connection_filter_input,
+            connection_group_name_input,
             command_history_filter_input,
             selected_connection_ids: HashSet::new(),
             selected_command_history: HashSet::new(),
@@ -759,6 +772,7 @@ impl Ashell {
             ssh_config_entries: crate::session::ssh_config::parse_ssh_config().unwrap_or_default(),
             ssh_config_selected: None,
             editing_session_id: None,
+            editing_connection_group: None,
             follow_system_theme,
             theme_mode,
             light_theme_name,
