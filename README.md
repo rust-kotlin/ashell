@@ -90,28 +90,34 @@ sudo xattr -cr /Applications/ashell.app
 cargo run --release
 ```
 
-## Codex 与终端完成通知
+## 终端通知与任务提醒
 
-ashell 支持通用 OSC 9 完成通知。以 Codex CLI 为例，可在 `~/.codex/config.toml` 中加入：
+ashell 支持 [OSC 9](https://iterm2.com/documentation-escape-codes.html)、
+[OSC 99](https://sw.kovidgoyal.net/kitty/desktop-notifications/)、
+[OSC 777](https://wezterm.org/escape-sequences.html) 和终端响铃（BEL），通知能力不绑定
+Codex 或其它特定工具。只要 CLI、脚本或远程程序发送受支持的终端控制序列，本地终端、
+SSH 和串口标签页都会将其转换为 macOS 或 Windows 系统通知，无需修改工具配置或伪装
+其它终端。
 
-```toml
-[tui]
-notifications = ["agent-turn-complete", "approval-requested"]
-notification_method = "osc9"
-notification_condition = "unfocused"
-```
+OSC 9 携带通知正文；OSC 777 和 OSC 99 可以同时携带标题与正文，OSC 99 还支持
+`always`、`unfocused` 和 `invisible` 显示时机。BEL 本身不含正文，因此仅显示通用提醒，
+不会读取或推断当前终端画面中的内容。
 
-当任务完成且对应标签不可见时，ashell 会显示系统通知；未读通知会在 macOS Dock
-或 Windows 任务栏图标上显示红色徽标，切回对应标签后自动清除。标签标题左侧的
-Loading 动画优先识别 OSC 133/633 shell integration 的命令开始和结束标记；未提供
-这些标记的 shell 或 CLI 会根据近期终端输出活动回退显示。OSC 9 完成通知会立即结束
-对应任务的 Loading 状态。
+未读通知会在 macOS Dock 或 Windows 任务栏图标上显示红色徽标，切回对应标签后自动
+清除。标签标题左侧的 Loading 动画优先识别 OSC 133/633 shell integration 的命令开始
+和结束标记；未提供协议标记时根据近期终端输出活动回退显示。
 
-也可以使用下面的命令测试任意 OSC 9 通知：
+可以分别使用下面的命令测试四种提醒：
 
 ```bash
-printf '\033]9;Task completed\007'
+sleep 3; printf '\033]9;Task completed\007'
+sleep 3; printf '\033]777;notify;Deploy;Production is ready\033\\'
+sleep 3; printf '\033]99;i=ashell-test:d=0;Build completed\033\\'; printf '\033]99;i=ashell-test:p=body;Artifacts are ready\033\\'
+sleep 3; printf '\007'
 ```
+
+执行后在 3 秒内切换到其他应用。macOS 第一次收到通知时可能会询问权限；如果仍未显示，
+请在“系统设置 > 通知 > ashell”中确认已允许通知。
 
 ## 打包 macOS 应用
 

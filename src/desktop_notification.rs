@@ -1,7 +1,22 @@
+#[cfg(target_os = "macos")]
+const APP_BUNDLE_ID: &str = "dev.ashell.app";
+
 #[cfg(target_os = "windows")]
 const APP_USER_MODEL_ID: &str = "dev.ashell.app";
 
 pub(crate) fn initialize() {
+    #[cfg(target_os = "macos")]
+    match desktop_notify::set_application(APP_BUNDLE_ID) {
+        Ok(()) => {
+            tracing::info!("registered the macOS notification application identity {APP_BUNDLE_ID}")
+        }
+        Err(error) => {
+            tracing::warn!(
+                "failed to register the macOS notification application identity {APP_BUNDLE_ID}: {error}"
+            );
+        }
+    }
+
     #[cfg(target_os = "windows")]
     if let Err(error) = unsafe {
         windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(windows::core::w!(
@@ -29,13 +44,13 @@ pub(crate) fn show_terminal_notification(title: String, body: String) {
 
 #[cfg(target_os = "macos")]
 fn show_native_notification(title: &str, body: &str) {
-    if let Err(error) = desktop_notify::Notification::new()
-        .appname("ashell")
+    let result = desktop_notify::Notification::new()
         .summary(title)
         .body(body)
-        .show()
-    {
-        tracing::warn!("failed to show macOS terminal notification: {error}");
+        .show();
+    match result {
+        Ok(_) => tracing::info!("submitted terminal notification to macOS"),
+        Err(error) => tracing::warn!("failed to show macOS terminal notification: {error}"),
     }
 }
 

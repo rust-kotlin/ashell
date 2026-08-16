@@ -19,9 +19,14 @@ use alacritty_terminal::{
     grid::{Dimensions, Scroll},
     index::{Column, Line, Point, Side},
     selection::{Selection, SelectionRange, SelectionType},
-    term::{Config, Term, TermMode, cell::Cell, point_to_viewport, viewport_to_point},
+    term::{
+        Config, Term, TermMode,
+        cell::{Cell, Flags},
+        point_to_viewport, viewport_to_point,
+    },
     vte::ansi::{CursorShape, Processor},
 };
+use base64::{Engine as _, engine::general_purpose};
 use gpui::Keystroke;
 
 use crate::session::config::Session;
@@ -38,6 +43,65 @@ pub enum TabKind {
 
 const TERMINAL_ACTIVITY_GRACE: Duration = Duration::from_millis(750);
 const MAX_OSC_PAYLOAD_BYTES: usize = 4096;
+const MAX_NOTIFICATION_TEXT_BYTES: usize = 8192;
+const MAX_OSC99_IDENTIFIER_BYTES: usize = 128;
+const MAX_PENDING_OSC99_NOTIFICATIONS: usize = 32;
+const OSC99_PENDING_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum TerminalNotificationOccasion {
+    #[default]
+    Always,
+    Unfocused,
+    Invisible,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalNotificationSource {
+    Osc9,
+    Osc99,
+    Osc777,
+    Bell,
+}
+
+impl TerminalNotificationSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Osc9 => "osc9",
+            Self::Osc99 => "osc99",
+            Self::Osc777 => "osc777",
+            Self::Bell => "bell",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalNotification {
+    pub(crate) title: Option<String>,
+    pub(crate) body: Option<String>,
+    pub(crate) occasion: TerminalNotificationOccasion,
+    pub(crate) source: TerminalNotificationSource,
+}
+
+impl TerminalNotification {
+    fn with_body(body: String, source: TerminalNotificationSource) -> Self {
+        Self {
+            title: None,
+            body: Some(body),
+            occasion: TerminalNotificationOccasion::Always,
+            source,
+        }
+    }
+
+    pub(crate) fn bell(body: String) -> Self {
+        Self {
+            title: None,
+            body: Some(body),
+            occasion: TerminalNotificationOccasion::Invisible,
+            source: TerminalNotificationSource::Bell,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 enum OscTerminalState {
@@ -53,9 +117,103 @@ enum OscTerminalState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OscTerminalEvent {
-    Notification(String),
+    Notification(TerminalNotification),
+    ProtocolReply(Vec<u8>),
     CommandStarted,
     CommandFinished,
+}
+
+#[derive(Debug)]
+struct Osc99TextChunk {
+    payload: String,
+    base64_encoded: bool,
+}
+
+#[derive(Debug)]
+struct PendingOsc99Notification {
+    title_chunks: Vec<Osc99TextChunk>,
+    body_chunks: Vec<Osc99TextChunk>,
+    occasion: TerminalNotificationOccasion,
+    encoded_bytes: usize,
+    updated_at: Instant,
+}
+
+impl PendingOsc99Notification {
+    fn new(updated_at: Instant) -> Self {
+        Self {
+            title_chunks: Vec::new(),
+            body_chunks: Vec::new(),
+            occasion: TerminalNotificationOccasion::Always,
+            encoded_bytes: 0,
+            updated_at,
+        }
+    }
+
+    fn push(
+        &mut self,
+        payload_type: Osc99PayloadType,
+        payload: String,
+        base64_encoded: bool,
+        occasion: Option<TerminalNotificationOccasion>,
+        now: Instant,
+    ) -> bool {
+        self.encoded_bytes = self.encoded_bytes.saturating_add(payload.len());
+        if self.encoded_bytes > MAX_NOTIFICATION_TEXT_BYTES {
+            return false;
+        }
+
+        let chunks = match payload_type {
+            Osc99PayloadType::Title => &mut self.title_chunks,
+            Osc99PayloadType::Body => &mut self.body_chunks,
+        };
+        chunks.push(Osc99TextChunk {
+            payload,
+            base64_encoded,
+        });
+        if let Some(occasion) = occasion {
+            self.occasion = occasion;
+        }
+        self.updated_at = now;
+        true
+    }
+
+    fn touch(&mut self, occasion: Option<TerminalNotificationOccasion>, updated_at: Instant) {
+        if let Some(occasion) = occasion {
+            self.occasion = occasion;
+        }
+        self.updated_at = updated_at;
+    }
+
+    fn finish(self) -> Option<TerminalNotification> {
+        let title = decode_osc99_text(&self.title_chunks)?;
+        let body = decode_osc99_text(&self.body_chunks)?;
+        let decoded_bytes =
+            title.as_ref().map_or(0, String::len) + body.as_ref().map_or(0, String::len);
+        if decoded_bytes > MAX_NOTIFICATION_TEXT_BYTES || (title.is_none() && body.is_none()) {
+            return None;
+        }
+
+        Some(TerminalNotification {
+            title,
+            body,
+            occasion: self.occasion,
+            source: TerminalNotificationSource::Osc99,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Osc99PayloadType {
+    Title,
+    Body,
+}
+
+struct Osc99Metadata {
+    identifier: Option<String>,
+    payload_type: String,
+    done: bool,
+    base64_encoded: bool,
+    occasion: Option<TerminalNotificationOccasion>,
 }
 
 #[derive(Default)]
@@ -63,6 +221,7 @@ struct OscTerminalParser {
     state: OscTerminalState,
     command: Vec<u8>,
     payload: Vec<u8>,
+    pending_osc99: HashMap<String, PendingOsc99Notification>,
 }
 
 impl OscTerminalParser {
@@ -89,7 +248,11 @@ impl OscTerminalParser {
                     };
                 }
                 OscTerminalState::Command => match byte {
-                    b';' if matches!(self.command.as_slice(), b"9" | b"133" | b"633") => {
+                    b';' if matches!(
+                        self.command.as_slice(),
+                        b"9" | b"99" | b"133" | b"633" | b"777"
+                    ) =>
+                    {
                         self.payload.clear();
                         self.state = OscTerminalState::Payload;
                     }
@@ -167,25 +330,130 @@ impl OscTerminalParser {
         match command.as_slice() {
             b"9" => {
                 // OSC 9 also namespaces Windows Terminal progress and CWD commands.
-                if trimmed.is_empty() || trimmed.starts_with("4;") || trimmed.starts_with("9;") {
+                if trimmed.is_empty()
+                    || trimmed == "4"
+                    || trimmed.starts_with("4;")
+                    || trimmed.starts_with("9;")
+                {
                     return None;
                 }
 
-                let message = trimmed
-                    .chars()
-                    .filter(|character| {
-                        !character.is_control() || matches!(character, '\n' | '\r' | '\t')
-                    })
-                    .collect::<String>();
-                (!message.trim().is_empty())
-                    .then(|| OscTerminalEvent::Notification(message.trim().to_string()))
+                sanitize_notification_text(trimmed).map(|message| {
+                    OscTerminalEvent::Notification(TerminalNotification::with_body(
+                        message,
+                        TerminalNotificationSource::Osc9,
+                    ))
+                })
             }
+            b"99" => self.parse_osc99(trimmed),
             b"133" | b"633" => match trimmed.split(';').next() {
                 Some("C") => Some(OscTerminalEvent::CommandStarted),
                 Some("A" | "D") => Some(OscTerminalEvent::CommandFinished),
                 _ => None,
             },
+            b"777" => parse_osc777(trimmed).map(OscTerminalEvent::Notification),
             _ => None,
+        }
+    }
+
+    fn parse_osc99(&mut self, payload: &str) -> Option<OscTerminalEvent> {
+        let now = Instant::now();
+        self.pending_osc99.retain(|_, pending| {
+            now.saturating_duration_since(pending.updated_at) <= OSC99_PENDING_TTL
+        });
+
+        let (metadata, payload) = payload.split_once(';')?;
+        let metadata = parse_osc99_metadata(metadata)?;
+        if metadata.payload_type == "?" {
+            let identifier = metadata.identifier?;
+            return Some(OscTerminalEvent::ProtocolReply(
+                format!(
+                    "\x1b]99;i={identifier}:p=?;p=title,body:o=always,unfocused,invisible\x1b\\"
+                )
+                .into_bytes(),
+            ));
+        }
+
+        let payload_type = match metadata.payload_type.as_str() {
+            "title" => Some(Osc99PayloadType::Title),
+            "body" => Some(Osc99PayloadType::Body),
+            _ => None,
+        };
+
+        let identifier = metadata.identifier;
+        let Some(payload_type) = payload_type else {
+            let identifier = identifier?;
+            let pending = self.pending_osc99.get_mut(&identifier)?;
+            pending.touch(metadata.occasion, now);
+            if !metadata.done {
+                return None;
+            }
+            return self
+                .pending_osc99
+                .remove(&identifier)
+                .and_then(PendingOsc99Notification::finish)
+                .map(OscTerminalEvent::Notification);
+        };
+
+        if let Some(identifier) = identifier {
+            if let Some(pending) = self.pending_osc99.get_mut(&identifier) {
+                if !pending.push(
+                    payload_type,
+                    payload.to_string(),
+                    metadata.base64_encoded,
+                    metadata.occasion,
+                    now,
+                ) {
+                    self.pending_osc99.remove(&identifier);
+                    return None;
+                }
+                if !metadata.done {
+                    return None;
+                }
+
+                return self
+                    .pending_osc99
+                    .remove(&identifier)
+                    .and_then(PendingOsc99Notification::finish)
+                    .map(OscTerminalEvent::Notification);
+            }
+
+            let mut pending = PendingOsc99Notification::new(now);
+            if !pending.push(
+                payload_type,
+                payload.to_string(),
+                metadata.base64_encoded,
+                metadata.occasion,
+                now,
+            ) {
+                return None;
+            }
+            if metadata.done {
+                return pending.finish().map(OscTerminalEvent::Notification);
+            }
+            if self.pending_osc99.len() >= MAX_PENDING_OSC99_NOTIFICATIONS {
+                return None;
+            }
+
+            self.pending_osc99.insert(identifier, pending);
+            None
+        } else {
+            if !metadata.done {
+                return None;
+            }
+
+            let mut pending = PendingOsc99Notification::new(now);
+            pending
+                .push(
+                    payload_type,
+                    payload.to_string(),
+                    metadata.base64_encoded,
+                    metadata.occasion,
+                    now,
+                )
+                .then(|| pending.finish())
+                .flatten()
+                .map(OscTerminalEvent::Notification)
         }
     }
 
@@ -194,6 +462,140 @@ impl OscTerminalParser {
         self.command.clear();
         self.payload.clear();
     }
+}
+
+fn parse_osc777(payload: &str) -> Option<TerminalNotification> {
+    let mut parts = payload.splitn(3, ';');
+    if parts.next()? != "notify" {
+        return None;
+    }
+
+    let title = parts.next().and_then(sanitize_notification_text);
+    let body = parts.next().and_then(sanitize_notification_text);
+    if title.is_none() && body.is_none() {
+        return None;
+    }
+
+    Some(TerminalNotification {
+        title,
+        body,
+        occasion: TerminalNotificationOccasion::Always,
+        source: TerminalNotificationSource::Osc777,
+    })
+}
+
+fn parse_osc99_metadata(metadata: &str) -> Option<Osc99Metadata> {
+    let mut parsed = Osc99Metadata {
+        identifier: None,
+        payload_type: "title".to_string(),
+        done: true,
+        base64_encoded: false,
+        occasion: None,
+    };
+
+    for field in metadata.split(':').filter(|field| !field.is_empty()) {
+        let (key, value) = field.split_once('=')?;
+        if key.len() != 1 || !key.as_bytes()[0].is_ascii_alphabetic() {
+            return None;
+        }
+
+        match key {
+            "i" => {
+                if !valid_osc99_identifier(value) {
+                    return None;
+                }
+                parsed.identifier = Some(value.to_string());
+            }
+            "p" => parsed.payload_type = value.to_string(),
+            "d" => parsed.done = parse_osc99_flag(value)?,
+            "e" => parsed.base64_encoded = parse_osc99_flag(value)?,
+            "o" => {
+                parsed.occasion = Some(match value {
+                    "always" => TerminalNotificationOccasion::Always,
+                    "unfocused" => TerminalNotificationOccasion::Unfocused,
+                    "invisible" => TerminalNotificationOccasion::Invisible,
+                    _ => return None,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Some(parsed)
+}
+
+fn parse_osc99_flag(value: &str) -> Option<bool> {
+    match value {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
+}
+
+fn valid_osc99_identifier(identifier: &str) -> bool {
+    !identifier.is_empty()
+        && identifier.len() <= MAX_OSC99_IDENTIFIER_BYTES
+        && identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+' | b'.'))
+}
+
+fn decode_osc99_text(chunks: &[Osc99TextChunk]) -> Option<Option<String>> {
+    if chunks.is_empty() {
+        return Some(None);
+    }
+
+    let mut decoded = Vec::new();
+    let mut index = 0;
+    while index < chunks.len() {
+        if !chunks[index].base64_encoded {
+            decoded.extend_from_slice(chunks[index].payload.as_bytes());
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < chunks.len() && chunks[index].base64_encoded {
+            index += 1;
+        }
+        let encoded_chunks = &chunks[start..index];
+        let decoded_chunks = encoded_chunks
+            .iter()
+            .map(|chunk| decode_base64(&chunk.payload))
+            .collect::<Option<Vec<_>>>();
+        if let Some(decoded_chunks) = decoded_chunks {
+            decoded.extend(decoded_chunks.into_iter().flatten());
+        } else {
+            let encoded = encoded_chunks
+                .iter()
+                .map(|chunk| chunk.payload.as_str())
+                .collect::<String>();
+            decoded.extend(decode_base64(&encoded)?);
+        }
+        if decoded.len() > MAX_NOTIFICATION_TEXT_BYTES {
+            return None;
+        }
+    }
+
+    let decoded = String::from_utf8(decoded).ok()?;
+    Some(sanitize_notification_text(&decoded))
+}
+
+fn decode_base64(encoded: &str) -> Option<Vec<u8>> {
+    general_purpose::STANDARD
+        .decode(encoded)
+        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(encoded))
+        .ok()
+}
+
+fn sanitize_notification_text(text: &str) -> Option<String> {
+    let sanitized = text
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        .collect::<String>();
+    let sanitized = sanitized.trim();
+    (!sanitized.is_empty() && sanitized.len() <= MAX_NOTIFICATION_TEXT_BYTES)
+        .then(|| sanitized.to_string())
 }
 
 #[derive(Debug)]
@@ -299,6 +701,9 @@ pub enum BackendEvent {
     TerminalTitleChanged {
         tab_id: String,
         title: String,
+    },
+    TerminalBell {
+        tab_id: String,
     },
     LocalDirectoryChanged {
         tab_id: String,
@@ -683,7 +1088,31 @@ mod backend_event_tests {
 
 #[cfg(test)]
 mod osc_terminal_tests {
-    use super::{MAX_OSC_PAYLOAD_BYTES, OscTerminalEvent, OscTerminalParser};
+    use std::{
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+
+    use super::{
+        BackendCommand, BackendEvent, BackendTx, GuardedBackendEventSender, MAX_OSC_PAYLOAD_BYTES,
+        MAX_PENDING_OSC99_NOTIFICATIONS, OSC99_PENDING_TTL, OscTerminalEvent, OscTerminalParser,
+        TerminalNotification, TerminalNotificationOccasion, TerminalNotificationSource,
+        TerminalTab,
+    };
+
+    fn notification(
+        title: Option<&str>,
+        body: Option<&str>,
+        occasion: TerminalNotificationOccasion,
+        source: TerminalNotificationSource,
+    ) -> OscTerminalEvent {
+        OscTerminalEvent::Notification(TerminalNotification {
+            title: title.map(str::to_string),
+            body: body.map(str::to_string),
+            occasion,
+            source,
+        })
+    }
 
     #[test]
     fn parses_bel_and_string_terminated_notifications() {
@@ -691,11 +1120,21 @@ mod osc_terminal_tests {
 
         assert_eq!(
             parser.advance(b"before\x1b]9;build complete\x07after"),
-            vec![OscTerminalEvent::Notification("build complete".into())]
+            vec![notification(
+                None,
+                Some("build complete"),
+                TerminalNotificationOccasion::Always,
+                TerminalNotificationSource::Osc9,
+            )]
         );
         assert_eq!(
             parser.advance(b"\x1b]9;deployment complete\x1b\\"),
-            vec![OscTerminalEvent::Notification("deployment complete".into())]
+            vec![notification(
+                None,
+                Some("deployment complete"),
+                TerminalNotificationOccasion::Always,
+                TerminalNotificationSource::Osc9,
+            )]
         );
     }
 
@@ -707,8 +1146,170 @@ mod osc_terminal_tests {
         assert!(parser.advance(b" finished\x1b").is_empty());
         assert_eq!(
             parser.advance(b"\\"),
-            vec![OscTerminalEvent::Notification("task finished".into())]
+            vec![notification(
+                None,
+                Some("task finished"),
+                TerminalNotificationOccasion::Always,
+                TerminalNotificationSource::Osc9,
+            )]
         );
+    }
+
+    #[test]
+    fn parses_osc777_title_and_body() {
+        let mut parser = OscTerminalParser::default();
+
+        assert_eq!(
+            parser.advance(b"\x1b]777;notify;Deploy;Production; ready\x1b\\"),
+            vec![notification(
+                Some("Deploy"),
+                Some("Production; ready"),
+                TerminalNotificationOccasion::Always,
+                TerminalNotificationSource::Osc777,
+            )]
+        );
+    }
+
+    #[test]
+    fn parses_simple_and_chunked_osc99_notifications() {
+        let mut parser = OscTerminalParser::default();
+
+        assert_eq!(
+            parser.advance(b"\x1b]99;;Simple title\x1b\\"),
+            vec![notification(
+                Some("Simple title"),
+                None,
+                TerminalNotificationOccasion::Always,
+                TerminalNotificationSource::Osc99,
+            )]
+        );
+        assert!(
+            parser
+                .advance(b"\x1b]99;i=build-1:d=0:o=unfocused;Build finished\x1b\\")
+                .is_empty()
+        );
+        assert_eq!(
+            parser.advance(b"\x1b]99;i=build-1:p=body;Artifacts are ready\x1b\\"),
+            vec![notification(
+                Some("Build finished"),
+                Some("Artifacts are ready"),
+                TerminalNotificationOccasion::Unfocused,
+                TerminalNotificationSource::Osc99,
+            )]
+        );
+    }
+
+    #[test]
+    fn ignores_unsupported_osc99_payloads_without_losing_supported_text() {
+        let mut parser = OscTerminalParser::default();
+
+        assert!(
+            parser
+                .advance(b"\x1b]99;i=rich-1:d=0;Rich notification\x1b\\")
+                .is_empty()
+        );
+        assert_eq!(
+            parser.advance(b"\x1b]99;i=rich-1:p=buttons;Open\x1b\\"),
+            vec![notification(
+                Some("Rich notification"),
+                None,
+                TerminalNotificationOccasion::Always,
+                TerminalNotificationSource::Osc99,
+            )]
+        );
+    }
+
+    #[test]
+    fn decodes_both_osc99_base64_chunking_modes() {
+        let mut parser = OscTerminalParser::default();
+
+        assert!(
+            parser
+                .advance(b"\x1b]99;i=encoded-1:d=0:e=1;VGFzaw==\x1b\\")
+                .is_empty()
+        );
+        assert_eq!(
+            parser.advance(b"\x1b]99;i=encoded-1:e=1;IGRvbmU=\x1b\\"),
+            vec![notification(
+                Some("Task done"),
+                None,
+                TerminalNotificationOccasion::Always,
+                TerminalNotificationSource::Osc99,
+            )]
+        );
+
+        assert!(
+            parser
+                .advance(b"\x1b]99;i=encoded-2:d=0:e=1;RGV\x1b\\")
+                .is_empty()
+        );
+        assert_eq!(
+            parser.advance(b"\x1b]99;i=encoded-2:e=1;wbG95ZWQ=\x1b\\"),
+            vec![notification(
+                Some("Deployed"),
+                None,
+                TerminalNotificationOccasion::Always,
+                TerminalNotificationSource::Osc99,
+            )]
+        );
+    }
+
+    #[test]
+    fn replies_to_osc99_capability_queries_and_rejects_unsafe_ids() {
+        let mut parser = OscTerminalParser::default();
+
+        assert_eq!(
+            parser.advance(b"\x1b]99;i=query-1:p=?;\x1b\\"),
+            vec![OscTerminalEvent::ProtocolReply(
+                b"\x1b]99;i=query-1:p=?;p=title,body:o=always,unfocused,invisible\x1b\\".to_vec(),
+            )]
+        );
+        assert!(parser.advance(b"\x1b]99;i=unsafe/id:p=?;\x1b\\").is_empty());
+    }
+
+    #[test]
+    fn sends_osc99_capability_replies_to_the_terminal_backend() {
+        let (backend_tx, backend_rx) = mpsc::channel();
+        let (events_tx, _events_rx) = mpsc::channel();
+        let mut tab = TerminalTab::new_local(
+            "tab-1".into(),
+            "Local".into(),
+            BackendTx::Local(backend_tx),
+            GuardedBackendEventSender::new(events_tx),
+        );
+
+        assert!(tab.feed(b"\x1b]99;i=query-2:p=?;\x1b\\").is_empty());
+        assert!(matches!(
+            backend_rx.try_recv(),
+            Ok(BackendCommand::Input(reply))
+                if reply.as_slice()
+                    == b"\x1b]99;i=query-2:p=?;p=title,body:o=always,unfocused,invisible\x1b\\"
+        ));
+    }
+
+    #[test]
+    fn bounds_and_expires_pending_osc99_notifications() {
+        let mut parser = OscTerminalParser::default();
+        for index in 0..MAX_PENDING_OSC99_NOTIFICATIONS {
+            let sequence = format!("\x1b]99;i=pending-{index}:d=0;title\x1b\\");
+            assert!(parser.advance(sequence.as_bytes()).is_empty());
+        }
+        assert_eq!(parser.pending_osc99.len(), MAX_PENDING_OSC99_NOTIFICATIONS);
+
+        assert!(
+            parser
+                .advance(b"\x1b]99;i=overflow:d=0;ignored\x1b\\")
+                .is_empty()
+        );
+        assert!(!parser.pending_osc99.contains_key("overflow"));
+
+        parser
+            .pending_osc99
+            .get_mut("pending-0")
+            .unwrap()
+            .updated_at = Instant::now() - OSC99_PENDING_TTL - Duration::from_secs(1);
+        assert_eq!(parser.advance(b"\x1b]99;;cleanup\x1b\\").len(), 1);
+        assert!(!parser.pending_osc99.contains_key("pending-0"));
     }
 
     #[test]
@@ -740,6 +1341,7 @@ mod osc_terminal_tests {
         let mut parser = OscTerminalParser::default();
 
         assert!(parser.advance(b"\x1b]2;window title\x07").is_empty());
+        assert!(parser.advance(b"\x1b]9;4\x07").is_empty());
         assert!(parser.advance(b"\x1b]9;4;1;50\x07").is_empty());
         assert!(parser.advance(b"\x1b]9;9;C:\\workspace\x07").is_empty());
     }
@@ -754,8 +1356,52 @@ mod osc_terminal_tests {
         assert!(parser.advance(&oversized).is_empty());
         assert_eq!(
             parser.advance(b"\x1b]9;next task\x07"),
-            vec![OscTerminalEvent::Notification("next task".into())]
+            vec![notification(
+                None,
+                Some("next task"),
+                TerminalNotificationOccasion::Always,
+                TerminalNotificationSource::Osc9,
+            )]
         );
+    }
+
+    #[test]
+    fn forwards_standalone_bell_without_duplicating_osc_terminator() {
+        let (events_tx, events_rx) = mpsc::channel();
+        let mut tab = TerminalTab::new_local(
+            "tab-1".into(),
+            "Local".into(),
+            BackendTx::Pending,
+            GuardedBackendEventSender::new(events_tx),
+        );
+
+        assert_eq!(
+            tab.feed(b"\x1b]9;task complete\x07"),
+            vec![TerminalNotification {
+                title: None,
+                body: Some("task complete".to_string()),
+                occasion: TerminalNotificationOccasion::Always,
+                source: TerminalNotificationSource::Osc9,
+            }]
+        );
+        assert!(events_rx.try_recv().is_err());
+
+        assert_eq!(
+            tab.feed(b"\x1b]99;;second task\x07"),
+            vec![TerminalNotification {
+                title: Some("second task".to_string()),
+                body: None,
+                occasion: TerminalNotificationOccasion::Always,
+                source: TerminalNotificationSource::Osc99,
+            }]
+        );
+        assert!(events_rx.try_recv().is_err());
+
+        assert!(tab.feed(b"\x07").is_empty());
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(BackendEvent::TerminalBell { tab_id }) if tab_id == "tab-1"
+        ));
     }
 }
 
@@ -856,7 +1502,7 @@ impl TerminalTab {
         }
     }
 
-    pub fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<TerminalNotification> {
         let decoded = self.output_decoder.decode(bytes);
         if !decoded.is_empty() {
             self.output_activity_until = Some(Instant::now() + TERMINAL_ACTIVITY_GRACE);
@@ -864,10 +1510,13 @@ impl TerminalTab {
         let mut notifications = Vec::new();
         for event in self.osc_terminal_parser.advance(&decoded) {
             match event {
-                OscTerminalEvent::Notification(message) => {
+                OscTerminalEvent::Notification(notification) => {
                     self.command_running = false;
                     self.output_activity_until = None;
-                    notifications.push(message);
+                    notifications.push(notification);
+                }
+                OscTerminalEvent::ProtocolReply(reply) => {
+                    self.send_backend(BackendCommand::Input(reply));
                 }
                 OscTerminalEvent::CommandStarted => {
                     self.shell_integration_available = true;
@@ -1277,6 +1926,11 @@ impl EventListener for TerminalListener {
                 let _ = self.events.send(BackendEvent::TerminalTitleChanged {
                     tab_id: self.tab_id.clone(),
                     title,
+                });
+            }
+            Event::Bell => {
+                let _ = self.events.send(BackendEvent::TerminalBell {
+                    tab_id: self.tab_id.clone(),
                 });
             }
             _ => {}

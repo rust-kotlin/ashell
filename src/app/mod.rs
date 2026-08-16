@@ -35,7 +35,10 @@ use crate::{
     session::config::{AuthMethod, ConfigStore},
     session::ssh_config::SshConfigEntry,
     system::{RemotePort, RemoteProcess, SystemSampler, SystemSnapshot},
-    terminal::{self, BackendEvent, TabKind, TerminalTab},
+    terminal::{
+        self, BackendEvent, TabKind, TerminalNotification, TerminalNotificationOccasion,
+        TerminalTab,
+    },
     text_encoding::TextEncoding,
 };
 
@@ -132,6 +135,18 @@ impl PaneLayout {
                 children.iter().map(|c| c.total_panes()).sum()
             }
         }
+    }
+}
+
+fn should_show_terminal_notification(
+    occasion: TerminalNotificationOccasion,
+    window_active: bool,
+    terminal_visible: bool,
+) -> bool {
+    match occasion {
+        TerminalNotificationOccasion::Always => true,
+        TerminalNotificationOccasion::Unfocused => !window_active,
+        TerminalNotificationOccasion::Invisible => !terminal_visible,
     }
 }
 
@@ -914,7 +929,7 @@ impl Ashell {
         this.apply_theme_preferences(window, cx);
         this.restore_saved_tabs(window, cx);
         this.report_active_terminal_focus(this.window_active);
-        this.start_event_pump(cx);
+        this.start_event_pump(window, cx);
         this
     }
 
@@ -1074,21 +1089,35 @@ impl Ashell {
         })
     }
 
-    fn handle_terminal_notification(&mut self, tab_id: &str, message: String) {
-        if self.is_terminal_visible(tab_id) {
+    fn handle_terminal_notification(&mut self, tab_id: &str, notification: TerminalNotification) {
+        let terminal_visible = self.is_terminal_visible(tab_id);
+        tracing::info!(
+            tab_id,
+            terminal_visible,
+            source = notification.source.as_str(),
+            "received terminal notification"
+        );
+        if !should_show_terminal_notification(
+            notification.occasion,
+            self.window_active,
+            terminal_visible,
+        ) {
             return;
         }
 
-        let title = self
+        let fallback_title = self
             .tabs
             .iter()
             .find(|tab| tab.id == tab_id)
             .map(|tab| format!("ashell - {}", tab.title))
             .unwrap_or_else(|| "ashell".to_string());
-        crate::desktop_notification::show_terminal_notification(title, message);
-        if self
-            .unread_terminal_notifications
-            .insert(tab_id.to_string())
+        let title = notification.title.unwrap_or(fallback_title);
+        let body = notification.body.unwrap_or_default();
+        crate::desktop_notification::show_terminal_notification(title, body);
+        if !terminal_visible
+            && self
+                .unread_terminal_notifications
+                .insert(tab_id.to_string())
         {
             self.update_unread_indicator();
         }
@@ -1182,21 +1211,32 @@ impl Ashell {
     }
 
     fn on_window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.window_active = window.is_window_active();
-        self.report_active_terminal_focus(self.window_active);
-        self.clear_visible_terminal_notifications();
+        self.sync_window_activation(window);
         cx.notify();
     }
 
-    pub(crate) fn start_event_pump(&self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
+    fn sync_window_activation(&mut self, window: &Window) -> bool {
+        let window_active = window.is_window_active();
+        if self.window_active == window_active {
+            return false;
+        }
+
+        self.window_active = window_active;
+        self.report_active_terminal_focus(window_active);
+        self.clear_visible_terminal_notifications();
+        true
+    }
+
+    pub(crate) fn start_event_pump(&self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
             let mut last_blink_time = std::time::Instant::now();
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(16))
                     .await;
                 if this
-                    .update(cx, |this, cx| {
+                    .update_in(cx, |this, window, cx| {
+                        let activation_changed = this.sync_window_activation(window);
                         let changed = this.drain_backend_events(cx);
                         let system_sampled = this.sample_system_if_due();
                         this.sync_theme_if_due(cx);
@@ -1210,7 +1250,12 @@ impl Ashell {
                         let blink_due = is_blinking
                             && now.duration_since(last_blink_time)
                                 >= std::time::Duration::from_millis(600);
-                        if changed || system_sampled || activity_changed || blink_due {
+                        if activation_changed
+                            || changed
+                            || system_sampled
+                            || activity_changed
+                            || blink_due
+                        {
                             cx.notify();
                             if blink_due {
                                 last_blink_time = now;
@@ -1243,8 +1288,8 @@ impl Ashell {
                         .find(|tab| tab.id == tab_id)
                         .map(|tab| tab.feed(&bytes))
                         .unwrap_or_default();
-                    for message in notifications {
-                        self.handle_terminal_notification(&tab_id, message);
+                    for notification in notifications {
+                        self.handle_terminal_notification(&tab_id, notification);
                     }
                 }
                 BackendEvent::Status { tab_id, text } => {
@@ -1572,6 +1617,10 @@ impl Ashell {
                         tab.terminal_title_received = true;
                     }
                     self.sync_sftp_path_from_terminal_title(&tab_id, cx);
+                }
+                BackendEvent::TerminalBell { tab_id } => {
+                    let body = t!("terminal_attention_required").to_string();
+                    self.handle_terminal_notification(&tab_id, TerminalNotification::bell(body));
                 }
                 BackendEvent::LocalDirectoryChanged { tab_id, path } => {
                     self.apply_local_directory_change(&tab_id, path);
@@ -2178,5 +2227,39 @@ impl Ashell {
             self.save_layout_state(window, cx);
         });
         gpui::Task::ready(())
+    }
+}
+
+#[cfg(test)]
+mod terminal_notification_tests {
+    use super::{TerminalNotificationOccasion, should_show_terminal_notification};
+
+    #[test]
+    fn applies_terminal_notification_occasion_rules() {
+        assert!(should_show_terminal_notification(
+            TerminalNotificationOccasion::Always,
+            true,
+            true,
+        ));
+        assert!(!should_show_terminal_notification(
+            TerminalNotificationOccasion::Unfocused,
+            true,
+            false,
+        ));
+        assert!(should_show_terminal_notification(
+            TerminalNotificationOccasion::Unfocused,
+            false,
+            false,
+        ));
+        assert!(!should_show_terminal_notification(
+            TerminalNotificationOccasion::Invisible,
+            true,
+            true,
+        ));
+        assert!(should_show_terminal_notification(
+            TerminalNotificationOccasion::Invisible,
+            true,
+            false,
+        ));
     }
 }
