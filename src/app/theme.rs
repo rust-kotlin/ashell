@@ -127,6 +127,7 @@ impl Ashell {
         }
         rust_i18n::set_locale(&active_locale);
         gpui_component::set_locale(&active_locale);
+        crate::app::system_menu::set_app_menus(cx);
         self.connection_filter_input.update(cx, |input, cx| {
             input.set_placeholder(t!("filter_connections").to_string(), window, cx);
         });

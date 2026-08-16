@@ -22,6 +22,9 @@ pub(crate) use app::keybinding_recorder::{
     OpenSession, OpenSettings, OpenTransfers, Paste, QuitApplication, SplitPaneDown, SplitPaneLeft,
     SplitPaneRight, SplitPaneUp, ToggleSftpZoom, ToggleSidebar,
 };
+pub(crate) use app::system_menu::{
+    AboutAshell, CloseWindow, MinimizeWindow, NewLocalTerminal, ToggleFullScreen, ZoomWindow,
+};
 
 pub(crate) use app::{Ashell, PaneLayout, SelectorEntry, SftpContextMenuState, TabGroup};
 
@@ -45,6 +48,7 @@ fn main() {
     });
     app.run(move |cx| {
         gpui_component::init(cx);
+        app::system_menu::init(cx);
         cx.on_action(|_: &QuitApplication, cx| cx.quit());
 
         cx.bind_keys([

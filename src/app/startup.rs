@@ -343,6 +343,7 @@ pub(crate) fn open_main_window(cx: &mut App) {
         window.set_window_title("ashell");
         gpui_component::Theme::sync_system_appearance(Some(window), cx);
         let view = cx.new(|cx| Ashell::new(window, cx));
+        crate::app::system_menu::set_app_menus(cx);
 
         tracing::info!("[ui] main application window opened");
         let focus_handle = view.read(cx).focus_handle.clone();

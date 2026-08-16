@@ -271,6 +271,8 @@ pub struct ConfigFile {
     pub locale: String,
     #[serde(default = "default_terminal_font_size")]
     pub terminal_font_size: f32,
+    #[serde(default)]
+    pub local_terminal_encoding: TextEncoding,
     #[serde(default = "default_ui_font_size")]
     pub ui_font_size: f32,
     #[serde(default)]
@@ -446,6 +448,7 @@ impl Default for ConfigFile {
             dark_theme_name: String::new(),
             locale: default_locale(),
             terminal_font_size: default_terminal_font_size(),
+            local_terminal_encoding: TextEncoding::Utf8,
             ui_font_size: default_ui_font_size(),
             right_click_copy_paste: false,
             keyword_highlight: false,
@@ -1249,6 +1252,14 @@ impl ConfigStore {
         self.cache.terminal_font_size = terminal_font_size.max(10.0);
     }
 
+    pub fn local_terminal_encoding(&self) -> TextEncoding {
+        self.cache.local_terminal_encoding
+    }
+
+    pub fn set_local_terminal_encoding(&mut self, encoding: TextEncoding) {
+        self.cache.local_terminal_encoding = encoding;
+    }
+
     pub fn ui_font_size(&self) -> f32 {
         if self.cache.ui_font_size <= 0.0 {
             default_ui_font_size()
@@ -1468,6 +1479,7 @@ impl ConfigStore {
         disk_config.dark_theme_name = local_config.dark_theme_name;
         disk_config.locale = local_config.locale;
         disk_config.terminal_font_size = local_config.terminal_font_size;
+        disk_config.local_terminal_encoding = local_config.local_terminal_encoding;
         disk_config.ui_font_size = local_config.ui_font_size;
         disk_config.right_click_copy_paste = local_config.right_click_copy_paste;
         disk_config.keyword_highlight = local_config.keyword_highlight;
@@ -1876,6 +1888,7 @@ mod tests {
         assert!(config.sftp_file_columns.is_none());
         assert!(!config.sftp_file_columns_customized);
         assert!(config.connection_groups.is_empty());
+        assert_eq!(config.local_terminal_encoding, TextEncoding::Utf8);
         assert!(config.collapsed_connection_groups.is_empty());
     }
 
@@ -2020,6 +2033,7 @@ mod tests {
         let mut local_config = ConfigFile {
             ui_font_size: 18.0,
             terminal_font_size: 20.0,
+            local_terminal_encoding: TextEncoding::Gbk,
             show_hidden_files: true,
             sftp_file_columns_customized: true,
             remember_tabs: true,
@@ -2057,6 +2071,7 @@ mod tests {
 
         assert_eq!(decrypted.ui_font_size, 18.0);
         assert_eq!(decrypted.terminal_font_size, 20.0);
+        assert_eq!(decrypted.local_terminal_encoding, TextEncoding::Gbk);
         assert!(decrypted.show_hidden_files);
         assert!(decrypted.sftp_file_columns_customized);
         assert!(decrypted.remember_tabs);

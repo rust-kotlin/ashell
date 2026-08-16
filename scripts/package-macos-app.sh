@@ -9,6 +9,13 @@ CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+APP_VERSION="${APP_VERSION:-$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT_DIR/Cargo.toml" | head -n 1)}"
+APP_BUILD_VERSION="${APP_BUILD_VERSION:-$APP_VERSION}"
+
+if [[ -z "$APP_VERSION" ]]; then
+  echo "error: unable to read the package version from Cargo.toml" >&2
+  exit 1
+fi
 
 cd "$ROOT_DIR"
 cargo build --release
@@ -40,9 +47,9 @@ cat > "$CONTENTS_DIR/Info.plist" <<EOF
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0</string>
+  <string>$APP_VERSION</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>$APP_BUILD_VERSION</string>
   <key>LSMinimumSystemVersion</key>
   <string>12.0</string>
   <key>NSHighResolutionCapable</key>

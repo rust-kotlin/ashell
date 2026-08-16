@@ -6,6 +6,7 @@ pub mod keybinding_recorder;
 pub mod resizable;
 pub mod search;
 pub mod startup;
+pub mod system_menu;
 pub mod theme;
 pub mod ui;
 
@@ -213,6 +214,7 @@ impl ScrollbarHandle for TerminalScrollbarHandle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DialogKind {
+    About,
     Settings,
     SessionSelector,
     ConnectionExport,
@@ -331,7 +333,6 @@ pub(crate) struct Ashell {
     pub(crate) transfers: Vec<crate::terminal::Transfer>,
     pub(crate) show_transfers_dialog: bool,
     pub(crate) show_command_history: bool,
-    pub(crate) show_collapsed_connections: bool,
     pub(crate) ssh_command_buffers: HashMap<String, String>,
     pub(crate) ssh_command_starts: HashMap<String, (usize, usize)>,
     pub(crate) system_status: Option<SharedString>,
@@ -354,8 +355,6 @@ pub(crate) struct Ashell {
     pub(crate) terminal_marked_text: Option<String>,
     pub(crate) sftp_panel_minimized: bool,
     pub(crate) sidebar_collapsed: bool,
-    pub(crate) collapsed_saved_scroll_handle: gpui::ScrollHandle,
-    pub(crate) collapsed_saved_sessions_overflowing: bool,
     pub(crate) window_active: bool,
     pub(crate) native_window_handle: Option<isize>,
     pub(crate) unread_terminal_notifications: HashSet<String>,
@@ -395,7 +394,8 @@ pub(crate) struct Ashell {
     pub(crate) events_tx: mpsc::Sender<BackendEvent>,
     pub(crate) last_window_size: Option<gpui::Size<Pixels>>,
     pub(crate) last_sidebar_width: Option<Pixels>,
-    pub(crate) should_move_window: bool,
+    pub(crate) pending_local_terminal_resizes: HashMap<String, (u16, u16)>,
+    pub(crate) local_terminal_resize_task: Option<gpui::Task<()>>,
     pub(crate) hovered_url: Option<HoveredUrl>,
     pub(crate) cmd_ctrl_pressed: bool,
     pub(crate) _subscriptions: Vec<gpui::Subscription>,
@@ -858,7 +858,6 @@ impl Ashell {
             },
             show_transfers_dialog: false,
             show_command_history: false,
-            show_collapsed_connections: false,
             ssh_command_buffers: HashMap::new(),
             ssh_command_starts: HashMap::new(),
             system_status: None,
@@ -878,8 +877,6 @@ impl Ashell {
             drag_split_origin: None,
             sftp_panel_minimized: config.sftp_panel_minimized(),
             sidebar_collapsed: config.sidebar_collapsed(),
-            collapsed_saved_scroll_handle: gpui::ScrollHandle::new(),
-            collapsed_saved_sessions_overflowing: false,
             window_active: window.is_window_active(),
             native_window_handle: crate::desktop_notification::native_window_handle(window),
             unread_terminal_notifications: HashSet::new(),
@@ -916,7 +913,8 @@ impl Ashell {
             events_tx,
             last_window_size: None,
             last_sidebar_width,
-            should_move_window: false,
+            pending_local_terminal_resizes: HashMap::new(),
+            local_terminal_resize_task: None,
             hovered_url: None,
             cmd_ctrl_pressed: false,
             _subscriptions,

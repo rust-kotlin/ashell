@@ -1750,7 +1750,6 @@ impl Ashell {
         if self.active_dialog.is_some() {
             return;
         }
-        self.show_collapsed_connections = false;
         let editing_group = group.clone();
         let is_editing = editing_group.is_some();
         let existing_groups = self.config.connection_groups();
@@ -3229,6 +3228,99 @@ impl Ashell {
         });
     }
 
+    pub(crate) fn show_about_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_dialog.is_some() {
+            return;
+        }
+
+        self.active_dialog = Some(crate::app::DialogKind::About);
+        let view = cx.entity();
+        let version = env!("CARGO_PKG_VERSION");
+
+        window.open_dialog(cx, move |dialog: Dialog, _window, _| {
+            dialog
+                .title(t!("menu_about_ashell").to_string())
+                .w(px(440.))
+                .keyboard(false)
+                .on_close({
+                    let view = view.clone();
+                    move |_, _, cx| {
+                        view.update(cx, |this, cx| {
+                            if this.active_dialog == Some(crate::app::DialogKind::About) {
+                                this.active_dialog = None;
+                            }
+                            cx.notify();
+                        });
+                    }
+                })
+                .content(move |content, _window, cx| {
+                    content.child(
+                        v_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_3()
+                            .py_4()
+                            .child(
+                                div()
+                                    .text_size(rems(1.5))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("Ashell"),
+                            )
+                            .child(div().text_size(rems(0.9)).child(format!(
+                                "{} {}",
+                                t!("version"),
+                                version
+                            )))
+                            .child(
+                                div()
+                                    .text_size(rems(0.9))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .text_center()
+                                    .child(t!("about_description")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(rems(0.9))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .text_center()
+                                    .child(t!("about_feedback_hint")),
+                            )
+                            .child(
+                                pointer_button("about-project-link")
+                                    .label("https://github.com/rust-kotlin/ashell")
+                                    .ghost()
+                                    .on_click(|_, _, _| {
+                                        if let Err(error) =
+                                            open::that("https://github.com/rust-kotlin/ashell")
+                                        {
+                                            tracing::warn!(
+                                                "failed to open Ashell project website: {error}"
+                                            );
+                                        }
+                                    }),
+                            ),
+                    )
+                })
+                .footer({
+                    let view = view.clone();
+                    h_flex().w_full().justify_end().child(
+                        pointer_button("about-close")
+                            .primary()
+                            .label(t!("close").to_string())
+                            .on_click(move |_, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    if this.active_dialog == Some(crate::app::DialogKind::About) {
+                                        this.active_dialog = None;
+                                    }
+                                    cx.notify();
+                                });
+                                window.close_dialog(cx);
+                            }),
+                    )
+                })
+        });
+    }
+
     pub(crate) fn show_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_dialog.is_some() {
             return;
@@ -3259,6 +3351,7 @@ impl Ashell {
                                 cx,
                                 &this.config,
                             );
+                            crate::app::system_menu::set_app_menus(cx);
                             cx.notify();
                         });
                     }
@@ -3692,6 +3785,39 @@ impl Ashell {
                                                                                         .on_click(window.listener_for(&view, move |this, _, _window, cx| {
                                                                                             this.change_terminal_font_family(&name, cx);
                                                                                         }))
+                                                                                );
+                                                                            }
+                                                                            menu
+                                                                        }
+                                                                    })
+                                                                    .into_any_element()
+                                                            }
+                                                        })
+                                                    )
+                                                )
+                                                .item(
+                                                    SettingItem::new(
+                                                        t!("local_terminal_encoding").to_string(),
+                                                        SettingField::render({
+                                                            let view = view_clone_for_general.clone();
+                                                            move |_, _window, cx| {
+                                                                let current = view.read(cx).config.local_terminal_encoding();
+                                                                pointer_button("local-terminal-encoding-dropdown")
+                                                                    .small()
+                                                                    .icon(IconName::Globe)
+                                                                    .label(current.label())
+                                                                    .dropdown_menu_with_anchor(Anchor::BottomRight, {
+                                                                        let view = view.clone();
+                                                                        move |mut menu, window, cx| {
+                                                                            let current = view.read(cx).config.local_terminal_encoding();
+                                                                            menu = menu.min_w(0.);
+                                                                            for encoding in TERMINAL_ENCODINGS.iter().copied() {
+                                                                                menu = menu.item(
+                                                                                    PopupMenuItem::new(encoding.label())
+                                                                                        .checked(encoding == current)
+                                                                                        .on_click(window.listener_for(&view, move |this, _, _, cx| {
+                                                                                            this.change_local_terminal_encoding(encoding, cx);
+                                                                                        })),
                                                                                 );
                                                                             }
                                                                             menu

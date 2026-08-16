@@ -9,6 +9,7 @@ use gpui::{
 };
 use gpui_component::{Theme, WindowExt as _, input::InputState};
 use rust_i18n::t;
+use std::time::Duration;
 use uuid::Uuid;
 
 use self::config::{
@@ -455,6 +456,66 @@ impl Ashell {
         cx.notify();
     }
 
+    pub(crate) fn resize_terminal_for_layout(
+        &mut self,
+        tab_id: &str,
+        cols: u16,
+        rows: u16,
+        cx: &mut Context<Self>,
+    ) -> Option<RenderSnapshot> {
+        let tab_index = self.tabs.iter().position(|tab| tab.id == tab_id)?;
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+
+        if self.tabs[tab_index].kind != TabKind::Local {
+            let keyword_highlight = self.config.keyword_highlight();
+            if self.tabs[tab_index].resize(cols, rows) {
+                return Some(self.tabs[tab_index].render_snapshot(keyword_highlight));
+            }
+            return None;
+        }
+
+        if self.tabs[tab_index].cols == cols && self.tabs[tab_index].rows == rows {
+            self.pending_local_terminal_resizes.remove(tab_id);
+            if self.pending_local_terminal_resizes.is_empty() {
+                self.local_terminal_resize_task = None;
+            }
+            return None;
+        }
+
+        let requested_size = (cols, rows);
+        if self.pending_local_terminal_resizes.get(tab_id) == Some(&requested_size) {
+            return None;
+        }
+        self.pending_local_terminal_resizes
+            .insert(tab_id.to_string(), requested_size);
+
+        self.local_terminal_resize_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(80))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let pending = std::mem::take(&mut this.pending_local_terminal_resizes);
+                this.local_terminal_resize_task = None;
+                let mut resized = false;
+                for (tab_id, (cols, rows)) in pending {
+                    if let Some(tab) = this
+                        .tabs
+                        .iter_mut()
+                        .find(|tab| tab.id == tab_id && tab.kind == TabKind::Local)
+                    {
+                        resized |= tab.resize(cols, rows);
+                    }
+                }
+                if resized {
+                    cx.notify();
+                }
+            });
+        }));
+
+        None
+    }
+
     pub(crate) fn open_local(&mut self, cx: &mut Context<Self>) {
         let previous_active_tab = self.active_tab.clone();
         let id = Uuid::new_v4().to_string();
@@ -473,6 +534,7 @@ impl Ashell {
                 let mut tab =
                     TerminalTab::new_local(id.clone(), title.clone(), backend, backend_events);
                 tab.local_cwd = initial_directory;
+                tab.set_text_encoding(self.config.local_terminal_encoding());
                 tab.resize(DEFAULT_COLS, DEFAULT_ROWS);
                 self.tabs.push(tab);
                 self.active_tab = Some(id.clone());
@@ -789,7 +851,6 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.show_collapsed_connections = false;
         let Some(session) = self.config.get(&session_id).cloned() else {
             self.status = "saved session not found".into();
             cx.notify();
@@ -805,7 +866,6 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.show_collapsed_connections = false;
         let Some(session) = self.config.get(&session_id).cloned() else {
             self.status = "saved session not found".into();
             cx.notify();
@@ -960,6 +1020,36 @@ impl Ashell {
         cx.notify();
     }
 
+    pub(crate) fn change_local_terminal_encoding(
+        &mut self,
+        encoding: TextEncoding,
+        cx: &mut Context<Self>,
+    ) {
+        if self.config.local_terminal_encoding() == encoding {
+            return;
+        }
+
+        self.config.set_local_terminal_encoding(encoding);
+        for tab in self
+            .tabs
+            .iter_mut()
+            .filter(|tab| tab.kind == TabKind::Local)
+        {
+            tab.set_text_encoding(encoding);
+        }
+        if self.config.remember_tabs() {
+            self.capture_tabs_state();
+        }
+        self.save_preferences_background();
+        self.status = t!(
+            "local_terminal_encoding_changed",
+            encoding = encoding.label()
+        )
+        .to_string()
+        .into();
+        cx.notify();
+    }
+
     pub(crate) fn refresh_ssh_config(&mut self) {
         self.ssh_config_entries =
             crate::session::ssh_config::parse_ssh_config().unwrap_or_default();
@@ -1010,7 +1100,6 @@ impl Ashell {
     }
 
     pub(crate) fn connect_saved_session(&mut self, session_id: String, cx: &mut Context<Self>) {
-        self.show_collapsed_connections = false;
         tracing::info!(
             "[ui] user clicked to connect saved session '{}'",
             session_id
@@ -1844,14 +1933,6 @@ impl Ashell {
             .as_ref()
             .and_then(|id| self.tabs.iter().find(|t| &t.id == id))
             .map(|tab| tab.kind)
-    }
-
-    pub(crate) fn active_title(&self) -> String {
-        self.active_tab
-            .as_ref()
-            .and_then(|id| self.tabs.iter().find(|t| &t.id == id))
-            .map(|t| t.title.clone())
-            .unwrap_or_else(|| t!("idle_no_session").into())
     }
 
     pub(crate) fn active_ssh_session(&self) -> Option<(String, Session)> {

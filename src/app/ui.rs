@@ -27,9 +27,7 @@ use crate::{
     Ashell, PaneLayout,
     app::{
         ServerMonitorView,
-        constants::{
-            COLLAPSED_SIDEBAR_WIDTH, SIDEBAR_WIDTH, TERMINAL_KEY_CONTEXT, TERMINAL_SCROLLBAR_GUTTER,
-        },
+        constants::{SIDEBAR_WIDTH, TERMINAL_KEY_CONTEXT, TERMINAL_SCROLLBAR_GUTTER},
         controls::{
             PointerClipboard, PointerSelectionCheckbox, SelectionState, pointer_button,
             pointer_checkbox,
@@ -248,6 +246,55 @@ impl Ashell {
             .child(self.render_command_history_popover_content(cx))
     }
 
+    fn render_terminal_encoding_button(
+        &self,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active_terminal_encoding = self.active_tab.as_ref().and_then(|active_id| {
+            self.tabs
+                .iter()
+                .find(|tab| tab.id == *active_id && tab.kind == TabKind::Ssh)
+                .map(|tab| (tab.id.clone(), tab.text_encoding()))
+        });
+
+        h_flex().when_some(active_terminal_encoding, |this, (tab_id, encoding)| {
+            this.child(
+                pointer_button(id)
+                    .ghost()
+                    .small()
+                    .icon(IconName::Globe)
+                    .label(encoding.label())
+                    .tooltip(t!("terminal_encoding").to_string())
+                    .dropdown_menu_with_anchor(Anchor::BottomRight, {
+                        let view = cx.entity();
+                        move |menu, window, _| {
+                            TERMINAL_ENCODINGS.iter().copied().fold(
+                                menu.min_w(0.),
+                                |menu, candidate| {
+                                    let tab_id = tab_id.clone();
+                                    menu.item(
+                                        PopupMenuItem::new(candidate.label())
+                                            .checked(candidate == encoding)
+                                            .on_click(window.listener_for(
+                                                &view,
+                                                move |this, _, _, cx| {
+                                                    this.set_terminal_encoding(
+                                                        tab_id.clone(),
+                                                        candidate,
+                                                        cx,
+                                                    );
+                                                },
+                                            )),
+                                    )
+                                },
+                            )
+                        }
+                    }),
+            )
+        })
+    }
+
     fn render_sftp_minimized_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .flex_none()
@@ -269,12 +316,12 @@ impl Ashell {
                 Anchor::BottomRight,
                 cx,
             ))
+            .child(self.render_terminal_encoding_button("sftp-terminal-encoding-minimized", cx))
             .child(
                 pointer_button("sftp-minimize-toggle")
                     .ghost()
                     .small()
                     .icon(IconName::ChevronUp)
-                    .label(t!("panel_expand_short").to_string())
                     .tooltip(t!("panel_expand").to_string())
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_sftp_minimized(window, cx);
@@ -303,21 +350,7 @@ impl Ashell {
             .border_b_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().tab_bar)
-            .child(
-                Icon::new(IconName::FolderOpen)
-                    .with_size(Size::Small)
-                    .text_color(cx.theme().primary),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .truncate()
-                    .text_size(rems(1.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(cx.theme().primary)
-                    .child(t!("remote_files")),
-            )
+            .child(div().flex_1().min_w(px(0.)))
             .when(!self.sftp_panel_minimized, |this| {
                 this.child(self.render_transfers_button("sftp-transfers-header", cx))
                     .child(self.render_command_history_popover(
@@ -326,6 +359,7 @@ impl Ashell {
                         Anchor::TopRight,
                         cx,
                     ))
+                    .child(self.render_terminal_encoding_button("sftp-terminal-encoding", cx))
             })
             .when(active_sftp.is_some(), |this| {
                 this.child(
@@ -383,7 +417,6 @@ impl Ashell {
                     .ghost()
                     .small()
                     .icon(IconName::ChevronDown)
-                    .label(t!("panel_minimize_short").to_string())
                     .tooltip(t!("panel_minimize").to_string())
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_sftp_minimized(window, cx);
@@ -3402,74 +3435,6 @@ impl Ashell {
             .border_color(cx.theme().sidebar_border)
             .bg(cx.theme().sidebar)
             .overflow_hidden()
-            .child(
-                v_flex()
-                    .gap_1()
-                    .min_w(px(0.))
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_size(rems(1.667))
-                                    .text_color(cx.theme().primary)
-                                    .child("Ashell"),
-                            )
-                            .child(div().flex_1())
-                            .child(
-                                pointer_button("sidebar-collapse-toggle")
-                                    .ghost()
-                                    .icon(IconName::PanelLeftClose)
-                                    .tooltip(t!("settings_toggle_sidebar").to_string())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.sidebar_collapsed = true;
-                                        this.config.set_sidebar_collapsed(true);
-                                        this.save_preferences_background();
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                pointer_button("sidebar-settings")
-                                    .ghost()
-                                    .icon(IconName::Settings)
-                                    .tooltip(t!("settings_open_settings").to_string())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.show_settings_dialog(window, cx)
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(rems(0.917))
-                            .text_color(cx.theme().muted_foreground)
-                            .truncate()
-                            .child({
-                                if let Some(kind) = self.active_kind() {
-                                    match kind {
-                                        TabKind::Local => t!("local_terminal").to_string(),
-                                        TabKind::Ssh => {
-                                            if let Some((_, session)) = self.active_ssh_session() {
-                                                format!("ssh / {}", session.name)
-                                            } else {
-                                                "ssh".to_string()
-                                            }
-                                        }
-                                        TabKind::Serial => {
-                                            if let Some((_, session)) = self.active_ssh_session() {
-                                                format!("serial / {}", session.name)
-                                            } else {
-                                                "serial".to_string()
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    self.active_title()
-                                }
-                            }),
-                    ),
-            )
             .when(is_active_ssh, |this| {
                 this.child(self.render_sidebar_monitoring_panel(is_active_ssh_connected, cx))
             })
@@ -3704,347 +3669,6 @@ impl Ashell {
             )
     }
 
-    fn render_collapsed_connections_popover_content(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let connection_filter = self
-            .connection_filter_input
-            .read(cx)
-            .value()
-            .trim()
-            .to_lowercase();
-        let group_sections = self.connection_group_sections(&connection_filter);
-        let visible_session_ids = group_sections
-            .iter()
-            .flat_map(|section| section.sessions.iter())
-            .map(|session| session.id.clone())
-            .collect::<Vec<_>>();
-        let has_connections = !visible_session_ids.is_empty();
-        let all_connections_selected = has_connections
-            && visible_session_ids
-                .iter()
-                .all(|id| self.selected_connection_ids.contains(id));
-        let total_connections = self.config.sessions().len();
-        let selected_connections = self
-            .config
-            .sessions()
-            .iter()
-            .filter(|session| self.selected_connection_ids.contains(&session.id))
-            .count();
-        let has_selected_connections = selected_connections > 0;
-        let has_group_sections = !group_sections.is_empty();
-        let connection_groups = self.config.connection_groups();
-        let active_session_id = self.active_session_id().map(ToOwned::to_owned);
-        let expanded_session_count = group_sections
-            .iter()
-            .filter(|section| {
-                !connection_filter.is_empty()
-                    || !self.config.is_connection_group_collapsed(&section.name)
-            })
-            .map(|section| section.sessions.len())
-            .sum::<usize>();
-        let estimated_list_height = if has_group_sections {
-            (group_sections.len() as f32 * 36. + expanded_session_count as f32 * 40.)
-                .clamp(112., 420.)
-        } else {
-            88.
-        };
-        let empty_message = if self.config.sessions().is_empty() {
-            t!("no_connections").to_string()
-        } else {
-            t!("no_matching_connections").to_string()
-        };
-        let collapsed_saved_sessions_overflowing = self.collapsed_saved_sessions_overflowing;
-        let collapsed_saved_scroll_handle = self.collapsed_saved_scroll_handle.clone();
-        let sidebar_view = cx.entity();
-        let theme = cx.theme().clone();
-
-        v_flex()
-            .w_full()
-            .p_3()
-            .gap_2()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.foreground)
-                            .child(t!("connection_management")),
-                    )
-                    .child(
-                        pointer_button("collapsed-import-connections")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::ArrowDown)
-                            .tooltip(t!("import_connections").to_string())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.show_collapsed_connections = false;
-                                this.import_connections(window, cx);
-                            })),
-                    )
-                    .child(
-                        pointer_button("collapsed-export-connections")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::ArrowUp)
-                            .tooltip(t!("export_connections").to_string())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.show_collapsed_connections = false;
-                                this.export_connections(window, cx);
-                            })),
-                    )
-                    .child(
-                        pointer_button("collapsed-new-connection")
-                            .primary()
-                            .small()
-                            .icon(IconName::Plus)
-                            .label(t!("new_connection_short").to_string())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.show_collapsed_connections = false;
-                                this.open_new_ssh_dialog(window, cx);
-                            })),
-                    )
-                    .child(
-                        pointer_button("close-collapsed-connections")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Close)
-                            .tooltip(t!("close_connections").to_string())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.show_collapsed_connections = false;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                Input::new(&self.connection_filter_input)
-                    .w_full()
-                    .min_w(px(0.)),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap_1()
-                    .pl(px(5.))
-                    .py(px(4.))
-                    .child(
-                        h_flex()
-                            .w(px(16.))
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                pointer_checkbox("collapsed-connections-select-all")
-                                    .small()
-                                    .checked(all_connections_selected)
-                                    .disabled(!has_connections)
-                                    .tab_stop(false)
-                                    .on_click(cx.listener({
-                                        let visible_session_ids = visible_session_ids.clone();
-                                        move |this, checked, _, cx| {
-                                            this.set_connection_selection(
-                                                visible_session_ids.clone(),
-                                                *checked,
-                                                cx,
-                                            );
-                                        }
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(rems(0.75))
-                            .text_color(theme.muted_foreground)
-                            .child(format!("{selected_connections}/{total_connections}")),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        pointer_button("collapsed-new-connection-group")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Plus)
-                            .tooltip(t!("new_connection_group").to_string())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.show_collapsed_connections = false;
-                                this.show_connection_group_dialog(None, window, cx);
-                            })),
-                    )
-                    .child({
-                        let groups = connection_groups.clone();
-                        pointer_button("collapsed-move-selected-connections")
-                            .ghost()
-                            .small()
-                            .icon(IconName::FolderClosed)
-                            .tooltip(t!("move_to_group").to_string())
-                            .disabled(!has_selected_connections)
-                            .dropdown_menu_with_anchor(Anchor::BottomRight, {
-                                let view = cx.entity();
-                                move |menu, window, _| {
-                                    let menu = menu.min_w(0.).item(
-                                        PopupMenuItem::new(t!("ungrouped").to_string()).on_click(
-                                            window.listener_for(&view, |this, _, _, cx| {
-                                                this.move_selected_connections_to_group(
-                                                    String::new(),
-                                                    cx,
-                                                );
-                                            }),
-                                        ),
-                                    );
-                                    groups.iter().fold(menu, |menu, group| {
-                                        let group = group.clone();
-                                        let label = group.clone();
-                                        menu.item(PopupMenuItem::new(label).on_click(
-                                            window.listener_for(&view, move |this, _, _, cx| {
-                                                this.move_selected_connections_to_group(
-                                                    group.clone(),
-                                                    cx,
-                                                );
-                                            }),
-                                        ))
-                                    })
-                                }
-                            })
-                    })
-                    .child(
-                        pointer_button("collapsed-delete-selected-connections")
-                            .danger()
-                            .small()
-                            .icon(IconName::Delete)
-                            .label(t!("delete_selected_connections").to_string())
-                            .disabled(!has_selected_connections)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.remove_selected_sessions(cx);
-                            })),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .h(px(estimated_list_height))
-                    .flex_none()
-                    .min_h(px(0.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .h_full()
-                            .id("collapsed-connections-scroll")
-                            .track_scroll(&self.collapsed_saved_scroll_handle)
-                            .overflow_y_scroll()
-                            .on_prepaint(move |_, _, cx| {
-                                let overflowing =
-                                    collapsed_saved_scroll_handle.max_offset().y > px(0.);
-                                sidebar_view.update(cx, |this, cx| {
-                                    if this.collapsed_saved_sessions_overflowing != overflowing {
-                                        this.collapsed_saved_sessions_overflowing = overflowing;
-                                        cx.notify();
-                                    }
-                                });
-                            })
-                            .child(if has_group_sections {
-                                v_flex()
-                                    .w_full()
-                                    .min_w(px(0.))
-                                    .gap_2()
-                                    .children(group_sections.into_iter().map(|section| {
-                                        self.render_connection_group_section(
-                                            section,
-                                            !connection_filter.is_empty(),
-                                            active_session_id.as_deref(),
-                                            cx,
-                                        )
-                                    }))
-                                    .into_any_element()
-                            } else {
-                                div()
-                                    .size_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(rems(0.833))
-                                    .text_color(theme.muted_foreground)
-                                    .child(empty_message)
-                                    .into_any_element()
-                            }),
-                    )
-                    .when(collapsed_saved_sessions_overflowing, |this| {
-                        this.child(
-                            div().relative().w(px(12.)).h_full().flex_none().child(
-                                Scrollbar::vertical(&self.collapsed_saved_scroll_handle)
-                                    .scrollbar_show(ScrollbarShow::Scrolling),
-                            ),
-                        )
-                    }),
-            )
-            .into_any_element()
-    }
-
-    fn render_collapsed_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .w_full()
-            .h_full()
-            .min_w(px(0.))
-            .p_2()
-            .border_r_1()
-            .border_color(cx.theme().sidebar_border)
-            .bg(cx.theme().sidebar)
-            .overflow_hidden()
-            .items_center()
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .pb_2()
-                    .child(
-                        pointer_button("sidebar-expand-toggle")
-                            .ghost()
-                            .icon(IconName::PanelLeftOpen)
-                            .tooltip(t!("settings_toggle_sidebar").to_string())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.show_collapsed_connections = false;
-                                this.sidebar_collapsed = false;
-                                this.config.set_sidebar_collapsed(false);
-                                this.save_preferences_background();
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                Popover::new("collapsed-connections-popover")
-                    .anchor(Anchor::TopLeft)
-                    .open(self.show_collapsed_connections)
-                    .on_open_change(cx.listener(|this, open, _, cx| {
-                        if this.show_collapsed_connections != *open {
-                            this.show_collapsed_connections = *open;
-                            cx.notify();
-                        }
-                    }))
-                    .trigger(
-                        pointer_button("collapsed-connections-trigger")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Network)
-                            .tooltip(t!("connection_management").to_string()),
-                    )
-                    .ml(px(40.))
-                    .w(px(480.))
-                    .p_0()
-                    .child(self.render_collapsed_connections_popover_content(cx)),
-            )
-            .child(div().flex_1())
-    }
-
     fn render_window_controls(
         &self,
         window: &mut Window,
@@ -4209,35 +3833,40 @@ impl Ashell {
                 (g.id.clone(), g.title.clone(), pane_ids)
             })
             .collect();
-        let is_integrated =
-            self.active_title_bar_style == crate::session::config::TitleBarStyle::Integrated;
-        let active_terminal_encoding = self.active_tab.as_ref().and_then(|active_id| {
-            self.tabs
-                .iter()
-                .find(|tab| {
-                    tab.id == *active_id && matches!(tab.kind, TabKind::Local | TabKind::Ssh)
-                })
-                .map(|tab| (tab.id.clone(), tab.text_encoding()))
-        });
-
         h_flex()
             .flex_1()
             .min_w(px(0.))
             .h_full()
+            .pl(px(8.))
             .items_center()
             .gap_2()
+            .child(
+                pointer_button("sidebar-toggle")
+                    .ghost()
+                    .small()
+                    .icon(if self.sidebar_collapsed {
+                        IconName::PanelLeftOpen
+                    } else {
+                        IconName::PanelLeftClose
+                    })
+                    .tooltip(t!("settings_toggle_sidebar").to_string())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_collapsed = !this.sidebar_collapsed;
+                        this.is_layout_reset = false;
+                        this.config.set_sidebar_collapsed(this.sidebar_collapsed);
+                        this.save_preferences_background();
+                        cx.notify();
+                    })),
+            )
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.))
                     .h_full()
-                    .when(is_integrated, |this| {
-                        this.window_control_area(gpui::WindowControlArea::Drag)
-                    })
                     .overflow_x_hidden()
                     .child({
                         TabBar::new("ashell-tab-bar")
-                            .underline()
+                            .segmented()
                             .track_scroll(&self.tabs_scroll_handle)
                             .selected_index(selected)
                             .children(groups_data.iter().enumerate().map(
@@ -4248,6 +3877,7 @@ impl Ashell {
                                     } else {
                                         title.clone()
                                     };
+                                    let click_gid = gid.clone();
                                     let close_id = if self.active_group.as_ref() == Some(&gid) {
                                         self.active_tab.clone().unwrap_or_else(|| {
                                             pane_ids.first().cloned().unwrap_or_default()
@@ -4274,10 +3904,12 @@ impl Ashell {
                                             .is_some_and(TerminalTab::is_command_active)
                                     });
                                     Tab::new()
-                                        .min_w(px(80.))
+                                        .min_w(px(112.))
+                                        .max_w(px(220.))
                                         .child(
                                             h_flex()
                                                 .w_full()
+                                                .h_full()
                                                 .min_w(px(0.))
                                                 .items_center()
                                                 .gap_2()
@@ -4309,7 +3941,7 @@ impl Ashell {
                                                         .min_w(px(0.))
                                                         .truncate()
                                                         .when(ix == selected, |this| {
-                                                            this.font_weight(FontWeight::BOLD)
+                                                            this.font_weight(FontWeight::SEMIBOLD)
                                                                 .text_color(cx.theme().foreground)
                                                         })
                                                         .when(ix != selected, |this| {
@@ -4324,7 +3956,12 @@ impl Ashell {
                                                         .ghost()
                                                         .xsmall()
                                                         .icon(IconName::Close)
-                                                        .mr(px(5.))
+                                                        .opacity(if ix == selected {
+                                                            0.8
+                                                        } else {
+                                                            0.45
+                                                        })
+                                                        .hover(|style| style.opacity(1.0))
                                                         .on_mouse_down(
                                                             MouseButton::Left,
                                                             |_, window, cx| {
@@ -4346,8 +3983,13 @@ impl Ashell {
                                                         )),
                                                 ),
                                         )
+                                        .cursor_pointer()
+                                        .block_mouse_except_scroll()
+                                        .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                            window.prevent_default();
+                                        })
                                         .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.activate_group(gid.clone(), window, cx)
+                                            this.activate_group(click_gid.clone(), window, cx)
                                         }))
                                 },
                             ))
@@ -4362,41 +4004,6 @@ impl Ashell {
                     .items_center()
                     .gap_1()
                     .pr(px(6.))
-                    .when_some(active_terminal_encoding, |this, (tab_id, encoding)| {
-                        this.child(
-                            pointer_button("terminal-encoding")
-                                .ghost()
-                                .small()
-                                .icon(IconName::Globe)
-                                .label(encoding.label())
-                                .tooltip(t!("terminal_encoding").to_string())
-                                .dropdown_menu_with_anchor(Anchor::BottomRight, {
-                                    let view = cx.entity();
-                                    move |menu, window, _| {
-                                        TERMINAL_ENCODINGS.iter().copied().fold(
-                                            menu.min_w(0.),
-                                            |menu, candidate| {
-                                                let tab_id = tab_id.clone();
-                                                menu.item(
-                                                    PopupMenuItem::new(candidate.label())
-                                                        .checked(candidate == encoding)
-                                                        .on_click(window.listener_for(
-                                                            &view,
-                                                            move |this, _, _, cx| {
-                                                                this.set_terminal_encoding(
-                                                                    tab_id.clone(),
-                                                                    candidate,
-                                                                    cx,
-                                                                );
-                                                            },
-                                                        )),
-                                                )
-                                            },
-                                        )
-                                    }
-                                }),
-                        )
-                    })
                     .child(
                         pointer_button("open-selector")
                             .secondary()
@@ -4455,7 +4062,18 @@ impl Ashell {
                                 this.split_current_pane("right", cx);
                             })),
                     )
-                    .child(self.render_search_button(cx)),
+                    .child(self.render_search_button(cx))
+                    .child(
+                        pointer_button("tabbar-settings")
+                            .ghost()
+                            .small()
+                            .rounded(px(999.))
+                            .icon(IconName::Settings)
+                            .tooltip(t!("settings_open_settings").to_string())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_settings_dialog(window, cx)
+                            })),
+                    ),
             )
     }
 
@@ -4913,6 +4531,7 @@ impl Ashell {
                     .is_some_and(|hu| hu.tab_id == *tab_id);
                 let mut el = div()
                     .size_full()
+                    .pl(px(8.))
                     .pr(px(TERMINAL_SCROLLBAR_GUTTER))
                     .overflow_hidden()
                     .when(is_url_hovered, |d| d.cursor_pointer())
@@ -4949,7 +4568,7 @@ impl Ashell {
                 let scrollbar = this.terminal_scrollbars.entry(tab_id.clone()).or_default();
                 el = el.vertical_scrollbar(scrollbar);
 
-                // When disconnected, overlay a reconnect bar at the bottom of the terminal.
+                // When disconnected, overlay a reconnect bar at the top of the terminal.
                 // Uses absolute positioning so the terminal element itself is unchanged,
                 // keeping panel size stable in multi-panel layouts.
                 let disconnected_reason = this
@@ -4960,7 +4579,7 @@ impl Ashell {
                 if let Some(reason) = disconnected_reason {
                     let tab_id_for_reconnect = tab_id.clone();
                     el = div().size_full().relative().child(el).child(
-                        div().absolute().bottom_0().left_0().right_0().child(
+                        div().absolute().top_0().left_0().right_0().child(
                             h_flex()
                                 .w_full()
                                 .items_center()
@@ -5260,40 +4879,26 @@ impl Render for Ashell {
         };
 
         let workspace = if self.sidebar_collapsed {
-            h_flex()
+            v_flex()
                 .size_full()
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(COLLAPSED_SIDEBAR_WIDTH))
-                        .h_full()
-                        .child(self.render_collapsed_sidebar(cx)),
+                .relative()
+                .overflow_hidden()
+                .when(
+                    self.active_title_bar_style == crate::session::config::TitleBarStyle::Native,
+                    |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .h(px(32.))
+                                .w_full()
+                                .bg(cx.theme().tab_bar)
+                                .border_b_1()
+                                .border_color(cx.theme().border)
+                                .child(self.render_tab_bar(cx)),
+                        )
+                    },
                 )
-                .child(
-                    div().flex_1().h_full().min_w(px(0.)).child(
-                        v_flex()
-                            .size_full()
-                            .relative()
-                            .overflow_hidden()
-                            .when(
-                                self.active_title_bar_style
-                                    == crate::session::config::TitleBarStyle::Native,
-                                |this| {
-                                    this.child(
-                                        div()
-                                            .flex_none()
-                                            .h(px(32.))
-                                            .w_full()
-                                            .bg(cx.theme().tab_bar)
-                                            .border_b_1()
-                                            .border_color(cx.theme().border)
-                                            .child(self.render_tab_bar(cx)),
-                                    )
-                                },
-                            )
-                            .child(body_panel),
-                    ),
-                )
+                .child(body_panel)
                 .into_any_element()
         } else {
             let sidebar_area = resizable_panel()
@@ -5350,6 +4955,25 @@ impl Render for Ashell {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .font_family(self.ui_font_family.clone())
+            .on_action(cx.listener(|this, _: &crate::AboutAshell, window, cx| {
+                this.show_about_dialog(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::NewLocalTerminal, _, cx| {
+                this.open_local(cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::CloseWindow, window, cx| {
+                this.save_layout_state(window, cx);
+                window.remove_window();
+            }))
+            .on_action(cx.listener(|_, _: &crate::MinimizeWindow, window, _| {
+                window.minimize_window();
+            }))
+            .on_action(cx.listener(|_, _: &crate::ZoomWindow, window, _| {
+                window.zoom_window();
+            }))
+            .on_action(cx.listener(|_, _: &crate::ToggleFullScreen, window, _| {
+                window.toggle_fullscreen();
+            }))
             .on_action(cx.listener(|this, _: &crate::OpenSettings, window, cx| this.show_settings_dialog(window, cx)))
             .on_action(cx.listener(|this, _: &crate::OpenSession, window, cx| this.show_selector_dialog(window, cx)))
             .on_action(cx.listener(|this, _: &crate::OpenTransfers, window, cx| this.show_transfers_dialog(window, cx)))
@@ -5357,9 +4981,6 @@ impl Render for Ashell {
             .on_action(cx.listener(|this, _: &crate::OpenSearch, window, cx| this.toggle_search(window, cx)))
             .on_action(cx.listener(|this, _: &crate::ToggleSidebar, _, cx| {
                 this.sidebar_collapsed = !this.sidebar_collapsed;
-                if !this.sidebar_collapsed {
-                    this.show_collapsed_connections = false;
-                }
                 this.is_layout_reset = false;
                 this.config.set_sidebar_collapsed(this.sidebar_collapsed);
                 this.save_preferences_background();
@@ -5394,7 +5015,7 @@ impl Render for Ashell {
                         cx.stop_propagation();
                     }
                 } else {
-                    cx.propagate();
+                    window.dispatch_action(Box::new(gpui_component::input::Copy), cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &crate::Paste, window, cx| {
@@ -5405,7 +5026,7 @@ impl Render for Ashell {
                         }
                     }
                 } else {
-                    cx.propagate();
+                    window.dispatch_action(Box::new(gpui_component::input::Paste), cx);
                 }
             }))
             .when(self.active_title_bar_style == crate::session::config::TitleBarStyle::Integrated, |this| {
@@ -5420,7 +5041,7 @@ impl Render for Ashell {
                         .child(self.render_window_controls(window, cx))
                         .child(
                             div()
-                                .id("tab-bar-drag")
+                                .id("title-bar-content")
                                 .flex_1()
                                 .min_w(px(0.))
                                 .h_full()
@@ -5429,29 +5050,6 @@ impl Render for Ashell {
                                     window.titlebar_double_click();
                                     #[cfg(not(target_os = "macos"))]
                                     window.zoom_window();
-                                })
-                                .when(cfg!(target_os = "linux"), |this| {
-                                    this.on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, _| {
-                                            this.should_move_window = true;
-                                        }),
-                                    )
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, _| {
-                                            this.should_move_window = false;
-                                        }),
-                                    )
-                                    .on_mouse_down_out(cx.listener(|this, _, _, _| {
-                                        this.should_move_window = false;
-                                    }))
-                                    .on_mouse_move(cx.listener(|this, _, window, _| {
-                                        if this.should_move_window {
-                                            this.should_move_window = false;
-                                            window.start_window_move();
-                                        }
-                                    }))
                                 })
                                 .child(self.render_tab_bar(cx)),
                         ),

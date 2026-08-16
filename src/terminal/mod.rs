@@ -19,11 +19,7 @@ use alacritty_terminal::{
     grid::{Dimensions, Scroll},
     index::{Column, Line, Point, Side},
     selection::{Selection, SelectionRange, SelectionType},
-    term::{
-        Config, Term, TermMode,
-        cell::{Cell, Flags},
-        point_to_viewport, viewport_to_point,
-    },
+    term::{Config, Term, TermMode, cell::Cell, point_to_viewport, viewport_to_point},
     vte::ansi::{CursorShape, Processor},
 };
 use base64::{Engine as _, engine::general_purpose};
@@ -1626,7 +1622,7 @@ impl TerminalTab {
         next
     }
 
-    pub fn resize(&mut self, cols: u16, rows: u16) {
+    pub fn resize(&mut self, cols: u16, rows: u16) -> bool {
         let new_cols = cols.max(1);
         let new_rows = rows.max(1);
         if self.cols != new_cols || self.rows != new_rows {
@@ -1639,6 +1635,9 @@ impl TerminalTab {
             );
             self.term.resize(TerminalSize::new(self.cols, self.rows));
             self.send_backend(BackendCommand::Resize { cols, rows });
+            true
+        } else {
+            false
         }
     }
 
