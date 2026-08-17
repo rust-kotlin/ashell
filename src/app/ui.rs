@@ -5075,28 +5075,38 @@ impl Render for Ashell {
             let view = cx.entity();
             v_flex()
                 .size_full()
+                .min_w(px(0.))
+                .items_stretch()
                 .child(
-                    div().flex_1().min_h(px(0.)).child(
-                        v_resizable("ashell-body")
-                            .lock(self.config.lock_layout())
-                            .with_state(&self.body_panels)
-                            .on_resize(move |_, _, cx| {
-                                view.update(cx, |this, _| {
-                                    this.is_layout_reset = false;
-                                });
-                            })
-                            .child(resizable_panel().child(self.render_terminal_panel(window, cx)))
-                            .child(
-                                resizable_panel()
-                                    .size(sftp_size)
-                                    .size_range(if self.sftp_panel_minimized {
-                                        px(minimized_height)..px(minimized_height)
-                                    } else {
-                                        px(min_panel_height)..px(1200.)
-                                    })
-                                    .child(self.render_sftp_panel(window, cx)),
-                            ),
-                    ),
+                    div()
+                        .w_full()
+                        .min_w(px(0.))
+                        .flex_1()
+                        .min_h(px(0.))
+                        .overflow_hidden()
+                        .child(
+                            v_resizable("ashell-body")
+                                .lock(self.config.lock_layout())
+                                .with_state(&self.body_panels)
+                                .on_resize(move |_, _, cx| {
+                                    view.update(cx, |this, _| {
+                                        this.is_layout_reset = false;
+                                    });
+                                })
+                                .child(
+                                    resizable_panel().child(self.render_terminal_panel(window, cx)),
+                                )
+                                .child(
+                                    resizable_panel()
+                                        .size(sftp_size)
+                                        .size_range(if self.sftp_panel_minimized {
+                                            px(minimized_height)..px(minimized_height)
+                                        } else {
+                                            px(min_panel_height)..px(1200.)
+                                        })
+                                        .child(self.render_sftp_panel(window, cx)),
+                                ),
+                        ),
                 )
                 .when(is_monitor_bottom, |this| {
                     this.child(self.render_monitoring_panel(
@@ -5109,10 +5119,15 @@ impl Render for Ashell {
         } else {
             v_flex()
                 .size_full()
+                .min_w(px(0.))
+                .items_stretch()
                 .child(
                     div()
+                        .w_full()
+                        .min_w(px(0.))
                         .flex_1()
                         .min_h(px(0.))
+                        .overflow_hidden()
                         .child(self.render_terminal_panel(window, cx)),
                 )
                 .when(is_monitor_bottom, |this| {
@@ -5154,9 +5169,10 @@ impl Render for Ashell {
                 .flex_none()
                 .child(self.sidebar(cx));
 
-            let main_area = resizable_panel().child(
+            let main_area = resizable_panel().min_w(px(0.)).child(
                 v_flex()
                     .size_full()
+                    .min_w(px(0.))
                     .relative()
                     .overflow_hidden()
                     .when(
@@ -5301,7 +5317,13 @@ impl Render for Ashell {
                 )
             })
             .child(
-                div().flex_1().min_h_0().child(workspace),
+                div()
+                    .w_full()
+                    .min_w(px(0.))
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(workspace),
             )
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_sheet_layer(window, cx))

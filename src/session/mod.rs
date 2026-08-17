@@ -24,6 +24,12 @@ use crate::{
     text_encoding::TextEncoding,
 };
 
+const MIN_TERMINAL_GRID_DIMENSION: u16 = 2;
+
+fn valid_terminal_layout_size(cols: u16, rows: u16) -> bool {
+    cols >= MIN_TERMINAL_GRID_DIMENSION && rows >= MIN_TERMINAL_GRID_DIMENSION
+}
+
 pub(crate) fn compact_local_path(path: &std::path::Path) -> String {
     if let Some(base_dirs) = directories::BaseDirs::new() {
         if let Some(relative_path) = relative_to_home(path, base_dirs.home_dir()) {
@@ -464,9 +470,13 @@ impl Ashell {
         rows: u16,
         cx: &mut Context<Self>,
     ) -> Option<RenderSnapshot> {
-        let tab_index = self.tabs.iter().position(|tab| tab.id == tab_id)?;
-        let cols = cols.max(1);
-        let rows = rows.max(1);
+        if !valid_terminal_layout_size(cols, rows) {
+            return None;
+        }
+
+        let Some(tab_index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
+            return None;
+        };
 
         if self.tabs[tab_index].kind != TabKind::Local {
             let keyword_highlight = self.config.keyword_highlight();
@@ -513,7 +523,6 @@ impl Ashell {
                 }
             });
         }));
-
         None
     }
 
