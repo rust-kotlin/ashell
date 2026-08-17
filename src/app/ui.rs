@@ -2,8 +2,8 @@ use std::{collections::HashSet, sync::Arc};
 
 use crate::app::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui::{
-    Anchor, AppContext as _, Context, ElementId, Focusable as _, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _,
+    Anchor, AppContext as _, Context, DismissEvent, ElementId, Empty, Focusable as _, FontWeight,
+    Hsla, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _,
     PathBuilder, Pixels, Render, StatefulInteractiveElement as _, Styled as _, Window, canvas, div,
     hsla, point, prelude::FluentBuilder as _, px, relative, rems, uniform_list,
 };
@@ -93,6 +93,11 @@ fn connection_matches_filter(session: &crate::session::config::Session, filter: 
 struct ConnectionGroupSection {
     name: String,
     sessions: Vec<crate::session::config::Session>,
+}
+
+#[derive(Clone)]
+struct TabGroupDrag {
+    group_id: String,
 }
 
 fn compact_menu_width(labels: &[&str]) -> Pixels {
@@ -4019,21 +4024,69 @@ impl Ashell {
                     .small()
                     .icon(IconName::ChevronDown)
                     .tooltip(t!("settings_tab_list").to_string())
-                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, _| {
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, menu_cx| {
+                        let popup_menu = menu_cx.entity();
                         tab_entries.iter().enumerate().fold(
                             menu.scrollable(true),
                             |menu, (ix, (group_id, label, _))| {
                                 let group_id = group_id.clone();
+                                let drag_group_id = group_id.clone();
+                                let target_group_id = group_id.clone();
+                                let target_group_for_style = group_id.clone();
+                                let item_view = view.clone();
+                                let item_menu = popup_menu.clone();
+                                let label = label.clone();
                                 menu.item(
-                                    PopupMenuItem::new(label.clone())
-                                        .checked(ix == selected)
-                                        .on_click(window.listener_for(
-                                            &view,
-                                            move |this, _, window, cx| {
-                                                this.tabs_scroll_handle.scroll_to_item(ix);
-                                                this.activate_group(group_id.clone(), window, cx);
-                                            },
-                                        )),
+                                    PopupMenuItem::element(move |_, _| {
+                                        let drop_view = item_view.clone();
+                                        let drop_menu = item_menu.clone();
+                                        let drop_target = target_group_id.clone();
+                                        h_flex()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .items_center()
+                                            .cursor_grab()
+                                            .drag_over::<TabGroupDrag>(move |this, drag, _, cx| {
+                                                if drag.group_id == target_group_for_style {
+                                                    this
+                                                } else {
+                                                    this.bg(cx.theme().drop_target)
+                                                }
+                                            })
+                                            .on_drag(
+                                                TabGroupDrag {
+                                                    group_id: drag_group_id,
+                                                },
+                                                |drag, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    cx.new(|_| {
+                                                        let _ = drag;
+                                                        Empty
+                                                    })
+                                                },
+                                            )
+                                            .on_drop::<TabGroupDrag>(move |drag, _, cx| {
+                                                let dragged_group_id = drag.group_id.clone();
+                                                drop_view.update(cx, |this, cx| {
+                                                    this.reorder_tab_groups(
+                                                        &dragged_group_id,
+                                                        &drop_target,
+                                                        cx,
+                                                    );
+                                                });
+                                                drop_menu.update(cx, |_, cx| {
+                                                    cx.emit(DismissEvent);
+                                                });
+                                            })
+                                            .child(label.clone())
+                                    })
+                                    .checked(ix == selected)
+                                    .on_click(
+                                        window.listener_for(&view, move |this, _, window, cx| {
+                                            this.tabs_scroll_handle.scroll_to_item(ix);
+                                            this.activate_group(group_id.clone(), window, cx);
+                                        }),
+                                    ),
                                 )
                             },
                         )

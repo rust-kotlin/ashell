@@ -2295,6 +2295,40 @@ impl Ashell {
         cx.notify();
     }
 
+    pub(crate) fn reorder_tab_groups(
+        &mut self,
+        dragged_group_id: &str,
+        target_group_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if dragged_group_id == target_group_id {
+            return;
+        }
+
+        let Some(from_index) = self
+            .tab_groups
+            .iter()
+            .position(|group| group.id == dragged_group_id)
+        else {
+            return;
+        };
+        let Some(mut target_index) = self
+            .tab_groups
+            .iter()
+            .position(|group| group.id == target_group_id)
+        else {
+            return;
+        };
+
+        let dragged_group = self.tab_groups.remove(from_index);
+        if from_index < target_index {
+            target_index -= 1;
+        }
+        self.tab_groups.insert(target_index, dragged_group);
+        self.save_tabs_state_background();
+        cx.notify();
+    }
+
     pub(crate) fn sync_pane_root_to_group(&mut self) {
         if let Some(group_id) = self.active_group.clone() {
             if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id) {
