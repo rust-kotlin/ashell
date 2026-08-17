@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use gpui::{
     Context, Focusable as _, Hsla, InteractiveElement as _, IntoElement, MouseButton,
-    ParentElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px, rems,
+    ParentElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, IconName, Sizable as _,
@@ -10,7 +10,10 @@ use gpui_component::{
 };
 use rust_i18n::t;
 
-use crate::{Ashell, app::controls::pointer_button};
+use crate::{
+    Ashell,
+    app::controls::{pointer_button, ui_rems},
+};
 
 impl Ashell {
     pub(crate) fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -325,7 +328,6 @@ impl Ashell {
         div().child(
             pointer_button("search-btn")
                 .ghost()
-                .small()
                 .icon(IconName::Search)
                 .tooltip(t!("search").to_string())
                 .on_click(cx.listener(|this, _, window, cx| {
@@ -389,12 +391,12 @@ impl Ashell {
                                     }
                                 },
                             ))
-                            .child(Input::new(&self.search_input).small()),
+                            .child(Input::new(&self.search_input)),
                     )
                     .when(!current_display.is_empty(), |this| {
                         this.child(
                             div()
-                                .text_size(rems(0.75))
+                                .text_size(ui_rems(0.75))
                                 .text_color(cx.theme().muted_foreground)
                                 .min_w(px(36.))
                                 .text_center()
@@ -404,7 +406,7 @@ impl Ashell {
                     .child(
                         pointer_button("search-prev")
                             .ghost()
-                            .xsmall()
+                            .small()
                             .icon(IconName::ChevronUp)
                             .disabled(!has_matches)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -414,7 +416,7 @@ impl Ashell {
                     .child(
                         pointer_button("search-next")
                             .ghost()
-                            .xsmall()
+                            .small()
                             .icon(IconName::ChevronDown)
                             .disabled(!has_matches)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -424,7 +426,7 @@ impl Ashell {
                     .child(
                         pointer_button("search-close")
                             .ghost()
-                            .xsmall()
+                            .small()
                             .icon(IconName::Close)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.close_search(window, cx);

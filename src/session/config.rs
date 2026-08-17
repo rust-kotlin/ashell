@@ -393,8 +393,11 @@ fn default_locale() -> String {
 }
 
 fn default_terminal_font_size() -> f32 {
-    18.0
+    12.0
 }
+
+const LEGACY_DEFAULT_TERMINAL_FONT_SIZE: f32 = 18.0;
+const LEGACY_DEFAULT_UI_FONT_SIZE: f32 = 16.0;
 
 fn default_ui_font_size() -> f32 {
     14.0
@@ -1150,7 +1153,9 @@ impl ConfigStore {
     }
 
     pub fn terminal_font_size(&self) -> f32 {
-        if self.cache.terminal_font_size <= 0.0 {
+        if self.cache.terminal_font_size <= 0.0
+            || (self.cache.terminal_font_size - LEGACY_DEFAULT_TERMINAL_FONT_SIZE).abs() < 0.01
+        {
             default_terminal_font_size()
         } else {
             self.cache.terminal_font_size
@@ -1261,7 +1266,10 @@ impl ConfigStore {
     }
 
     pub fn ui_font_size(&self) -> f32 {
-        if self.cache.ui_font_size <= 0.0 {
+        if self.cache.ui_font_size <= 0.0
+            || (self.cache.ui_font_size - LEGACY_DEFAULT_UI_FONT_SIZE).abs() < 0.01
+        {
+            // Migrate the previous application default to the current compact default.
             default_ui_font_size()
         } else {
             self.cache.ui_font_size
@@ -1269,7 +1277,7 @@ impl ConfigStore {
     }
 
     pub fn set_ui_font_size(&mut self, ui_font_size: f32) {
-        self.cache.ui_font_size = ui_font_size.max(8.0);
+        self.cache.ui_font_size = ui_font_size.clamp(10.0, 28.0);
     }
 
     pub fn ui_font_family(&self) -> &str {
@@ -1526,6 +1534,21 @@ pub trait ProxyStream:
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static> ProxyStream
     for T
 {
+}
+
+/// Build the shared russh client configuration used by terminal and SFTP sessions.
+///
+/// Keep russh's modern key-exchange order intact, then add the SHA-1 group14
+/// algorithm as a final fallback for legacy OpenSSH servers such as OpenSSH 5.x.
+pub(crate) fn ssh_client_config() -> russh::client::Config {
+    let mut config = russh::client::Config {
+        inactivity_timeout: None,
+        keepalive_interval: Some(std::time::Duration::from_secs(5)),
+        keepalive_max: 3,
+        ..Default::default()
+    };
+    config.preferred.kex.to_mut().push(russh::kex::DH_G14_SHA1);
+    config
 }
 
 #[derive(Debug, Clone)]
@@ -1890,6 +1913,32 @@ mod tests {
         assert!(config.connection_groups.is_empty());
         assert_eq!(config.local_terminal_encoding, TextEncoding::Utf8);
         assert!(config.collapsed_connection_groups.is_empty());
+    }
+
+    #[test]
+    fn font_sizes_migrate_the_previous_defaults() {
+        let mut store = ConfigStore::in_memory();
+
+        assert_eq!(store.terminal_font_size(), 12.0);
+        assert_eq!(store.ui_font_size(), 14.0);
+
+        store.set_terminal_font_size(18.0);
+        assert_eq!(store.terminal_font_size(), 12.0);
+
+        store.set_ui_font_size(14.0);
+        assert_eq!(store.ui_font_size(), 14.0);
+
+        store.set_ui_font_size(20.0);
+        assert_eq!(store.ui_font_size(), 20.0);
+    }
+
+    #[test]
+    fn legacy_ssh_key_exchange_is_only_a_fallback() {
+        let config = ssh_client_config();
+        let kex = config.preferred.kex.as_ref();
+
+        assert_eq!(kex.last(), Some(&russh::kex::DH_G14_SHA1));
+        assert_eq!(kex.first(), Some(&russh::kex::CURVE25519));
     }
 
     #[test]

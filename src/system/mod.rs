@@ -192,7 +192,7 @@ pub fn remote_snapshot_from_kv(raw: &str) -> Result<SystemSnapshot> {
                 .unwrap_or_default();
             disks.push(DiskSample {
                 mount,
-                available_bytes,
+                available_bytes: available_bytes.min(total_bytes),
                 total_bytes,
             });
             continue;
@@ -208,13 +208,15 @@ pub fn remote_snapshot_from_kv(raw: &str) -> Result<SystemSnapshot> {
         .get("CPU_PERCENT")
         .ok_or_else(|| anyhow!("missing CPU_PERCENT"))?
         .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite())
         .unwrap_or_default()
         / 100.0;
 
-    let mem_used = parse_u64(&kv, "MEM_USED");
     let mem_total = parse_u64(&kv, "MEM_TOTAL");
-    let swap_used = parse_u64(&kv, "SWAP_USED");
     let swap_total = parse_u64(&kv, "SWAP_TOTAL");
+    let mem_used = parse_u64(&kv, "MEM_USED").min(mem_total);
+    let swap_used = parse_u64(&kv, "SWAP_USED").min(swap_total);
     let rx_rate = parse_u64(&kv, "NET_RX");
     let tx_rate = parse_u64(&kv, "NET_TX");
 
@@ -254,7 +256,12 @@ pub fn remote_processes_from_ps(raw: &str) -> Vec<RemoteProcess> {
                 let mut fields = record.splitn(5, '\t');
                 let pid = fields.next()?.parse::<u32>().ok()?;
                 let user = fields.next()?.to_string();
-                let cpu_percent = fields.next()?.parse::<f32>().ok()?.max(0.0);
+                let cpu_percent = fields
+                    .next()?
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|value| value.is_finite())
+                    .map(|value| value.max(0.0))?;
                 let memory_bytes = fields.next()?.parse::<u64>().ok()?;
                 let command = fields.next()?.trim().to_string();
                 return (!command.is_empty()).then_some(RemoteProcess {
@@ -269,7 +276,12 @@ pub fn remote_processes_from_ps(raw: &str) -> Vec<RemoteProcess> {
             let mut fields = line.split_whitespace();
             let pid = fields.next()?.parse::<u32>().ok()?;
             let user = fields.next()?.to_string();
-            let cpu_percent = fields.next()?.parse::<f32>().ok()?.max(0.0);
+            let cpu_percent = fields
+                .next()?
+                .parse::<f32>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .map(|value| value.max(0.0))?;
             let memory_bytes = fields.next()?.parse::<u64>().ok()?.saturating_mul(1024);
             let command = fields.collect::<Vec<_>>().join(" ");
             if command.is_empty() {
@@ -327,7 +339,7 @@ fn parse_u64(kv: &BTreeMap<String, String>, key: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{remote_ports_from_probe, remote_processes_from_ps};
+    use super::{remote_ports_from_probe, remote_processes_from_ps, remote_snapshot_from_kv};
 
     #[test]
     fn parses_remote_process_rows_and_rss_bytes() {
@@ -361,6 +373,19 @@ mod tests {
         let processes = remote_processes_from_ps("PID USER CPU RSS COMMAND\n9 root bad 64 init\n");
 
         assert!(processes.is_empty());
+    }
+
+    #[test]
+    fn clamps_remote_resource_values_to_valid_ranges() {
+        let snapshot = remote_snapshot_from_kv(
+            "CPU_PERCENT=250\nMEM_TOTAL=100\nMEM_USED=150\nSWAP_TOTAL=0\nSWAP_USED=10\nNET_RX=12\nNET_TX=34\nDISK=/\t3145728\t2097152\n",
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.cpu_percent, 1.0);
+        assert_eq!(snapshot.mem_percent, 1.0);
+        assert_eq!(snapshot.swap_percent, 0.0);
+        assert_eq!(snapshot.disks[0].available_bytes, 2097152);
     }
 
     #[test]

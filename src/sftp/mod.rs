@@ -775,12 +775,7 @@ async fn emit_entries(
 async fn connect_and_authenticate(
     session: &Session,
 ) -> Result<Arc<russh::client::Handle<SftpClientHandler>>> {
-    let config = Arc::new(client::Config {
-        inactivity_timeout: None,
-        keepalive_interval: Some(std::time::Duration::from_secs(5)),
-        keepalive_max: 3,
-        ..Default::default()
-    });
+    let config = Arc::new(crate::session::config::ssh_client_config());
     let addr = format!("{}:{}", session.host, session.port);
     let stream = crate::session::config::connect_proxy(session).await?;
     let mut handle = client::connect_stream(config, stream, SftpClientHandler)

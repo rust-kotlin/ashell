@@ -487,12 +487,7 @@ async fn connect_and_authenticate(
     session: &Session,
     events: &GuardedBackendEventSender,
 ) -> Result<russh::client::Handle<ClientHandler>> {
-    let config = Arc::new(client::Config {
-        inactivity_timeout: None,
-        keepalive_interval: Some(std::time::Duration::from_secs(5)),
-        keepalive_max: 3,
-        ..Default::default()
-    });
+    let config = Arc::new(crate::session::config::ssh_client_config());
     let addr = format!("{}:{}", session.host, session.port);
     tracing::info!(
         "[ssh] initiating tcp connection to {} (user: {})",
@@ -795,10 +790,12 @@ fn key_source_label(session: &Session) -> String {
 
 const REMOTE_SYSTEM_PROBE: &str = r#"sh -lc '
 os=$(uname -s 2>/dev/null || echo unknown)
+LC_ALL=C
+export LC_ALL
 
 if [ "$os" = "Linux" ] && [ -r /proc/stat ]; then
-  cpu_stat() { awk '"'"'/^cpu / { print ($2+$3+$4+$5+$6+$7+$8), $5 }'"'"' /proc/stat 2>/dev/null; }
-  net_stat() { awk -F"[: ]+" '"'"'/:/ && $1!="Inter" && $1!="face" { rx += $3; tx += $11 } END { print rx+0, tx+0 }'"'"' /proc/net/dev 2>/dev/null; }
+  cpu_stat() { awk '"'"'/^cpu / { total = ($2+$3+$4+$5+$6+$7+$8); printf "%.0f %.0f\n", total, $5 }'"'"' /proc/stat 2>/dev/null; }
+  net_stat() { awk -F"[: ]+" '"'"'/:/ && $1!="Inter" && $1!="face" { rx += $3; tx += $11 } END { printf "%.0f %.0f\n", rx+0, tx+0 }'"'"' /proc/net/dev 2>/dev/null; }
 
   read cpu_total_1 cpu_idle_1 <<EOF
 $(cpu_stat)
@@ -814,22 +811,62 @@ EOF
 $(net_stat)
 EOF
 
+  cpu_total_1=${cpu_total_1:-0}
+  cpu_idle_1=${cpu_idle_1:-0}
+  cpu_total_2=${cpu_total_2:-0}
+  cpu_idle_2=${cpu_idle_2:-0}
+  net_rx_1=${net_rx_1:-0}
+  net_tx_1=${net_tx_1:-0}
+  net_rx_2=${net_rx_2:-0}
+  net_tx_2=${net_tx_2:-0}
   cpu_delta=$((cpu_total_2 - cpu_total_1))
   idle_delta=$((cpu_idle_2 - cpu_idle_1))
-  cpu_percent=$(awk -v total="$cpu_delta" -v idle="$idle_delta" '"'"'BEGIN { if (total <= 0) print "0.00"; else printf "%.2f", ((total-idle)/total)*100 }'"'"')
-  mem_total=$(awk '"'"'/^MemTotal:/ {print $2 * 1024}'"'"' /proc/meminfo 2>/dev/null)
-  mem_available=$(awk '"'"'/^MemAvailable:/ {print $2 * 1024}'"'"' /proc/meminfo 2>/dev/null)
-  swap_total=$(awk '"'"'/^SwapTotal:/ {print $2 * 1024}'"'"' /proc/meminfo 2>/dev/null)
-  swap_free=$(awk '"'"'/^SwapFree:/ {print $2 * 1024}'"'"' /proc/meminfo 2>/dev/null)
 
+  # metrics normalization
+  cpu_percent=$(awk -v total="$cpu_delta" -v idle="$idle_delta" '"'"'BEGIN {
+    if (total <= 0) {
+      print "0.00"
+    } else {
+      usage = ((total-idle)/total)*100
+      if (usage < 0) usage = 0
+      if (usage > 100) usage = 100
+      printf "%.2f", usage
+    }
+  }'"'"')
+  mem_available=$(awk '"'"'
+    /^MemTotal:/ { total = $2 * 1024 }
+    /^MemAvailable:/ { available = $2 * 1024; has_available = 1 }
+    /^MemFree:/ { free = $2 * 1024 }
+    /^Buffers:/ { buffers = $2 * 1024 }
+    /^Cached:/ { cached = $2 * 1024 }
+    /^SReclaimable:/ { reclaimable = $2 * 1024 }
+    /^Shmem:/ { shmem = $2 * 1024 }
+    END {
+      if (!has_available) available = free + buffers + cached + reclaimable - shmem
+      if (available < 0) available = 0
+      if (total > 0 && available > total) available = total
+      printf "%.0f\n", available
+    }
+  '"'"' /proc/meminfo 2>/dev/null)
+  mem_total=$(awk '"'"'/^MemTotal:/ {printf "%.0f\n", $2 * 1024; exit}'"'"' /proc/meminfo 2>/dev/null)
+  swap_total=$(awk '"'"'/^SwapTotal:/ {printf "%.0f\n", $2 * 1024; exit}'"'"' /proc/meminfo 2>/dev/null)
+  swap_free=$(awk '"'"'/^SwapFree:/ {printf "%.0f\n", $2 * 1024; exit}'"'"' /proc/meminfo 2>/dev/null)
+  mem_used=$(( ${mem_total:-0} - ${mem_available:-0} ))
+  [ "$mem_used" -lt 0 ] && mem_used=0
+  swap_used=$(( ${swap_total:-0} - ${swap_free:-0} ))
+  [ "$swap_used" -lt 0 ] && swap_used=0
+  net_rx=$(( ${net_rx_2:-0} - ${net_rx_1:-0} ))
+  [ "$net_rx" -lt 0 ] && net_rx=0
+  net_tx=$(( ${net_tx_2:-0} - ${net_tx_1:-0} ))
+  [ "$net_tx" -lt 0 ] && net_tx=0
   echo "CPU_PERCENT=${cpu_percent:-0.00}"
   echo "MEM_TOTAL=${mem_total:-0}"
-  echo "MEM_USED=$(( ${mem_total:-0} - ${mem_available:-0} ))"
+  echo "MEM_USED=$mem_used"
   echo "SWAP_TOTAL=${swap_total:-0}"
-  echo "SWAP_USED=$(( ${swap_total:-0} - ${swap_free:-0} ))"
-  echo "NET_RX=$(( ${net_rx_2:-0} - ${net_rx_1:-0} ))"
-  echo "NET_TX=$(( ${net_tx_2:-0} - ${net_tx_1:-0} ))"
-  df -kP 2>/dev/null | awk "NR > 1 && \$1 !~ /^(tmpfs|devtmpfs|ramfs|overlay|aufs)\$/ { printf \"DISK=%s\t%s\t%s\n\", \$6, \$4 * 1024, \$2 * 1024 }" | head -n 6
+  echo "SWAP_USED=$swap_used"
+  echo "NET_RX=$net_rx"
+  echo "NET_TX=$net_tx"
+  LC_ALL=C df -kP 2>/dev/null | awk "NR > 1 && \$1 !~ /^(tmpfs|devtmpfs|ramfs|overlay|aufs)\$/ { printf \"DISK=%s\t%.0f\t%.0f\n\", \$6, \$4 * 1024, \$2 * 1024 }" | head -n 6
   exit 0
 fi
 
@@ -878,6 +915,8 @@ exit 2
 
 const REMOTE_PROCESS_PROBE: &str = r#"sh -lc '
 os=$(uname -s 2>/dev/null || echo unknown)
+LC_ALL=C
+export LC_ALL
 
 if [ "$os" = "Linux" ] && [ -r /proc/stat ]; then
   before=$(mktemp "${TMPDIR:-/tmp}/ashell-process-before.XXXXXX") || exit 1
@@ -958,7 +997,10 @@ exit 2
 '"#;
 
 const REMOTE_PORT_PROBE: &str = r#"sh -lc '
+LC_ALL=C
+export LC_ALL
 if command -v lsof >/dev/null 2>&1; then
+  lsof_output=$(
   lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk '"'"'
     NR > 1 && $2 ~ /^[0-9]+$/ {
       endpoint = $9;
@@ -986,11 +1028,15 @@ if command -v lsof >/dev/null 2>&1; then
       printf "PORT\tUDP\t%s\t%s\tUNCONN\t%s\t%s\n", address, port, $2, $1;
     }
   '"'"'
-  exit 0
+  )
+  if [ -n "$lsof_output" ]; then
+    printf "%s\n" "$lsof_output"
+    exit 0
+  fi
 fi
 
 if command -v ss >/dev/null 2>&1; then
-  ss -H -lntup 2>/dev/null | awk '"'"'
+  ss_output=$(ss -lntup 2>/dev/null | awk '"'"'
     NF >= 5 {
       protocol = $1;
       state = $2;
@@ -1017,7 +1063,11 @@ if command -v ss >/dev/null 2>&1; then
       printf "PORT\t%s\t%s\t%s\t%s\t%s\t%s\n", protocol, address, port, state, pid, process;
     }
   '"'"'
-  exit 0
+  )
+  if [ -n "$ss_output" ]; then
+    printf "%s\n" "$ss_output"
+    exit 0
+  fi
 fi
 
 if command -v netstat >/dev/null 2>&1; then

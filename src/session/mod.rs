@@ -709,7 +709,7 @@ impl Ashell {
         }
 
         if !is_editing {
-            self.open_ssh_session(session, cx);
+            self.open_ssh_session(session, window, cx);
         }
         self.editing_session_id = None;
         self.active_dialog = None;
@@ -909,7 +909,7 @@ impl Ashell {
     }
 
     pub(crate) fn change_ui_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
-        self.ui_font_size = (self.ui_font_size + delta).clamp(8.0, 24.0);
+        self.ui_font_size = (self.ui_font_size + delta).clamp(10.0, 28.0);
         self.config.set_ui_font_size(self.ui_font_size);
         self.save_preferences_background();
         Theme::global_mut(cx).font_size = px(self.ui_font_size);
@@ -1109,7 +1109,12 @@ impl Ashell {
         cx.notify();
     }
 
-    pub(crate) fn connect_saved_session(&mut self, session_id: String, cx: &mut Context<Self>) {
+    pub(crate) fn connect_saved_session(
+        &mut self,
+        session_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         tracing::info!(
             "[ui] user clicked to connect saved session '{}'",
             session_id
@@ -1122,7 +1127,7 @@ impl Ashell {
         if session.protocol == "serial" {
             self.open_serial_session(session, cx);
         } else {
-            self.open_ssh_session(session, cx);
+            self.open_ssh_session(session, window, cx);
         }
     }
 
@@ -1182,7 +1187,7 @@ impl Ashell {
                 self.open_new_ssh_dialog(window, cx);
             }
             SelectorEntry::Saved(session_id) => {
-                self.connect_saved_session(session_id, cx);
+                self.connect_saved_session(session_id, window, cx);
                 window.close_dialog(cx);
             }
         }
@@ -1216,7 +1221,12 @@ impl Ashell {
         }
     }
 
-    pub(crate) fn open_ssh_session(&mut self, session: Session, cx: &mut Context<Self>) {
+    pub(crate) fn open_ssh_session(
+        &mut self,
+        session: Session,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let previous_active_tab = self.active_tab.clone();
         tracing::info!(
             "[session] opening ssh tab for session '{}' ({}@{})",
@@ -1259,7 +1269,7 @@ impl Ashell {
             sftp_tab_id: Some(id.clone()),
         });
         self.active_group = Some(group_id.clone());
-        self.tabs_scroll_handle.scroll_to_item(self.tabs.len() - 1);
+        self.ensure_tab_visible(self.tab_groups.len() - 1, window, cx);
         if let Some(session_id) = self.active_session_id() {
             if let Some(index) = self
                 .config

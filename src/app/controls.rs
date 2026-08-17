@@ -2,8 +2,8 @@ use std::{rc::Rc, time::Duration};
 
 use gpui::{
     App, ClipboardItem, ElementId, InteractiveElement as _, IntoElement, MouseButton,
-    ParentElement as _, RenderOnce, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Window, div, prelude::FluentBuilder as _, px,
+    ParentElement as _, Rems, RenderOnce, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Window, div, prelude::FluentBuilder as _, px, rems,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Size,
@@ -12,8 +12,16 @@ use gpui_component::{
     switch::Switch,
 };
 
+/// Shared application button size, matching the SSH file panel header controls.
+pub(crate) const APP_BUTTON_SIZE: Size = Size::Small;
+
 pub(crate) fn pointer_button(id: impl Into<ElementId>) -> Button {
-    Button::new(id).cursor_pointer()
+    Button::new(id).with_size(APP_BUTTON_SIZE).cursor_pointer()
+}
+
+/// Keep intentionally compact text readable when a view uses relative sizes.
+pub(crate) fn ui_rems(size: f32) -> Rems {
+    rems(size.max(0.85))
 }
 
 pub(crate) fn pointer_checkbox(id: impl Into<ElementId>) -> Checkbox {
@@ -106,7 +114,7 @@ impl RenderOnce for PointerSelectionCheckbox {
 
         div()
             .id(self.id)
-            .size(px(14.))
+            .size(px(16.))
             .flex_none()
             .flex()
             .items_center()
@@ -140,7 +148,7 @@ impl RenderOnce for PointerSelectionCheckbox {
                 |this, icon| {
                     this.child(
                         Icon::new(icon)
-                            .with_size(Size::XSmall)
+                            .with_size(Size::Small)
                             .text_color(icon_color),
                     )
                 },
@@ -191,7 +199,7 @@ impl RenderOnce for PointerClipboard {
                 IconName::Copy
             })
             .ghost()
-            .xsmall()
+            .small()
             .when_some(self.tooltip, |this, tooltip| this.tooltip(tooltip))
             .when(!copied, |this| {
                 let state = state.clone();

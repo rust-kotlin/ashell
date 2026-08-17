@@ -9,7 +9,7 @@ use gpui::{
     Anchor, AppContext as _, Context, DismissEvent, ElementId, Empty, Focusable as _, FontWeight,
     Hsla, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _,
     PathBuilder, Pixels, Render, StatefulInteractiveElement as _, Styled as _, Window, canvas, div,
-    hsla, point, prelude::FluentBuilder as _, px, relative, rems, uniform_list,
+    hsla, point, prelude::FluentBuilder as _, px, relative, uniform_list,
 };
 use gpui_component::{
     ActiveTheme, Disableable as _, ElementExt, Icon, IconName, InteractiveElementExt as _, Root,
@@ -33,7 +33,7 @@ use crate::{
         constants::{SIDEBAR_WIDTH, TERMINAL_KEY_CONTEXT, TERMINAL_SCROLLBAR_GUTTER},
         controls::{
             PointerClipboard, PointerSelectionCheckbox, SelectionState, pointer_button,
-            pointer_checkbox,
+            pointer_checkbox, ui_rems,
         },
     },
     sftp::format_mtime,
@@ -117,6 +117,7 @@ fn compact_menu_width(labels: &[&str]) -> Pixels {
 }
 
 const TAB_SCROLL_ANIMATION_DURATION: Duration = Duration::from_millis(180);
+const TAB_SCROLL_LAYOUT_RETRY_FRAMES: u8 = 3;
 
 impl Ashell {
     fn tab_scroll_target_x(&self, index: usize) -> Option<Pixels> {
@@ -183,11 +184,47 @@ impl Ashell {
         });
     }
 
-    fn ensure_tab_visible(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn ensure_tab_visible(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.tab_scroll_animation_id = self.tab_scroll_animation_id.wrapping_add(1);
         let animation_id = self.tab_scroll_animation_id;
+        self.ensure_tab_visible_after_layout(
+            index,
+            animation_id,
+            TAB_SCROLL_LAYOUT_RETRY_FRAMES,
+            window,
+            cx,
+        );
+    }
+
+    fn ensure_tab_visible_after_layout(
+        &mut self,
+        index: usize,
+        animation_id: u64,
+        retries_remaining: u8,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         cx.on_next_frame(window, move |this, window, cx| {
+            if this.tab_scroll_animation_id != animation_id {
+                return;
+            }
+
             let Some(target_x) = this.tab_scroll_target_x(index) else {
+                if retries_remaining > 0 {
+                    cx.notify();
+                    this.ensure_tab_visible_after_layout(
+                        index,
+                        animation_id,
+                        retries_remaining - 1,
+                        window,
+                        cx,
+                    );
+                }
                 return;
             };
             let start_x = this.tabs_scroll_handle.offset().x;
@@ -261,13 +298,13 @@ impl Ashell {
             )
             .child(
                 div()
-                    .text_size(rems(1.5))
+                    .text_size(ui_rems(1.5))
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("Ashell"),
             )
             .child(
                 div()
-                    .text_size(rems(1.083))
+                    .text_size(ui_rems(1.083))
                     .text_color(cx.theme().muted_foreground)
                     .child(t!("open_local_or_ssh")),
             )
@@ -347,7 +384,6 @@ impl Ashell {
     ) -> impl IntoElement {
         pointer_button(id)
             .ghost()
-            .small()
             .icon(IconName::ChevronsUpDown)
             .label(t!("transfers").to_string())
             .tooltip(t!("transfers").to_string())
@@ -379,7 +415,6 @@ impl Ashell {
             .trigger(
                 pointer_button(trigger_id)
                     .ghost()
-                    .small()
                     .icon(IconName::Menu)
                     .label(t!("command_history_short").to_string())
                     .tooltip(t!("command_history").to_string()),
@@ -405,7 +440,6 @@ impl Ashell {
             this.child(
                 pointer_button(id)
                     .ghost()
-                    .small()
                     .icon(IconName::Globe)
                     .label(encoding.label())
                     .tooltip(t!("terminal_encoding").to_string())
@@ -463,8 +497,8 @@ impl Ashell {
             .child(
                 pointer_button("sftp-minimize-toggle")
                     .ghost()
-                    .small()
                     .icon(IconName::ChevronUp)
+                    .label(t!("panel_expand_short").to_string())
                     .tooltip(t!("panel_expand").to_string())
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_sftp_minimized(window, cx);
@@ -508,7 +542,6 @@ impl Ashell {
                 this.child(
                     pointer_button("sftp-header-more")
                         .ghost()
-                        .small()
                         .icon(IconName::Ellipsis)
                         .label(t!("sftp_more_actions_short").to_string())
                         .tooltip(t!("sftp_more_actions").to_string())
@@ -558,8 +591,8 @@ impl Ashell {
             .child(
                 pointer_button("sftp-minimize-toggle-header")
                     .ghost()
-                    .small()
                     .icon(IconName::ChevronDown)
+                    .label(t!("panel_minimize_short").to_string())
                     .tooltip(t!("panel_minimize").to_string())
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_sftp_minimized(window, cx);
@@ -587,7 +620,7 @@ impl Ashell {
                                 .p_3()
                                 .child(
                                     div()
-                                        .text_size(rems(1.0))
+                                        .text_size(ui_rems(1.0))
                                         .text_color(cx.theme().muted_foreground)
                                         .child(t!("open_ssh_tab_sftp")),
                                 ),
@@ -717,7 +750,7 @@ impl Ashell {
                                     .flex_1()
                                     .min_w(px(0.))
                                     .truncate()
-                                    .text_size(rems(0.917))
+                                    .text_size(ui_rems(0.917))
                                     .text_color(cx.theme().muted_foreground)
                                     .child(t!("name")),
                             ),
@@ -734,7 +767,7 @@ impl Ashell {
                                 .size_full()
                                 .items_center()
                                 .px_2()
-                                .text_size(rems(0.917))
+                                .text_size(ui_rems(0.917))
                                 .text_color(cx.theme().muted_foreground)
                                 .child(t!("size")),
                         ),
@@ -751,7 +784,7 @@ impl Ashell {
                                 .size_full()
                                 .items_center()
                                 .px_2()
-                                .text_size(rems(0.917))
+                                .text_size(ui_rems(0.917))
                                 .text_color(cx.theme().muted_foreground)
                                 .child(t!("modified")),
                         ),
@@ -797,7 +830,7 @@ impl Ashell {
                         .child(
                             pointer_button("sftp-up")
                                 .ghost()
-                                .small()
+
                                 .icon(IconName::ChevronUp)
                                 .tooltip(t!("parent_directory").to_string())
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -813,7 +846,7 @@ impl Ashell {
                         .child(
                             pointer_button("sftp-sync-cwd")
                                 .ghost()
-                                .small()
+
                                 .icon(IconName::Replace)
                                 .label(t!("sync_cwd").to_string())
                                 .tooltip(t!("sync_cwd_tooltip").to_string())
@@ -824,7 +857,7 @@ impl Ashell {
                         .child(
                             pointer_button("sftp-refresh")
                                 .ghost()
-                                .small()
+
                                 .icon(IconName::Redo)
                                 .label(t!("refresh").to_string())
                                 .tooltip(t!("refresh").to_string())
@@ -833,7 +866,7 @@ impl Ashell {
                         .child(
                             pointer_button("sftp-create-upload")
                                 .ghost()
-                                .small()
+
                                 .icon(IconName::Plus)
                                 .label(t!("add").to_string())
                                 .tooltip(t!("create_or_upload").to_string())
@@ -923,7 +956,7 @@ impl Ashell {
                                                 .border_b_1()
                                                 .border_color(cx.theme().border)
                                                 .bg(cx.theme().muted.opacity(0.8))
-                                                .text_size(rems(0.917))
+                                                .text_size(ui_rems(0.917))
                                                 .text_color(cx.theme().muted_foreground)
                                                 .child(t!("directories")),
                                         )
@@ -1003,7 +1036,7 @@ impl Ashell {
                                                                                             ix,
                                                                                         ))
                                                                                         .ghost()
-                                                                                        .xsmall()
+                                                                                        .small()
                                                                                         .icon(if row.expanded {
                                                                                             IconName::ChevronDown
                                                                                         } else {
@@ -1083,7 +1116,7 @@ impl Ashell {
                                                                                             .min_w(px(0.))
                                                                                             .truncate()
                                                                                             .text_size(
-                                                                                                rems(0.917),
+                                                                                                ui_rems(0.917),
                                                                                             )
                                                                                             .child(row.label),
                                                                                     )
@@ -1147,7 +1180,7 @@ impl Ashell {
                                                     .child(
                                                         pointer_button("cancel-sftp-new-folder")
                                                             .ghost()
-                                                            .xsmall()
+                                                            .small()
                                                             .icon(IconName::Close)
                                                             .tooltip(t!("cancel").to_string())
                                                             .on_click(cx.listener(
@@ -1279,7 +1312,7 @@ impl Ashell {
                                                         .flex_1()
                                                         .min_w(px(0.))
                                                         .truncate()
-                                                        .text_size(rems(0.917))
+                                                        .text_size(ui_rems(0.917))
                                                         .text_color(cx.theme().muted_foreground)
                                                         .child(
                                                             t!(
@@ -1292,7 +1325,7 @@ impl Ashell {
                                                 .child(
                                                     pointer_button("sftp-download-selected")
                                                         .ghost()
-                                                        .xsmall()
+                                                        .small()
                                                         .icon(IconName::ArrowDown)
                                                         .tooltip(
                                                             t!(
@@ -1312,7 +1345,7 @@ impl Ashell {
                                                 .child(
                                                     pointer_button("sftp-delete-selected")
                                                         .danger()
-                                                        .xsmall()
+                                                        .small()
                                                         .icon(IconName::Delete)
                                                         .tooltip(t!("delete_selected").to_string())
                                                         .on_click(cx.listener(
@@ -1609,7 +1642,7 @@ impl Ashell {
                                                                                                         }
                                                                                                     })
                                                                                                     .text_size(
-                                                                                                        rems(1.0),
+                                                                                                        ui_rems(1.0),
                                                                                                     )
                                                                                                     .text_color(
                                                                                                         name_color,
@@ -1633,7 +1666,7 @@ impl Ashell {
                                                                                             .items_center()
                                                                                             .px_2()
                                                                                             .text_size(
-                                                                                                rems(0.917),
+                                                                                                ui_rems(0.917),
                                                                                             )
                                                                                             .text_color(
                                                                                                 theme
@@ -1668,7 +1701,7 @@ impl Ashell {
                                                                                             .items_center()
                                                                                             .px_2()
                                                                                             .text_size(
-                                                                                                rems(0.917),
+                                                                                                ui_rems(0.917),
                                                                                             )
                                                                                             .text_color(
                                                                                                 theme
@@ -1716,7 +1749,7 @@ impl Ashell {
                                                             .items_center()
                                                             .justify_center()
                                                             .px_4()
-                                                            .text_size(rems(0.917))
+                                                            .text_size(ui_rems(0.917))
                                                             .text_color(
                                                                 cx.theme().muted_foreground,
                                                             )
@@ -1884,7 +1917,7 @@ impl Ashell {
                     .items_center()
                     .child(
                         div()
-                            .text_size(rems(0.833))
+                            .text_size(ui_rems(0.833))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(cpu_color)
                             .child(t!("cpu").to_string()),
@@ -1892,7 +1925,7 @@ impl Ashell {
                     .child(div().flex_1())
                     .child(
                         div()
-                            .text_size(rems(0.833))
+                            .text_size(ui_rems(0.833))
                             .text_color(muted_fg)
                             .child(format!("{:.0}%", cpu_pct * 100.0)),
                     ),
@@ -1960,7 +1993,7 @@ impl Ashell {
                     .items_center()
                     .child(
                         div()
-                            .text_size(rems(0.833))
+                            .text_size(ui_rems(0.833))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(mem_color)
                             .child(t!("mem").to_string()),
@@ -1968,7 +2001,7 @@ impl Ashell {
                     .child(div().flex_1())
                     .child(
                         div()
-                            .text_size(rems(0.833))
+                            .text_size(ui_rems(0.833))
                             .text_color(muted_fg)
                             .child(format!("{:.0}%", mem_pct * 100.0)),
                     ),
@@ -1987,7 +2020,7 @@ impl Ashell {
                     )
                     .child(
                         div()
-                            .text_size(rems(0.7))
+                            .text_size(ui_rems(0.7))
                             .text_color(muted_fg)
                             .child(mem_detail),
                     ),
@@ -2007,7 +2040,7 @@ impl Ashell {
                         )
                         .child(
                             div()
-                                .text_size(rems(0.7))
+                                .text_size(ui_rems(0.7))
                                 .text_color(muted_fg)
                                 .child(swap_detail),
                         ),
@@ -2042,7 +2075,7 @@ impl Ashell {
                             .items_center()
                             .child(
                                 div()
-                                    .text_size(rems(0.833))
+                                    .text_size(ui_rems(0.833))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(net_color)
                                     .child(t!("net").to_string()),
@@ -2053,13 +2086,13 @@ impl Ashell {
                                     .gap_1()
                                     .child(
                                         div()
-                                            .text_size(rems(0.75))
+                                            .text_size(ui_rems(0.75))
                                             .text_color(net_color)
                                             .child(format!("↓{}", net_rx)),
                                     )
                                     .child(
                                         div()
-                                            .text_size(rems(0.75))
+                                            .text_size(ui_rems(0.75))
                                             .text_color(net_tx_color)
                                             .child(format!("↑{}", net_tx)),
                                     ),
@@ -2149,7 +2182,7 @@ impl Ashell {
                             .items_center()
                             .child(
                                 div()
-                                    .text_size(rems(0.833))
+                                    .text_size(ui_rems(0.833))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(disk_color)
                                     .child(t!("disk").to_string()),
@@ -2157,7 +2190,7 @@ impl Ashell {
                             .child(div().flex_1())
                             .child(
                                 div()
-                                    .text_size(rems(0.833))
+                                    .text_size(ui_rems(0.833))
                                     .text_color(muted_fg)
                                     .child(format!("{:.0}%", disk_pct)),
                             ),
@@ -2189,7 +2222,7 @@ impl Ashell {
                                             .gap_1()
                                             .child(
                                                 div()
-                                                    .text_size(rems(0.667))
+                                                    .text_size(ui_rems(0.667))
                                                     .text_color(muted_fg)
                                                     .child(mount_short),
                                             )
@@ -2202,7 +2235,7 @@ impl Ashell {
                                             )
                                             .child(
                                                 div()
-                                                    .text_size(rems(0.667))
+                                                    .text_size(ui_rems(0.667))
                                                     .text_color(muted_fg)
                                                     .child(format!("{:.0}%", pct)),
                                             )
@@ -2303,7 +2336,7 @@ impl Ashell {
                                 div()
                                     .min_w(px(0.))
                                     .truncate()
-                                    .text_size(rems(0.8))
+                                    .text_size(ui_rems(0.8))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(monitor_title),
                             )
@@ -2311,7 +2344,7 @@ impl Ashell {
                                 div()
                                     .min_w(px(0.))
                                     .truncate()
-                                    .text_size(rems(0.7))
+                                    .text_size(ui_rems(0.7))
                                     .text_color(muted_fg)
                                     .child(monitor_detail),
                             ),
@@ -2319,7 +2352,7 @@ impl Ashell {
                     .child(
                         div()
                             .flex_none()
-                            .text_size(rems(0.7))
+                            .text_size(ui_rems(0.7))
                             .text_color(muted_fg)
                             .child(t!("system_info")),
                     ),
@@ -2348,13 +2381,13 @@ impl Ashell {
                             .justify_between()
                             .child(
                                 div()
-                                    .text_size(rems(0.85))
+                                    .text_size(ui_rems(0.85))
                                     .text_color(cpu_color)
                                     .child(t!("cpu").to_string()),
                             )
                             .child(
                                 div()
-                                    .text_size(rems(0.85))
+                                    .text_size(ui_rems(0.85))
                                     .text_color(muted_fg)
                                     .child(format!("{:.1}%", cpu_pct * 100.0)),
                             ),
@@ -2391,13 +2424,13 @@ impl Ashell {
                             .justify_between()
                             .child(
                                 div()
-                                    .text_size(rems(0.85))
+                                    .text_size(ui_rems(0.85))
                                     .text_color(mem_color)
                                     .child(t!("mem").to_string()),
                             )
                             .child(
                                 div()
-                                    .text_size(rems(0.85))
+                                    .text_size(ui_rems(0.85))
                                     .text_color(muted_fg)
                                     .child(self.system.mem_detail.clone()),
                             ),
@@ -2418,13 +2451,13 @@ impl Ashell {
                             .justify_between()
                             .child(
                                 div()
-                                    .text_size(rems(0.85))
+                                    .text_size(ui_rems(0.85))
                                     .text_color(swap_color)
                                     .child(t!("swap").to_string()),
                             )
                             .child(
                                 div()
-                                    .text_size(rems(0.85))
+                                    .text_size(ui_rems(0.85))
                                     .text_color(muted_fg)
                                     .child(self.system.swap_detail.clone()),
                             ),
@@ -2446,14 +2479,14 @@ impl Ashell {
                             .items_center()
                             .child(
                                 div()
-                                    .text_size(rems(0.85))
+                                    .text_size(ui_rems(0.85))
                                     .text_color(disk_color)
                                     .child(t!("disk").to_string()),
                             )
                             .children(if self.system.disks.len() > 3 {
                                 Some(
                                     div()
-                                        .text_size(rems(0.65))
+                                        .text_size(ui_rems(0.65))
                                         .text_color(muted_fg)
                                         .child(t!("scroll").to_string()),
                                 )
@@ -2489,13 +2522,13 @@ impl Ashell {
                                                     .justify_between()
                                                     .child(
                                                         div()
-                                                            .text_size(rems(0.75))
+                                                            .text_size(ui_rems(0.75))
                                                             .text_color(muted_fg)
                                                             .child(mount_short),
                                                     )
                                                     .child(
                                                         div()
-                                                            .text_size(rems(0.75))
+                                                            .text_size(ui_rems(0.75))
                                                             .text_color(muted_fg)
                                                             .child(format!("{:.1}%", pct)),
                                                     ),
@@ -2543,13 +2576,13 @@ impl Ashell {
                             .justify_between()
                             .child(
                                 div()
-                                    .text_size(rems(0.85))
+                                    .text_size(ui_rems(0.85))
                                     .text_color(net_color)
                                     .child(t!("net").to_string()),
                             )
                             .child(
                                 div()
-                                    .text_size(rems(0.85))
+                                    .text_size(ui_rems(0.85))
                                     .text_color(muted_fg)
                                     .child(t!("live")),
                             ),
@@ -2565,13 +2598,13 @@ impl Ashell {
                                     .child(
                                         div()
                                             .flex_none()
-                                            .text_size(rems(0.75))
+                                            .text_size(ui_rems(0.75))
                                             .text_color(net_color)
                                             .child("↓"),
                                     )
                                     .child(
                                         div()
-                                            .text_size(rems(0.75))
+                                            .text_size(ui_rems(0.75))
                                             .child(self.system.net_rx.clone()),
                                     ),
                             )
@@ -2583,13 +2616,13 @@ impl Ashell {
                                     .child(
                                         div()
                                             .flex_none()
-                                            .text_size(rems(0.75))
+                                            .text_size(ui_rems(0.75))
                                             .text_color(cx.theme().chart_5)
                                             .child("↑"),
                                     )
                                     .child(
                                         div()
-                                            .text_size(rems(0.75))
+                                            .text_size(ui_rems(0.75))
                                             .child(self.system.net_tx.clone()),
                                     ),
                             ),
@@ -2655,7 +2688,7 @@ impl Ashell {
                         div()
                             .flex_1()
                             .min_w(px(0.))
-                            .text_size(rems(0.75))
+                            .text_size(ui_rems(0.75))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(cx.theme().muted_foreground)
                             .child(t!("process").to_string()),
@@ -2664,7 +2697,7 @@ impl Ashell {
                         div()
                             .w(metric_column_width)
                             .flex_none()
-                            .text_size(rems(0.75))
+                            .text_size(ui_rems(0.75))
                             .text_right()
                             .text_color(cx.theme().muted_foreground)
                             .child(metric_label),
@@ -2682,7 +2715,7 @@ impl Ashell {
                             .child(
                                 pointer_button("refresh-processes")
                                     .ghost()
-                                    .xsmall()
+                                    .small()
                                     .icon(IconName::Redo)
                                     .tooltip(t!("refresh_processes").to_string())
                                     .disabled(self.remote_processes_in_flight)
@@ -2712,7 +2745,7 @@ impl Ashell {
                     .px_2()
                     .py_1()
                     .truncate()
-                    .text_size(rems(0.75))
+                    .text_size(ui_rems(0.75))
                     .text_color(cx.theme().muted_foreground)
                     .child(status)
             }))
@@ -2725,7 +2758,7 @@ impl Ashell {
                     .when(processes.is_empty() && !processes_loading, |this| {
                         this.flex().items_center().justify_center().child(
                             div()
-                                .text_size(rems(0.833))
+                                .text_size(ui_rems(0.833))
                                 .text_color(theme.muted_foreground)
                                 .child(empty_message.clone()),
                         )
@@ -2802,14 +2835,14 @@ impl Ashell {
                                                                             div()
                                                                                 .w_full()
                                                                                 .truncate()
-                                                                                .text_size(rems(0.833))
+                                                                                .text_size(ui_rems(0.833))
                                                                                 .child(command.clone()),
                                                                         )
                                                                         .child(
                                                                             div()
                                                                                 .w_full()
                                                                                 .truncate()
-                                                                                .text_size(rems(0.667))
+                                                                                .text_size(ui_rems(0.667))
                                                                                 .text_color(
                                                                                     row_theme
                                                                                         .muted_foreground,
@@ -2827,7 +2860,7 @@ impl Ashell {
                                                                     .when(expanded, |this| {
                                                                         this.child(
                                                                             div()
-                                                                                .text_size(rems(0.75))
+                                                                                .text_size(ui_rems(0.75))
                                                                                 .text_color(
                                                                                     row_theme
                                                                                         .muted_foreground,
@@ -2843,7 +2876,7 @@ impl Ashell {
                                                                 div()
                                                                     .w(metric_column_width)
                                                                     .flex_none()
-                                                                    .text_size(rems(0.75))
+                                                                    .text_size(ui_rems(0.75))
                                                                     .font_weight(FontWeight::SEMIBOLD)
                                                                     .text_right()
                                                                     .text_color(
@@ -2902,7 +2935,7 @@ impl Ashell {
                                                                         ))
                                                                         .danger()
                                                                         .outline()
-                                                                        .xsmall()
+                                                                        .small()
                                                                         .icon(IconName::Delete)
                                                                         .tooltip(
                                                                             t!("terminate_process")
@@ -2941,7 +2974,7 @@ impl Ashell {
                                                                         .w_full()
                                                                         .min_w(px(0.))
                                                                         .whitespace_normal()
-                                                                        .text_size(rems(0.833))
+                                                                        .text_size(ui_rems(0.833))
                                                                         .child(format!(
                                                                             "{}: {}",
                                                                             t!("process_command"),
@@ -2951,7 +2984,7 @@ impl Ashell {
                                                                 .child(
                                                                     h_flex()
                                                                         .gap_3()
-                                                                        .text_size(rems(0.75))
+                                                                        .text_size(ui_rems(0.75))
                                                                         .text_color(row_theme.muted_foreground)
                                                                         .child(format!(
                                                                             "{}: {}",
@@ -3038,7 +3071,7 @@ impl Ashell {
                     .child(
                         div()
                             .flex_1()
-                            .text_size(rems(0.75))
+                            .text_size(ui_rems(0.75))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme.muted_foreground)
                             .child(t!("network_ports").to_string()),
@@ -3046,7 +3079,7 @@ impl Ashell {
                     .child(
                         pointer_button("refresh-ports")
                             .ghost()
-                            .xsmall()
+                            .small()
                             .icon(IconName::Redo)
                             .tooltip(t!("refresh_ports").to_string())
                             .disabled(loading)
@@ -3070,7 +3103,7 @@ impl Ashell {
                     .items_center()
                     .gap_2()
                     .px_2()
-                    .text_size(rems(0.667))
+                    .text_size(ui_rems(0.667))
                     .text_color(theme.muted_foreground)
                     .child(
                         div()
@@ -3100,7 +3133,7 @@ impl Ashell {
                     .px_2()
                     .py_1()
                     .truncate()
-                    .text_size(rems(0.75))
+                    .text_size(ui_rems(0.75))
                     .text_color(theme.muted_foreground)
                     .child(status)
             }))
@@ -3113,7 +3146,7 @@ impl Ashell {
                     .when(ports.is_empty() && !loading, |this| {
                         this.flex().items_center().justify_center().child(
                             div()
-                                .text_size(rems(0.833))
+                                .text_size(ui_rems(0.833))
                                 .text_color(theme.muted_foreground)
                                 .child(empty_message.clone()),
                         )
@@ -3147,7 +3180,7 @@ impl Ashell {
                                                                 div()
                                                                     .w(px(64.))
                                                                     .flex_none()
-                                                                    .text_size(rems(0.75))
+                                                                    .text_size(ui_rems(0.75))
                                                                     .child(port.protocol.clone()),
                                                             )
                                                             .child(
@@ -3155,14 +3188,14 @@ impl Ashell {
                                                                     .flex_1()
                                                                     .min_w(px(0.))
                                                                     .truncate()
-                                                                    .text_size(rems(0.75))
+                                                                    .text_size(ui_rems(0.75))
                                                                     .child(port.address.clone()),
                                                             )
                                                             .child(
                                                                 div()
                                                                     .w(px(60.))
                                                                     .flex_none()
-                                                                    .text_size(rems(0.75))
+                                                                    .text_size(ui_rems(0.75))
                                                                     .child(port.port.to_string()),
                                                             )
                                                             .child(
@@ -3170,7 +3203,7 @@ impl Ashell {
                                                                     .w(px(82.))
                                                                     .flex_none()
                                                                     .truncate()
-                                                                    .text_size(rems(0.75))
+                                                                    .text_size(ui_rems(0.75))
                                                                     .text_color(
                                                                         theme.muted_foreground,
                                                                     )
@@ -3181,7 +3214,7 @@ impl Ashell {
                                                                     .w(px(150.))
                                                                     .flex_none()
                                                                     .truncate()
-                                                                    .text_size(rems(0.75))
+                                                                    .text_size(ui_rems(0.75))
                                                                     .text_color(
                                                                         theme.muted_foreground,
                                                                     )
@@ -3380,7 +3413,6 @@ impl Ashell {
                                 pointer_checkbox(ElementId::Name(
                                     format!("connection-check-{selection_id}").into(),
                                 ))
-                                .small()
                                 .checked(is_selected)
                                 .tab_stop(false)
                                 .on_click(cx.listener({
@@ -3401,7 +3433,7 @@ impl Ashell {
                             .flex_basis(relative(0.5))
                             .min_w(px(0.))
                             .truncate()
-                            .text_size(rems(0.833))
+                            .text_size(ui_rems(0.833))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(name),
                     )
@@ -3412,7 +3444,7 @@ impl Ashell {
                             .min_w(px(0.))
                             .truncate()
                             .text_right()
-                            .text_size(rems(0.75))
+                            .text_size(ui_rems(0.75))
                             .text_color(cx.theme().muted_foreground)
                             .child(detail),
                     )
@@ -3432,11 +3464,11 @@ impl Ashell {
                             .child(
                                 pointer_button(connect_button_id)
                                     .ghost()
-                                    .xsmall()
+                                    .small()
                                     .icon(IconName::ExternalLink)
                                     .tooltip(t!("connect").to_string())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.connect_saved_session(connect_id.clone(), cx);
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.connect_saved_session(connect_id.clone(), window, cx);
                                     })),
                             ),
                     ),
@@ -3549,14 +3581,14 @@ impl Ashell {
                             .flex_1()
                             .min_w(px(0.))
                             .truncate()
-                            .text_size(rems(0.8))
+                            .text_size(ui_rems(0.8))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(display_name),
                     )
                     .child(
                         div()
                             .flex_none()
-                            .text_size(rems(0.7))
+                            .text_size(ui_rems(0.7))
                             .text_color(cx.theme().muted_foreground)
                             .child(count.to_string()),
                     )
@@ -3574,7 +3606,7 @@ impl Ashell {
                                         format!("connection-group-menu-{group_id}").into(),
                                     ))
                                     .ghost()
-                                    .xsmall()
+                                    .small()
                                     .icon(IconName::Ellipsis)
                                     .tooltip(t!("more").to_string())
                                     .dropdown_menu_with_anchor(Anchor::BottomRight, {
@@ -3701,7 +3733,7 @@ impl Ashell {
                                 div()
                                     .flex_1()
                                     .min_w(px(0.))
-                                    .text_size(rems(0.833))
+                                    .text_size(ui_rems(0.833))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(cx.theme().foreground)
                                     .truncate()
@@ -3710,7 +3742,7 @@ impl Ashell {
                             .child(
                                 pointer_button("import-connections")
                                     .ghost()
-                                    .xsmall()
+                                    .small()
                                     .icon(IconName::ArrowDown)
                                     .label(t!("import_connections").to_string())
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -3720,7 +3752,7 @@ impl Ashell {
                             .child(
                                 pointer_button("export-connections")
                                     .ghost()
-                                    .xsmall()
+                                    .small()
                                     .icon(IconName::ArrowUp)
                                     .label(t!("export_connections").to_string())
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -3730,7 +3762,7 @@ impl Ashell {
                             .child(
                                 pointer_button("open-ssh-panel")
                                     .primary()
-                                    .xsmall()
+                                    .small()
                                     .icon(IconName::Plus)
                                     .label(t!("new_connection_short").to_string())
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -3758,7 +3790,6 @@ impl Ashell {
                                     .justify_center()
                                     .child(
                                         pointer_checkbox("connections-select-all")
-                                            .small()
                                             .checked(all_connections_selected)
                                             .disabled(!has_connections)
                                             .tab_stop(false)
@@ -3777,7 +3808,7 @@ impl Ashell {
                             )
                             .child(
                                 div()
-                                    .text_size(rems(0.75))
+                                    .text_size(ui_rems(0.75))
                                     .text_color(cx.theme().muted_foreground)
                                     .child(format!("{selected_connections}/{total_connections}")),
                             )
@@ -3785,7 +3816,6 @@ impl Ashell {
                             .child(
                                 pointer_button("new-connection-group")
                                     .ghost()
-                                    .small()
                                     .icon(IconName::Plus)
                                     .tooltip(t!("new_connection_group").to_string())
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -3796,7 +3826,6 @@ impl Ashell {
                                 let groups = connection_groups.clone();
                                 pointer_button("move-selected-connections")
                                     .ghost()
-                                    .small()
                                     .icon(IconName::FolderClosed)
                                     .tooltip(t!("move_to_group").to_string())
                                     .disabled(!has_selected_connections)
@@ -3836,7 +3865,6 @@ impl Ashell {
                             .child(
                                 pointer_button("delete-selected-connections")
                                     .danger()
-                                    .small()
                                     .icon(IconName::Delete)
                                     .label(t!("delete_selected_connections").to_string())
                                     .disabled(!has_selected_connections)
@@ -3870,7 +3898,7 @@ impl Ashell {
                                         )
                                         .child(
                                             div()
-                                                .text_size(rems(0.833))
+                                                .text_size(ui_rems(0.833))
                                                 .text_color(cx.theme().muted_foreground)
                                                 .child(empty_connections_message.clone()),
                                         )
@@ -3878,7 +3906,6 @@ impl Ashell {
                                             this.child(
                                                 pointer_button("empty-new-connection")
                                                     .secondary()
-                                                    .small()
                                                     .icon(IconName::Plus)
                                                     .label(t!("new_connection").to_string())
                                                     .on_click(cx.listener(
@@ -4107,7 +4134,6 @@ impl Ashell {
             h_flex().flex_none().child(
                 pointer_button("tabbar-menu")
                     .ghost()
-                    .small()
                     .icon(IconName::ChevronDown)
                     .tooltip(t!("settings_tab_list").to_string())
                     .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, menu_cx| {
@@ -4194,7 +4220,6 @@ impl Ashell {
             .child(
                 pointer_button("sidebar-toggle")
                     .ghost()
-                    .small()
                     .icon(if self.sidebar_collapsed {
                         IconName::PanelLeftOpen
                     } else {
@@ -4276,7 +4301,7 @@ impl Ashell {
                                                 .id(("ashell-tab", ix))
                                                 .relative()
                                                 .flex_none()
-                                                .h(px(30.))
+                                                .h(px(34.))
                                                 .min_w(px(112.))
                                                 .max_w(px(220.))
                                                 .border_b_2()
@@ -4285,7 +4310,7 @@ impl Ashell {
                                                 } else {
                                                     cx.theme().transparent
                                                 })
-                                                .text_size(rems(0.875))
+                                                .text_size(ui_rems(0.875))
                                                 .hover(|this| {
                                                     this.text_color(
                                                         cx.theme().tab_active_foreground,
@@ -4308,7 +4333,7 @@ impl Ashell {
                                                                 .when(output_active, |this| {
                                                                     this.child(
                                                                         Spinner::new()
-                                                                            .xsmall()
+                                                                            .small()
                                                                             .color(
                                                                                 cx.theme().primary,
                                                                             ),
@@ -4346,7 +4371,7 @@ impl Ashell {
                                                         .child(
                                                             pointer_button(("tab-close", ix))
                                                                 .ghost()
-                                                                .xsmall()
+                                                                .small()
                                                                 .icon(IconName::Close)
                                                                 .opacity(if ix == selected {
                                                                     0.8
@@ -4412,7 +4437,6 @@ impl Ashell {
                     .child(
                         pointer_button("open-selector")
                             .ghost()
-                            .small()
                             .icon(IconName::Plus)
                             .tooltip(t!("settings_open_session").to_string())
                             .dropdown_menu_with_anchor(Anchor::BottomRight, {
@@ -4443,7 +4467,6 @@ impl Ashell {
                     .child(
                         pointer_button("split-horizontal")
                             .ghost()
-                            .small()
                             .icon(IconName::PanelBottom)
                             .tooltip(t!("settings_split_pane_down").to_string())
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -4455,7 +4478,6 @@ impl Ashell {
                     .child(
                         pointer_button("split-vertical")
                             .ghost()
-                            .small()
                             .icon(IconName::PanelRight)
                             .tooltip(t!("settings_split_pane_right").to_string())
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -4468,7 +4490,6 @@ impl Ashell {
                     .child(
                         pointer_button("tabbar-settings")
                             .ghost()
-                            .small()
                             .icon(IconName::Settings)
                             .tooltip(t!("settings_open_settings").to_string())
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -4566,7 +4587,7 @@ impl Ashell {
                     .child(
                         pointer_button("close-command-history")
                             .ghost()
-                            .xsmall()
+                            .small()
                             .icon(IconName::Close)
                             .tooltip(t!("close_command_history").to_string())
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -4594,7 +4615,6 @@ impl Ashell {
                             .justify_center()
                             .child(
                                 pointer_checkbox("command-history-select-all")
-                                    .small()
                                     .checked(all_history_selected)
                                     .disabled(!has_visible_history)
                                     .tab_stop(false)
@@ -4612,7 +4632,7 @@ impl Ashell {
                     )
                     .child(
                         div()
-                            .text_size(rems(0.75))
+                            .text_size(ui_rems(0.75))
                             .text_color(theme.muted_foreground)
                             .child(format!("{selected_history}/{total_history}")),
                     )
@@ -4620,7 +4640,6 @@ impl Ashell {
                     .child(
                         pointer_button("delete-selected-command-history")
                             .danger()
-                            .small()
                             .icon(IconName::Delete)
                             .label(t!("delete_selected_connections").to_string())
                             .tooltip(t!("delete_selected_commands").to_string())
@@ -4651,7 +4670,7 @@ impl Ashell {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(rems(0.833))
+                            .text_size(ui_rems(0.833))
                             .text_color(theme.muted_foreground)
                             .child(t!("command_history_empty"))
                             .into_any_element()
@@ -4662,7 +4681,7 @@ impl Ashell {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(rems(0.833))
+                            .text_size(ui_rems(0.833))
                             .text_color(theme.muted_foreground)
                             .child(t!("no_matching_commands"))
                             .into_any_element()
@@ -4744,7 +4763,6 @@ impl Ashell {
                                                         pointer_checkbox(ElementId::Name(
                                                             selection_id.into(),
                                                         ))
-                                                        .small()
                                                         .checked(is_selected)
                                                         .tab_stop(false)
                                                         .on_click(cx.listener({
@@ -4766,7 +4784,7 @@ impl Ashell {
                                                     .flex_1()
                                                     .min_w(px(0.))
                                                     .truncate()
-                                                    .text_size(rems(0.833))
+                                                    .text_size(ui_rems(0.833))
                                                     .text_color(row_theme.foreground)
                                                     .child(command),
                                             )
@@ -4790,7 +4808,7 @@ impl Ashell {
                                                                     execute_id.into(),
                                                                 ))
                                                                 .ghost()
-                                                                .xsmall()
+                                                                .small()
                                                                 .icon(IconName::Play)
                                                                 .tooltip(
                                                                     t!("execute_command")
@@ -4991,7 +5009,7 @@ impl Ashell {
                                 .cursor_pointer()
                                 .child(
                                     div()
-                                        .text_size(rems(0.85))
+                                        .text_size(ui_rems(0.85))
                                         .text_color(cx.theme().danger)
                                         .child(
                                             t!("session_disconnected", "reason" = reason)
@@ -5000,7 +5018,7 @@ impl Ashell {
                                 )
                                 .child(
                                     div()
-                                        .text_size(rems(0.85))
+                                        .text_size(ui_rems(0.85))
                                         .text_color(cx.theme().muted_foreground)
                                         .child(format!("— {}", t!("press_enter_to_reconnect"))),
                                 )
@@ -5655,7 +5673,7 @@ impl Render for Ashell {
                                                             v_flex().gap_2().children(
                                                                 progress.lines.iter().cloned().map(|line| {
                                                                     div()
-                                                                        .text_size(rems(1.0))
+                                                                        .text_size(ui_rems(1.0))
                                                                         .text_color(if progress.failed {
                                                                             cx.theme().danger
                                                                         } else {

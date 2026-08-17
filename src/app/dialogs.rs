@@ -2,7 +2,7 @@ use gpui::{
     Anchor, AppContext as _, Bounds, Context, DragMoveEvent, ElementId, Empty, Entity,
     Focusable as _, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
     ParentElement as _, Pixels, Point, Render, SharedString, Size, StatefulInteractiveElement as _,
-    Styled as _, Window, div, point, prelude::FluentBuilder as _, px, rems, size,
+    Styled as _, Window, div, point, prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, WindowExt as _,
@@ -19,7 +19,7 @@ use rust_i18n::t;
 
 use crate::{
     Ashell,
-    app::controls::{pointer_button, pointer_switch},
+    app::controls::{pointer_button, pointer_switch, ui_rems},
     session::config::AuthMethod,
     system::{RemoteProcess, format_bytes},
     text_encoding::{FILE_ENCODINGS, TERMINAL_ENCODINGS, TextEncoding},
@@ -719,13 +719,13 @@ impl Ashell {
                                                 .gap_1()
                                                 .child(
                                                     div()
-                                                        .text_size(rems(1.0))
+                                                        .text_size(ui_rems(1.0))
                                                         .font_weight(FontWeight::SEMIBOLD)
                                                         .child(t!("local_terminal")),
                                                 )
                                                 .child(
                                                     div()
-                                                        .text_size(rems(0.917))
+                                                        .text_size(ui_rems(0.917))
                                                         .text_color(_cx.theme().muted_foreground)
                                                         .child(t!("open_local_shell_tab")),
                                                 ),
@@ -763,13 +763,13 @@ impl Ashell {
                                                 .gap_1()
                                                 .child(
                                                     div()
-                                                        .text_size(rems(1.0))
+                                                        .text_size(ui_rems(1.0))
                                                         .font_weight(FontWeight::SEMIBOLD)
                                                         .child(t!("new_connection")),
                                                 )
                                                 .child(
                                                     div()
-                                                        .text_size(rems(0.917))
+                                                        .text_size(ui_rems(0.917))
                                                         .text_color(_cx.theme().muted_foreground)
                                                         .child(t!("create_or_edit_ssh_session")),
                                                 ),
@@ -835,6 +835,7 @@ impl Ashell {
                                                                 this.active_dialog = None;
                                                                 this.connect_saved_session(
                                                                     connect_id.clone(),
+                                                                    window,
                                                                     cx,
                                                                 );
                                                                 window.close_dialog(cx);
@@ -847,7 +848,7 @@ impl Ashell {
                                                             .gap_1()
                                                             .child(
                                                                 div()
-                                                                    .text_size(rems(1.0))
+                                                                    .text_size(ui_rems(1.0))
                                                                     .font_weight(
                                                                         FontWeight::SEMIBOLD,
                                                                     )
@@ -855,7 +856,7 @@ impl Ashell {
                                                             )
                                                             .child(
                                                                 div()
-                                                                    .text_size(rems(0.917))
+                                                                    .text_size(ui_rems(0.917))
                                                                     .text_color(
                                                                         _cx.theme()
                                                                             .muted_foreground,
@@ -930,7 +931,6 @@ impl Ashell {
                         let clear_btn = if can_clear {
                             Some(
                                 pointer_button("clear_transfers_btn")
-                                    .small()
                                     .ghost()
                                     .icon(IconName::Delete)
                                     .label(t!("clear_transfers").to_string())
@@ -974,7 +974,6 @@ impl Ashell {
                             .child(
                                 h_flex().gap_2().children(clear_btn).child(
                                     pointer_button("close_dialog")
-                                        .small()
                                         .ghost()
                                         .icon(IconName::Close)
                                         .on_click(window.listener_for(
@@ -1047,7 +1046,6 @@ impl Ashell {
                                             format!("pause-{}", t.info.id),
                                         ))
                                         .ghost()
-                                        .small()
                                         .icon(IconName::Pause)
                                         .on_click(window.listener_for(&view, {
                                             let id = t.info.id.clone();
@@ -1061,7 +1059,6 @@ impl Ashell {
                                             format!("cancel-{}", t.info.id),
                                         ))
                                         .ghost()
-                                        .small()
                                         .icon(IconName::Close)
                                         .on_click(window.listener_for(&view, {
                                             let id = t.info.id.clone();
@@ -1079,7 +1076,6 @@ impl Ashell {
                                             format!("resume-{}", t.info.id),
                                         ))
                                         .ghost()
-                                        .small()
                                         .icon(IconName::Play)
                                         .on_click(window.listener_for(&view, {
                                             let id = t.info.id.clone();
@@ -1093,7 +1089,6 @@ impl Ashell {
                                             format!("cancel-{}", t.info.id),
                                         ))
                                         .ghost()
-                                        .small()
                                         .icon(IconName::Close)
                                         .on_click(window.listener_for(&view, {
                                             let id = t.info.id.clone();
@@ -1111,7 +1106,6 @@ impl Ashell {
                                             format!("remove-{}", t.info.id),
                                         ))
                                         .ghost()
-                                        .small()
                                         .icon(IconName::Close)
                                         .on_click(window.listener_for(&view, {
                                             let id = t.info.id.clone();
@@ -1132,7 +1126,6 @@ impl Ashell {
                                                 format!("folder-{}", t.info.id),
                                             ))
                                             .ghost()
-                                            .small()
                                             .icon(IconName::Folder)
                                             .on_click({
                                                 let target = t.info.target.clone();
@@ -1148,7 +1141,6 @@ impl Ashell {
                                             format!("remove-{}", t.info.id),
                                         ))
                                         .ghost()
-                                        .small()
                                         .icon(IconName::Close)
                                         .on_click(window.listener_for(&view, {
                                             let id = t.info.id.clone();
@@ -1165,7 +1157,6 @@ impl Ashell {
                                             format!("remove-{}", t.info.id),
                                         ))
                                         .ghost()
-                                        .small()
                                         .icon(IconName::Close)
                                         .on_click(window.listener_for(&view, {
                                             let id = t.info.id.clone();
@@ -1181,7 +1172,6 @@ impl Ashell {
                                             format!("remove-{}", t.info.id),
                                         ))
                                         .ghost()
-                                        .small()
                                         .icon(IconName::Close)
                                         .on_click(window.listener_for(&view, {
                                             let id = t.info.id.clone();
@@ -1219,7 +1209,6 @@ impl Ashell {
                                             )))
                                             .icon(icon)
                                             .ghost()
-                                            .small()
                                             .disabled(true),
                                         )
                                         .child(
@@ -1428,7 +1417,7 @@ impl Ashell {
                                     .gap_1()
                                     .children(selected_paths.into_iter().map(|path| {
                                         div()
-                                            .text_size(rems(0.917))
+                                            .text_size(ui_rems(0.917))
                                             .text_color(cx.theme().muted_foreground)
                                             .child(path)
                                     })),
@@ -1448,7 +1437,7 @@ impl Ashell {
                                 .gap_2()
                                 .children(warning_block)
                                 .child(
-                                    div().text_size(rems(1.0)).mb_2().child(
+                                    div().text_size(ui_rems(1.0)).mb_2().child(
                                         t!(
                                             "confirm_delete_desc",
                                             count = view
@@ -1547,7 +1536,7 @@ impl Ashell {
                                         .w_full()
                                         .whitespace_normal()
                                         .line_clamp(3)
-                                        .text_size(rems(0.917))
+                                        .text_size(ui_rems(0.917))
                                         .child(
                                             t!("confirm_terminate_process_desc", pid = pid)
                                                 .to_string(),
@@ -1564,13 +1553,13 @@ impl Ashell {
                                             div()
                                                 .w_full()
                                                 .truncate()
-                                                .text_size(rems(0.833))
+                                                .text_size(ui_rems(0.833))
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .child(process_name.clone()),
                                         )
                                         .child(
                                             div()
-                                                .text_size(rems(0.75))
+                                                .text_size(ui_rems(0.75))
                                                 .text_color(cx.theme().muted_foreground)
                                                 .child(
                                                     t!(
@@ -1687,7 +1676,7 @@ impl Ashell {
                             div()
                                 .w_full()
                                 .whitespace_normal()
-                                .text_size(rems(0.917))
+                                .text_size(ui_rems(0.917))
                                 .child(
                                     t!("reconnect_ssh_desc", name = session_name.as_str())
                                         .to_string(),
@@ -2580,7 +2569,7 @@ impl Ashell {
                                                         )
                                                         .child(
                                                             pointer_button("sftp-editor-close")
-                                                                .xsmall()
+                                                                .small()
                                                                 .ghost()
                                                                 .icon(IconName::Close)
                                                                 .tooltip(t!("cancel").to_string())
@@ -2645,7 +2634,7 @@ impl Ashell {
                                                                 "sftp-editor-encoding",
                                                             )
                                                             .ghost()
-                                                            .small()
+
                                                             .icon(IconName::Globe)
                                                             .label(file_encoding.label())
                                                             .tooltip(
@@ -3262,25 +3251,25 @@ impl Ashell {
                             .py_4()
                             .child(
                                 div()
-                                    .text_size(rems(1.5))
+                                    .text_size(ui_rems(1.5))
                                     .font_weight(FontWeight::BOLD)
                                     .child("Ashell"),
                             )
-                            .child(div().text_size(rems(0.9)).child(format!(
+                            .child(div().text_size(ui_rems(0.9)).child(format!(
                                 "{} {}",
                                 t!("version"),
                                 version
                             )))
                             .child(
                                 div()
-                                    .text_size(rems(0.9))
+                                    .text_size(ui_rems(0.9))
                                     .text_color(cx.theme().muted_foreground)
                                     .text_center()
                                     .child(t!("about_description")),
                             )
                             .child(
                                 div()
-                                    .text_size(rems(0.9))
+                                    .text_size(ui_rems(0.9))
                                     .text_color(cx.theme().muted_foreground)
                                     .text_center()
                                     .child(t!("about_feedback_hint")),
@@ -3483,7 +3472,7 @@ impl Ashell {
                                                                     (state.follow_system_theme, state.theme_mode.is_dark())
                                                                 };
                                                                 pointer_button("theme-mode-dropdown")
-                                                                    .small()
+
                                                                     .icon(if follow_system { IconName::Sun } else if is_dark_mode { IconName::Moon } else { IconName::Sun })
                                                                     .label(if follow_system { t!("follow_system").to_string() } else if is_dark_mode { t!("use_dark_mode").to_string() } else { t!("use_light_mode").to_string() })
                                                                     .dropdown_menu_with_anchor(Anchor::BottomRight, {
@@ -3531,7 +3520,7 @@ impl Ashell {
                                                             move |_, _window, cx| {
                                                                 let current_theme = view.read(cx).light_theme_name.to_string();
                                                                 pointer_button("light-theme-dropdown")
-                                                                    .small()
+
                                                                     .icon(IconName::Sun)
                                                                     .label(current_theme.clone())
                                                                     .dropdown_menu_with_anchor(Anchor::BottomRight, {
@@ -3567,7 +3556,7 @@ impl Ashell {
                                                             move |_, _window, cx| {
                                                                 let current_theme = view.read(cx).dark_theme_name.to_string();
                                                                 pointer_button("dark-theme-dropdown")
-                                                                    .small()
+
                                                                     .icon(IconName::Moon)
                                                                     .label(current_theme.clone())
                                                                     .dropdown_menu_with_anchor(Anchor::BottomRight, {
@@ -3603,7 +3592,7 @@ impl Ashell {
                                                             move |_, _window, cx| {
                                                                 let current_style = view.read(cx).config.title_bar_style();
                                                                 pointer_button("title-bar-style-dropdown")
-                                                                    .small()
+
                                                                     .label(match current_style {
                                                                         crate::session::config::TitleBarStyle::Native => t!("title_bar_native").to_string(),
                                                                         crate::session::config::TitleBarStyle::Integrated => t!("title_bar_integrated").to_string(),
@@ -3652,9 +3641,9 @@ impl Ashell {
                                                                 h_flex()
                                                                     .items_center()
                                                                     .gap_3()
-                                                                    .child(pointer_button("ui-font-size-down").small().label("-").on_click(window.listener_for(&view, |this, _, _, cx| this.change_ui_font_size(-1.0, cx))))
+                                                                    .child(pointer_button("ui-font-size-down").label("-").on_click(window.listener_for(&view, |this, _, _, cx| this.change_ui_font_size(-1.0, cx))))
                                                                     .child(div().min_w(px(64.)).text_center().child(format!("{:.0}px", view.read(cx).ui_font_size)))
-                                                                    .child(pointer_button("ui-font-size-up").small().label("+").on_click(window.listener_for(&view, |this, _, _, cx| this.change_ui_font_size(1.0, cx))))
+                                                                    .child(pointer_button("ui-font-size-up").label("+").on_click(window.listener_for(&view, |this, _, _, cx| this.change_ui_font_size(1.0, cx))))
                                                                     .into_any_element()
                                                             }
                                                         })
@@ -3669,9 +3658,9 @@ impl Ashell {
                                                                 h_flex()
                                                                     .items_center()
                                                                     .gap_3()
-                                                                    .child(pointer_button("terminal-font-size-down").small().label("-").on_click(window.listener_for(&view, |this, _, _, cx| this.change_terminal_font_size(-1.0, cx))))
+                                                                    .child(pointer_button("terminal-font-size-down").label("-").on_click(window.listener_for(&view, |this, _, _, cx| this.change_terminal_font_size(-1.0, cx))))
                                                                     .child(div().min_w(px(64.)).text_center().child(format!("{:.0}px", view.read(cx).terminal_font_size)))
-                                                                    .child(pointer_button("terminal-font-size-up").small().label("+").on_click(window.listener_for(&view, |this, _, _, cx| this.change_terminal_font_size(1.0, cx))))
+                                                                    .child(pointer_button("terminal-font-size-up").label("+").on_click(window.listener_for(&view, |this, _, _, cx| this.change_terminal_font_size(1.0, cx))))
                                                                     .into_any_element()
                                                             }
                                                         })
@@ -3684,7 +3673,7 @@ impl Ashell {
                                                             let view = view_clone_for_general.clone();
                                                             move |_, _window, cx| {
                                                                 pointer_button("ui-font-dropdown")
-                                                                    .small()
+
                                                                     .icon(IconName::ChevronsUpDown)
                                                                     .label({
                                                                         let current = view.read(cx).ui_font_family.to_string();
@@ -3748,7 +3737,7 @@ impl Ashell {
                                                             let view = view_clone_for_general.clone();
                                                             move |_, _window, cx| {
                                                                 pointer_button("terminal-font-dropdown")
-                                                                    .small()
+
                                                                     .icon(IconName::ChevronsUpDown)
                                                                     .label({
                                                                         let current = view.read(cx).terminal_font_family.to_string();
@@ -3803,7 +3792,7 @@ impl Ashell {
                                                             move |_, _window, cx| {
                                                                 let current = view.read(cx).config.local_terminal_encoding();
                                                                 pointer_button("local-terminal-encoding-dropdown")
-                                                                    .small()
+
                                                                     .icon(IconName::Globe)
                                                                     .label(current.label())
                                                                     .dropdown_menu_with_anchor(Anchor::BottomRight, {
@@ -3837,7 +3826,7 @@ impl Ashell {
                                                                 use crate::session::config::CursorStyle;
                                                                 let current = view.read(cx).cursor_style;
                                                                 pointer_button("cursor-style-dropdown")
-                                                                    .small()
+
                                                                     .icon(IconName::ChevronsUpDown)
                                                                     .label(match current {
                                                                         CursorStyle::Default => t!("cursor_style_default").to_string(),
@@ -3891,7 +3880,7 @@ impl Ashell {
                                                             let view = view_clone_for_general.clone();
                                                             move |_, window, cx| {
                                                                 pointer_switch("right-click-copy-paste")
-                                                                    .small()
+
                                                                     .checked(view.read(cx).config.right_click_copy_paste())
                                                                     .on_click(window.listener_for(&view, |this, checked, _, cx| {
                                                                         this.config.set_right_click_copy_paste(*checked);
@@ -3910,7 +3899,7 @@ impl Ashell {
                                                             let view = view_clone_for_general.clone();
                                                             move |_, window, cx| {
                                                                 pointer_switch("keyword-highlight")
-                                                                    .small()
+
                                                                     .checked(view.read(cx).config.keyword_highlight())
                                                                     .on_click(window.listener_for(&view, |this, checked, _, cx| {
                                                                         this.config.set_keyword_highlight(*checked);
@@ -3929,7 +3918,7 @@ impl Ashell {
                                                             let view = view_clone_for_general.clone();
                                                             move |_, window, cx| {
                                                                 pointer_switch("remember-tabs")
-                                                                    .small()
+
                                                                     .checked(view.read(cx).config.remember_tabs())
                                                                     .on_click(window.listener_for(&view, |this, checked, _, cx| {
                                                                         this.config.set_remember_tabs(*checked);
@@ -3949,7 +3938,7 @@ impl Ashell {
                                                             let view = view_clone_for_general.clone();
                                                             move |_, window, cx| {
                                                                 pointer_switch("lock-layout")
-                                                                    .small()
+
                                                                     .checked(view.read(cx).config.lock_layout())
                                                                     .on_click(window.listener_for(&view, |this, checked, _, cx| {
                                                                         this.config.set_lock_layout(*checked);
@@ -3968,7 +3957,7 @@ impl Ashell {
                                                             let view = view_clone_for_general.clone();
                                                             move |_, _window, cx| {
                                                                 pointer_button("monitoring-position-dropdown")
-                                                                    .small()
+
                                                                     .icon(IconName::PanelLeftOpen)
                                                                     .label({
                                                                         let pos = view.read(cx).config.monitoring_position().to_string();
@@ -4027,7 +4016,7 @@ impl Ashell {
                                                             let view = view_clone_for_general.clone();
                                                             move |_, _window, cx| {
                                                                 pointer_button("language-dropdown")
-                                                                    .small()
+
                                                                     .icon(IconName::Globe)
                                                                     .label({
                                                                         let current_locale = view.read(cx).config.locale().to_string();
@@ -4081,7 +4070,7 @@ impl Ashell {
                                                             let view = view_clone_for_general.clone();
                                                             move |_, window, _cx| {
                                                                 pointer_button("reset-layout")
-                                                                    .small()
+
                                                                     .label(t!("reset").to_string())
                                                                     .on_click(window.listener_for(&view, |this, _, window, cx| {
                                                                         this.reset_layout(window, cx);
@@ -4108,7 +4097,7 @@ impl Ashell {
                                                                 .gap_2()
                                                                 .child(
                                                                     pointer_button("backup-export")
-                                                                        .small()
+
                                                                         .label(t!("backup_export").to_string())
                                                                         .on_click(window.listener_for(&view, |this, _, window, cx| {
                                                                             this.export_local_config(window, cx);
@@ -4116,7 +4105,7 @@ impl Ashell {
                                                                 )
                                                                 .child(
                                                                     pointer_button("backup-import")
-                                                                        .small()
+
                                                                         .label(t!("backup_import").to_string())
                                                                         .on_click(window.listener_for(&view, |this, _, window, cx| {
                                                                             this.import_local_config(window, cx);
@@ -4159,14 +4148,14 @@ impl Ashell {
                                                                     .gap_2()
                                                                     .child(
                                                                         pointer_button("sync-backend-webdav")
-                                                                            .small()
+
                                                                             .label("WebDAV")
                                                                             .when(!is_s3, |button| button.primary())
                                                                             .on_click(window.listener_for(&view, |this, _, _, cx| this.set_sync_backend("webdav", cx)))
                                                                     )
                                                                     .child(
                                                                         pointer_button("sync-backend-s3")
-                                                                            .small()
+
                                                                             .label("S3")
                                                                             .when(is_s3, |button| button.primary())
                                                                             .on_click(window.listener_for(&view, |this, _, _, cx| this.set_sync_backend("s3", cx)))
@@ -4190,8 +4179,8 @@ impl Ashell {
                                                             .child(
                                                                 h_flex()
                                                                     .gap_2()
-                                                                    .child(pointer_button("sync-download").small().disabled(in_progress).label(t!("sync_download").to_string()).on_click(window.listener_for(&view, |this, _, _, cx| this.download_sync_config(cx))))
-                                                                    .child(pointer_button("sync-upload").small().disabled(in_progress).label(t!("sync_upload").to_string()).on_click(window.listener_for(&view, |this, _, _, cx| this.upload_sync_config(cx)))),
+                                                                    .child(pointer_button("sync-download").disabled(in_progress).label(t!("sync_download").to_string()).on_click(window.listener_for(&view, |this, _, _, cx| this.download_sync_config(cx))))
+                                                                    .child(pointer_button("sync-upload").disabled(in_progress).label(t!("sync_upload").to_string()).on_click(window.listener_for(&view, |this, _, _, cx| this.upload_sync_config(cx)))),
                                                             )
                                                             .child(div().text_sm().text_color(cx.theme().muted_foreground).child(status))
                                                     }
@@ -4211,7 +4200,7 @@ impl Ashell {
                                                             let view = view.clone();
                                                             move |_, window, cx| {
                                                                 pointer_switch("use-proxy")
-                                                                    .small()
+
                                                                     .checked(view.read(cx).config.use_proxy())
                                                                     .on_click(window.listener_for(&view, |this, checked, _, cx| {
                                                                         this.config.set_use_proxy(*checked);
@@ -4230,7 +4219,7 @@ impl Ashell {
                                                             let view = view.clone();
                                                             move |_, window, cx| {
                                                                 pointer_switch("read-env-proxy")
-                                                                    .small()
+
                                                                     .checked(view.read(cx).config.read_env_proxy())
                                                                     .on_click(window.listener_for(&view, |this, checked, _, cx| {
                                                                         this.config.set_read_env_proxy(*checked);
@@ -4259,7 +4248,7 @@ impl Ashell {
                                                                     .gap_2()
                                                                     .child(
                                                                         pointer_button("global-proxy-type-socks5")
-                                                                            .small()
+
                                                                             .label("SOCKS5")
                                                                             .when(proxy_type == "socks5", |b| b.primary())
                                                                             .on_click(window.listener_for(&view, |this, _, _, cx| {
@@ -4269,7 +4258,7 @@ impl Ashell {
                                                                     )
                                                                     .child(
                                                                         pointer_button("global-proxy-type-http")
-                                                                            .small()
+
                                                                             .label("HTTP")
                                                                             .when(proxy_type == "http", |b| b.primary())
                                                                             .on_click(window.listener_for(&view, |this, _, _, cx| {
@@ -4284,7 +4273,7 @@ impl Ashell {
                                                             .child(v_flex().gap_1().child(div().text_sm().child(t!("global_proxy_password").to_string())).child(Input::new(&global_proxy_password_input).w_full()))
                                                             .child(
                                                                 pointer_button("save-global-proxy")
-                                                                    .small()
+
                                                                     .primary()
                                                                     .label(t!("save_proxy").to_string())
                                                                     .on_click(window.listener_for(&view, |this, _, _, cx| {
@@ -4333,17 +4322,17 @@ impl Ashell {
                                                     v_flex()
                                                         .gap_2()
                                                         .items_center()
-                                                        .child(div().text_size(rems(1.5)).font_weight(FontWeight::BOLD).child("Ashell"))
-                                                        .child(div().text_size(rems(0.9)).child(format!("Version {}", version)))
+                                                        .child(div().text_size(ui_rems(1.5)).font_weight(FontWeight::BOLD).child("Ashell"))
+                                                        .child(div().text_size(ui_rems(0.9)).child(format!("Version {}", version)))
                                                         .child(
                                                             div()
-                                                                .text_size(rems(0.9))
+                                                                .text_size(ui_rems(0.9))
                                                                 .text_color(cx.theme().muted_foreground)
                                                                 .child("A GPUI Component based SSH and local terminal client"),
                                                         )
                                                         .child(
                                                             div()
-                                                                .text_size(rems(0.9))
+                                                                .text_size(ui_rems(0.9))
                                                                 .text_color(cx.theme().muted_foreground)
                                                                 .child(t!("about_feedback_hint")),
                                                         )
