@@ -164,17 +164,86 @@ fn highlight_colors() -> HighlightColors {
     }
 }
 
+#[derive(Clone, Copy)]
+struct KeywordMatch {
+    start_col: i32,
+    end_col: i32,
+    color: Hsla,
+    priority: usize,
+}
+
+impl KeywordMatch {
+    fn span_len(self) -> i32 {
+        self.end_col - self.start_col + 1
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        self.start_col <= other.end_col && other.start_col <= self.end_col
+    }
+}
+
+#[derive(Default)]
+struct KeywordHighlights {
+    colors: HashMap<(i32, i32), Hsla>,
+    pending: Vec<KeywordMatch>,
+    next_priority: usize,
+}
+
+impl KeywordHighlights {
+    fn apply_row(&mut self, row_i32: i32) {
+        let mut matches = std::mem::take(&mut self.pending);
+        matches.sort_unstable_by(|left, right| {
+            right
+                .span_len()
+                .cmp(&left.span_len())
+                .then(left.priority.cmp(&right.priority))
+                .then(left.start_col.cmp(&right.start_col))
+        });
+
+        let mut selected = Vec::with_capacity(matches.len());
+        for candidate in matches {
+            if selected
+                .iter()
+                .copied()
+                .any(|existing| candidate.overlaps(existing))
+            {
+                continue;
+            }
+            selected.push(candidate);
+        }
+
+        for candidate in selected {
+            for col in candidate.start_col..=candidate.end_col {
+                self.colors.insert((row_i32, col), candidate.color);
+            }
+        }
+    }
+}
+
+fn is_keyword_word_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn has_keyword_boundaries(text: &[u8], start: usize, end: usize) -> bool {
+    (start == 0 || !is_keyword_word_char(text[start - 1]))
+        && (end == text.len() || !is_keyword_word_char(text[end]))
+}
+
 /// Highlight all occurrences of keyword list in `text`, writing to `map`.
-/// Case-insensitive, matches inside larger words (e.g. "my_ERROR" highlights "ERROR").
-/// Each keyword only matches once per position (no overlapping highlights).
+/// Case-insensitive, matches only complete words or phrases.
+/// Each keyword only matches once per position; overlapping matches are resolved after the row
+/// has been scanned so a longer keyword keeps the entire word in one color.
 fn highlight_keywords(
-    map: &mut HashMap<(i32, i32), Hsla>,
+    map: &mut KeywordHighlights,
     text: &str,
     byte_to_col: &[i32],
-    row_i32: i32,
+    _row_i32: i32,
     keywords: &[&str],
     color: Hsla,
 ) {
+    let priority = map.next_priority;
+    map.next_priority += 1;
+
     for &kw in keywords {
         let kw_lower: Vec<u8> = kw.bytes().map(|b| b.to_ascii_lowercase()).collect();
         let text_bytes = text.as_bytes();
@@ -183,11 +252,19 @@ fn highlight_keywords(
         while start + kw_lower.len() <= text_lower.len() {
             if text_lower[start..].starts_with(&kw_lower) {
                 let abs = start;
+                let end = abs + kw.len();
+                if !has_keyword_boundaries(text_bytes, abs, end) {
+                    start = end;
+                    continue;
+                }
                 let start_col = byte_to_col[abs];
                 let end_col = byte_to_col[(abs + kw.len() - 1).min(byte_to_col.len() - 1)];
-                for c in start_col..=end_col {
-                    map.entry((row_i32, c)).or_insert(color);
-                }
+                map.pending.push(KeywordMatch {
+                    start_col,
+                    end_col,
+                    color,
+                    priority,
+                });
                 start = abs + kw.len();
             } else {
                 start += 1;
@@ -294,7 +371,7 @@ pub fn highlight_cells(cells: &[RenderCell], rows: usize) -> HashMap<(i32, i32),
         row.sort_by_key(|&(col, _)| col);
     }
 
-    let mut map = HashMap::new();
+    let mut map = KeywordHighlights::default();
 
     let mut chars_buf = String::with_capacity(128);
     let mut byte_to_col: Vec<i32> = Vec::with_capacity(128);
@@ -772,8 +849,10 @@ pub fn highlight_cells(cells: &[RenderCell], rows: usize) -> HashMap<(i32, i32),
             colors.deprecated,
         );
 
+        map.apply_row(row_i32);
+
         // ── 30. HTTP status codes ──────────────────────────────
-        highlight_http_codes(&mut map, text, &byte_to_col, row_i32, &colors);
+        highlight_http_codes(&mut map.colors, text, &byte_to_col, row_i32, &colors);
 
         // ── 31. IP addresses ───────────────────────────────────
         for m in find_ip_addresses(text) {
@@ -781,7 +860,7 @@ pub fn highlight_cells(cells: &[RenderCell], rows: usize) -> HashMap<(i32, i32),
             let start_col = byte_to_col[m];
             let end_col = byte_to_col[(m + ip_len - 1).min(byte_to_col.len() - 1)];
             for c in start_col..=end_col {
-                map.entry((row_i32, c)).or_insert(colors.network);
+                map.colors.entry((row_i32, c)).or_insert(colors.network);
             }
         }
 
@@ -791,7 +870,7 @@ pub fn highlight_cells(cells: &[RenderCell], rows: usize) -> HashMap<(i32, i32),
             let start_col = byte_to_col[m];
             let end_col = byte_to_col[(m + port_len - 1).min(byte_to_col.len() - 1)];
             for c in start_col..=end_col {
-                map.entry((row_i32, c)).or_insert(colors.port);
+                map.colors.entry((row_i32, c)).or_insert(colors.port);
             }
         }
     }
@@ -805,13 +884,13 @@ pub fn highlight_cells(cells: &[RenderCell], rows: usize) -> HashMap<(i32, i32),
                 let idx = m + i;
                 if idx < line.byte_to_cell.len() {
                     let (r, c) = line.byte_to_cell[idx];
-                    map.entry((r as i32, c as i32)).or_insert(colors.url);
+                    map.colors.entry((r as i32, c as i32)).or_insert(colors.url);
                 }
             }
         }
     }
 
-    map
+    map.colors
 }
 
 fn find_ip_len(text: &str) -> usize {
@@ -1063,7 +1142,7 @@ pub fn find_url_at_cell(
 
 #[cfg(test)]
 mod tests {
-    use super::find_url_len;
+    use super::{KeywordHighlights, KeywordMatch, find_url_len, hsla};
 
     fn detected_url(text: &str) -> &str {
         &text[..find_url_len(text)]
@@ -1091,5 +1170,46 @@ mod tests {
             detected_url("https://example.com/path_(one))] following text"),
             "https://example.com/path_(one)"
         );
+    }
+
+    #[test]
+    fn overlapping_keywords_keep_the_longest_match_color() {
+        let long_color = hsla(10, 20, 30);
+        let short_color = hsla(200, 210, 220);
+        let mut highlights = KeywordHighlights::default();
+        highlights.pending = vec![
+            KeywordMatch {
+                start_col: 3,
+                end_col: 11,
+                color: short_color,
+                priority: 0,
+            },
+            KeywordMatch {
+                start_col: 0,
+                end_col: 11,
+                color: long_color,
+                priority: 1,
+            },
+        ];
+
+        highlights.apply_row(0);
+
+        assert_eq!(highlights.colors.len(), 12);
+        assert!(highlights.colors.values().all(|color| *color == long_color));
+    }
+
+    #[test]
+    fn keyword_matches_require_word_boundaries() {
+        let text = "Bootstrap BOOT";
+        let byte_to_col = (0..text.len()).map(|col| col as i32).collect::<Vec<_>>();
+        let color = hsla(10, 20, 30);
+        let mut highlights = KeywordHighlights::default();
+
+        super::highlight_keywords(&mut highlights, text, &byte_to_col, 0, &["BOOT"], color);
+        highlights.apply_row(0);
+
+        assert_eq!(highlights.colors.len(), 4);
+        assert!((0..9).all(|col| !highlights.colors.contains_key(&(0, col))));
+        assert!((10..14).all(|col| highlights.colors.get(&(0, col)) == Some(&color)));
     }
 }
