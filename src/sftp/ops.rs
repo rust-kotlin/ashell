@@ -46,6 +46,7 @@ impl Ashell {
         if let Some(sftp) = self.active_sftp_mut() {
             sftp.current_path = path.clone();
             sftp.selected_path = None;
+            sftp.selection_anchor = None;
             sftp.preview = None;
             sftp.selected_entries.clear();
             sftp.expand_to(&path);
@@ -134,13 +135,48 @@ impl Ashell {
         }
     }
 
-    pub(crate) fn select_sftp_entry(&mut self, entry: RemoteEntry, cx: &mut Context<Self>) {
+    pub(crate) fn select_sftp_entry(
+        &mut self,
+        entry: RemoteEntry,
+        visible_paths: &[String],
+        extend_range: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if extend_range {
+            if let Some(sftp) = self.active_sftp_mut() {
+                let target_path = entry.full_path.clone();
+                let target_index = visible_paths.iter().position(|path| path == &target_path);
+                let anchor_index = sftp
+                    .selection_anchor
+                    .as_ref()
+                    .and_then(|anchor| visible_paths.iter().position(|path| path == anchor));
+
+                sftp.selected_entries.clear();
+                if let Some(target_index) = target_index {
+                    let anchor_index = anchor_index.unwrap_or(target_index);
+                    let start = anchor_index.min(target_index);
+                    let end = anchor_index.max(target_index);
+                    sftp.selected_entries
+                        .extend(visible_paths[start..=end].iter().cloned());
+                } else {
+                    sftp.selected_entries.insert(target_path.clone());
+                }
+                if sftp.selection_anchor.is_none() {
+                    sftp.selection_anchor = Some(target_path.clone());
+                }
+                sftp.selected_path = Some(target_path);
+            }
+            cx.notify();
+            return;
+        }
+
         if entry.is_dir {
             self.navigate_sftp(entry.full_path, cx);
             return;
         }
         self.mark_sftp_entry_selected(&entry.full_path, cx);
         if let Some(sftp) = self.active_sftp_mut() {
+            sftp.selection_anchor = Some(entry.full_path.clone());
             if !sftp.selected_entries.remove(&entry.full_path) {
                 sftp.selected_entries.insert(entry.full_path);
             }
@@ -381,6 +417,8 @@ impl Ashell {
         cx: &mut Context<Self>,
     ) {
         if let Some(sftp) = self.active_sftp_mut() {
+            sftp.selected_path = Some(path.clone());
+            sftp.selection_anchor = Some(path.clone());
             if checked {
                 sftp.selected_entries.insert(path);
             } else {
@@ -403,6 +441,8 @@ impl Ashell {
                 }
             } else {
                 sftp.selected_entries.clear();
+                sftp.selected_path = None;
+                sftp.selection_anchor = None;
             }
             cx.notify();
         }

@@ -100,6 +100,7 @@ fn connecting_sftp_state() -> crate::terminal::SftpUiState {
         loading_directories: std::collections::HashSet::new(),
         directory_errors: std::collections::HashMap::new(),
         selected_path: None,
+        selection_anchor: None,
         preview: None,
         selected_entries: std::collections::HashSet::new(),
         home_dir: "/".into(),

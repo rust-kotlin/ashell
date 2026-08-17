@@ -887,6 +887,7 @@ pub struct SftpUiState {
     pub loading_directories: HashSet<String>,
     pub directory_errors: HashMap<String, String>,
     pub selected_path: Option<String>,
+    pub selection_anchor: Option<String>,
     pub preview: Option<PreviewData>,
     pub selected_entries: HashSet<String>,
     pub home_dir: String,

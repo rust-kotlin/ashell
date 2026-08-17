@@ -326,7 +326,6 @@ impl Ashell {
             pointer_button("search-btn")
                 .ghost()
                 .small()
-                .rounded(px(999.))
                 .icon(IconName::Search)
                 .tooltip(t!("search").to_string())
                 .on_click(cx.listener(|this, _, window, cx| {
