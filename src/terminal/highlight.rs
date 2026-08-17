@@ -888,8 +888,30 @@ fn find_urls(text: &str) -> Vec<usize> {
 }
 
 fn find_url_len(text: &str) -> usize {
-    text.find(|c: char| c.is_ascii_whitespace())
-        .unwrap_or(text.len())
+    let end = text
+        .find(|c: char| c.is_ascii_whitespace())
+        .unwrap_or(text.len());
+    let mut url = &text[..end];
+
+    loop {
+        let Some(&closing) = url.as_bytes().last() else {
+            break;
+        };
+        let opening = match closing {
+            b')' => b'(',
+            b']' => b'[',
+            b'}' => b'{',
+            _ => break,
+        };
+        let opening_count = url.bytes().filter(|byte| *byte == opening).count();
+        let closing_count = url.bytes().filter(|byte| *byte == closing).count();
+        if closing_count <= opening_count {
+            break;
+        }
+        url = &url[..url.len() - 1];
+    }
+
+    url.len()
 }
 
 fn find_ports(text: &str) -> Vec<usize> {
@@ -1037,4 +1059,37 @@ pub fn find_url_at_cell(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_url_len;
+
+    fn detected_url(text: &str) -> &str {
+        &text[..find_url_len(text)]
+    }
+
+    #[test]
+    fn excludes_unmatched_trailing_parenthesis() {
+        assert_eq!(
+            detected_url("https://onlyoffice.com/desktop)"),
+            "https://onlyoffice.com/desktop"
+        );
+    }
+
+    #[test]
+    fn preserves_balanced_parentheses_in_url() {
+        assert_eq!(
+            detected_url("https://example.com/wiki/Function_(mathematics)"),
+            "https://example.com/wiki/Function_(mathematics)"
+        );
+    }
+
+    #[test]
+    fn removes_only_unmatched_trailing_delimiters() {
+        assert_eq!(
+            detected_url("https://example.com/path_(one))] following text"),
+            "https://example.com/path_(one)"
+        );
+    }
 }
