@@ -1327,6 +1327,7 @@ impl Ashell {
                                                         .ghost()
                                                         .small()
                                                         .icon(IconName::ArrowDown)
+                                                        .label(t!("download").to_string())
                                                         .tooltip(
                                                             t!(
                                                                 "download_count",
@@ -1347,6 +1348,7 @@ impl Ashell {
                                                         .danger()
                                                         .small()
                                                         .icon(IconName::Delete)
+                                                        .label(t!("delete_selected").to_string())
                                                         .tooltip(t!("delete_selected").to_string())
                                                         .on_click(cx.listener(
                                                             |this, _, window, cx| {
@@ -3817,6 +3819,7 @@ impl Ashell {
                                 pointer_button("new-connection-group")
                                     .ghost()
                                     .icon(IconName::Plus)
+                                    .label(t!("new_connection_short").to_string())
                                     .tooltip(t!("new_connection_group").to_string())
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.show_connection_group_dialog(None, window, cx);
@@ -3827,6 +3830,7 @@ impl Ashell {
                                 pointer_button("move-selected-connections")
                                     .ghost()
                                     .icon(IconName::FolderClosed)
+                                    .label(t!("move_to_group").to_string())
                                     .tooltip(t!("move_to_group").to_string())
                                     .disabled(!has_selected_connections)
                                     .dropdown_menu_with_anchor(Anchor::BottomRight, {
