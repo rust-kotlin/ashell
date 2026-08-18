@@ -4131,6 +4131,8 @@ impl Ashell {
         let tabbar_menu = {
             let view = view.clone();
             let tab_entries = groups_data.clone();
+            let active_group = self.active_group.clone();
+            let active_tab = self.active_tab.clone();
             h_flex().flex_none().child(
                 pointer_button("tabbar-menu")
                     .ghost()
@@ -4140,11 +4142,16 @@ impl Ashell {
                         let popup_menu = menu_cx.entity();
                         tab_entries.iter().enumerate().fold(
                             menu.scrollable(true),
-                            |menu, (ix, (group_id, label, _))| {
+                            |menu, (ix, (group_id, label, pane_ids))| {
                                 let group_id = group_id.clone();
                                 let drag_group_id = group_id.clone();
                                 let target_group_id = group_id.clone();
                                 let target_group_for_style = group_id.clone();
+                                let close_tab_id = if active_group.as_ref() == Some(&group_id) {
+                                    active_tab.clone().or_else(|| pane_ids.first().cloned())
+                                } else {
+                                    pane_ids.first().cloned()
+                                };
                                 let item_view = view.clone();
                                 let item_menu = popup_menu.clone();
                                 let label = label.clone();
@@ -4155,6 +4162,9 @@ impl Ashell {
                                         let drop_view = item_view.clone();
                                         let drop_menu = item_menu.clone();
                                         let drop_target = target_group_id.clone();
+                                        let close_view = item_view.clone();
+                                        let close_menu = item_menu.clone();
+                                        let close_tab_id = close_tab_id.clone();
                                         h_flex()
                                             .flex_1()
                                             .min_w(px(0.))
@@ -4195,7 +4205,38 @@ impl Ashell {
                                                     cx.emit(DismissEvent);
                                                 });
                                             })
-                                            .child(label.clone())
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.))
+                                                    .truncate()
+                                                    .child(label.clone()),
+                                            )
+                                            .child(
+                                                pointer_button(("tab-group-close", ix))
+                                                    .ghost()
+                                                    .icon(IconName::Delete)
+                                                    .tooltip(t!("delete").to_string())
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        |_, window, cx| {
+                                                            window.prevent_default();
+                                                            cx.stop_propagation();
+                                                        },
+                                                    )
+                                                    .on_click(move |_, window, cx| {
+                                                        window.prevent_default();
+                                                        cx.stop_propagation();
+                                                        if let Some(tab_id) = close_tab_id.clone() {
+                                                            close_view.update(cx, |this, cx| {
+                                                                this.close_tab(tab_id, cx);
+                                                            });
+                                                        }
+                                                        close_menu.update(cx, |_, cx| {
+                                                            cx.emit(DismissEvent);
+                                                        });
+                                                    }),
+                                            )
                                     })
                                     .checked(ix == selected)
                                     .on_click(
@@ -4245,6 +4286,11 @@ impl Ashell {
                             .flex_1()
                             .min_w(px(0.))
                             .h_full()
+                            .when(
+                                self.active_title_bar_style
+                                    == crate::session::config::TitleBarStyle::Integrated,
+                                |this| this.window_control_area(gpui::WindowControlArea::Drag),
+                            )
                             .overflow_x_hidden()
                             .child({
                                 h_flex()
