@@ -5020,7 +5020,7 @@ impl Ashell {
                     None
                 };
                 let font_family = this.terminal_font_family.clone();
-                let font_size = px(this.terminal_font_size);
+                let font_size = px(this.terminal_font_size());
                 let line_height = px(this.terminal_line_height());
                 let cell_width = px(this.terminal_cell_width());
                 let is_url_hovered = this

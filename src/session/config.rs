@@ -280,7 +280,10 @@ pub struct ConfigFile {
     pub dark_theme_name: String,
     #[serde(default = "default_locale")]
     pub locale: String,
-    #[serde(default = "default_terminal_font_size")]
+    #[serde(
+        default = "default_terminal_font_size",
+        deserialize_with = "deserialize_terminal_font_size"
+    )]
     pub terminal_font_size: f32,
     #[serde(default)]
     pub local_terminal_encoding: TextEncoding,
@@ -409,8 +412,21 @@ fn default_terminal_font_size() -> f32 {
     12.0
 }
 
-const LEGACY_DEFAULT_TERMINAL_FONT_SIZE: f32 = 18.0;
-const LEGACY_DEFAULT_UI_FONT_SIZE: f32 = 16.0;
+pub(crate) fn normalize_terminal_font_size(font_size: f32) -> f32 {
+    if !font_size.is_finite() || font_size <= 0.0 {
+        return default_terminal_font_size();
+    }
+    // Older scroll zoom values used half pixels, which the settings label rounded to even numbers.
+    font_size.round().clamp(10.0, 24.0)
+}
+
+fn deserialize_terminal_font_size<'de, D>(deserializer: D) -> std::result::Result<f32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let font_size = f32::deserialize(deserializer)?;
+    Ok(normalize_terminal_font_size(font_size))
+}
 
 fn default_ui_font_size() -> f32 {
     14.0
@@ -689,6 +705,7 @@ impl ConfigStore {
             ConfigFile::default()
         };
 
+        cache.terminal_font_size = normalize_terminal_font_size(cache.terminal_font_size);
         if cache.sync_device_id.is_empty() {
             cache.sync_device_id = Uuid::new_v4().to_string();
         }
@@ -1167,13 +1184,7 @@ impl ConfigStore {
     }
 
     pub fn terminal_font_size(&self) -> f32 {
-        if self.cache.terminal_font_size <= 0.0
-            || (self.cache.terminal_font_size - LEGACY_DEFAULT_TERMINAL_FONT_SIZE).abs() < 0.01
-        {
-            default_terminal_font_size()
-        } else {
-            self.cache.terminal_font_size
-        }
+        normalize_terminal_font_size(self.cache.terminal_font_size)
     }
 
     pub fn set_theme_preferences(
@@ -1267,7 +1278,7 @@ impl ConfigStore {
     }
 
     pub fn set_terminal_font_size(&mut self, terminal_font_size: f32) {
-        self.cache.terminal_font_size = terminal_font_size.max(10.0);
+        self.cache.terminal_font_size = normalize_terminal_font_size(terminal_font_size);
     }
 
     pub fn local_terminal_encoding(&self) -> TextEncoding {
@@ -1287,10 +1298,7 @@ impl ConfigStore {
     }
 
     pub fn ui_font_size(&self) -> f32 {
-        if self.cache.ui_font_size <= 0.0
-            || (self.cache.ui_font_size - LEGACY_DEFAULT_UI_FONT_SIZE).abs() < 0.01
-        {
-            // Migrate the previous application default to the current compact default.
+        if self.cache.ui_font_size <= 0.0 {
             default_ui_font_size()
         } else {
             self.cache.ui_font_size
@@ -1507,7 +1515,8 @@ impl ConfigStore {
         disk_config.light_theme_name = local_config.light_theme_name;
         disk_config.dark_theme_name = local_config.dark_theme_name;
         disk_config.locale = local_config.locale;
-        disk_config.terminal_font_size = local_config.terminal_font_size;
+        disk_config.terminal_font_size =
+            normalize_terminal_font_size(local_config.terminal_font_size);
         disk_config.local_terminal_encoding = local_config.local_terminal_encoding;
         disk_config.local_terminal_shell = local_config.local_terminal_shell;
         disk_config.ui_font_size = local_config.ui_font_size;
@@ -1942,20 +1951,50 @@ mod tests {
     }
 
     #[test]
-    fn font_sizes_migrate_the_previous_defaults() {
+    fn configured_font_sizes_survive_config_reload() {
         let mut store = ConfigStore::in_memory();
 
         assert_eq!(store.terminal_font_size(), 12.0);
         assert_eq!(store.ui_font_size(), 14.0);
 
-        store.set_terminal_font_size(18.0);
+        store.set_terminal_font_size(13.0);
+        store.set_ui_font_size(16.0);
+
+        let serialized = serde_json::to_vec(&store.cache).unwrap();
+        let cache = serde_json::from_slice(&serialized).unwrap();
+        let reopened = ConfigStore {
+            cache,
+            ..ConfigStore::in_memory()
+        };
+
+        assert_eq!(reopened.terminal_font_size(), 13.0);
+        assert_eq!(reopened.ui_font_size(), 16.0);
+    }
+
+    #[test]
+    fn terminal_font_size_preserves_odd_pixels_and_normalizes_legacy_halves() {
+        let mut store = ConfigStore::in_memory();
+
+        store.set_terminal_font_size(11.0);
+        assert_eq!(store.terminal_font_size(), 11.0);
+        store.set_terminal_font_size(13.0);
+        assert_eq!(store.terminal_font_size(), 13.0);
+
+        store.cache.terminal_font_size = 10.5;
+        assert_eq!(store.terminal_font_size(), 11.0);
+        store.cache.terminal_font_size = 11.5;
         assert_eq!(store.terminal_font_size(), 12.0);
+        store.cache.terminal_font_size = 12.5;
+        assert_eq!(store.terminal_font_size(), 13.0);
+        store.cache.terminal_font_size = 13.5;
+        assert_eq!(store.terminal_font_size(), 14.0);
+    }
 
-        store.set_ui_font_size(14.0);
-        assert_eq!(store.ui_font_size(), 14.0);
+    #[test]
+    fn terminal_font_size_is_normalized_when_deserialized() {
+        let config: ConfigFile = serde_json::from_str(r#"{"terminal_font_size":11.5}"#).unwrap();
 
-        store.set_ui_font_size(20.0);
-        assert_eq!(store.ui_font_size(), 20.0);
+        assert_eq!(config.terminal_font_size, 12.0);
     }
 
     #[test]

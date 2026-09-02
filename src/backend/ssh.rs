@@ -4,7 +4,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use async_trait::async_trait;
 use base64::Engine as _;
 use directories::BaseDirs;
 use russh::{
@@ -535,6 +534,7 @@ async fn connect_and_authenticate(
                 .authenticate_password(&session.user, &session.password)
                 .await
                 .context("password authentication failed")?
+                .success()
         }
         AuthMethod::Key => {
             let has_explicit_key = session_has_explicit_key(session);
@@ -571,15 +571,15 @@ async fn connect_and_authenticate(
                     tab_id: tab_id.to_string(),
                     text: format!("private key loaded from {source}, algorithm {algorithm}, sending public key authentication for {}", session.user),
                 });
-                let keys = private_keys_with_algs(keypair).context("invalid private key")?;
+                let keys = private_keys_with_algs(keypair);
                 let mut success = false;
                 for key in keys {
                     match handle.authenticate_publickey(&session.user, key).await {
-                        Ok(true) => {
+                        Ok(result) if result.success() => {
                             success = true;
                             break;
                         }
-                        Ok(false) => {
+                        Ok(_) => {
                             tracing::debug!(
                                 "[ssh] public key auth failed with algorithm, trying next"
                             );
@@ -637,15 +637,15 @@ async fn connect_and_authenticate(
             if has_explicit_key {
                 let keypair = load_session_private_key(session)?;
                 let algorithm = format!("{:?}", keypair.algorithm());
-                let keys = private_keys_with_algs(keypair).context("invalid private key")?;
+                let keys = private_keys_with_algs(keypair);
                 let mut success = false;
                 for key in keys {
                     match handle.authenticate_publickey(&session.user, key).await {
-                        Ok(true) => {
+                        Ok(result) if result.success() => {
                             success = true;
                             break;
                         }
-                        Ok(false) => {
+                        Ok(_) => {
                             continue;
                         }
                         Err(_) => {
@@ -1148,13 +1148,12 @@ Get-Process | ForEach-Object { $processNames[[int]$_.Id] = $_.ProcessName }
 #[derive(Clone)]
 struct ClientHandler;
 
-#[async_trait]
 impl Handler for ClientHandler {
     type Error = anyhow::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
+        _server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }

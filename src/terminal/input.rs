@@ -17,6 +17,30 @@ thread_local! {
     static LAST_DRAG_SCROLL: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
 }
 
+const TERMINAL_ZOOM_PIXEL_STEP: f32 = 20.0;
+
+fn terminal_zoom_steps(delta: &ScrollDelta, accumulator: &mut f32) -> i32 {
+    match delta {
+        ScrollDelta::Lines(point) => {
+            *accumulator = 0.0;
+            point.y.signum() as i32
+        }
+        ScrollDelta::Pixels(point) => {
+            let delta_y = point.y.as_f32();
+            if delta_y == 0.0 {
+                return 0;
+            }
+            if *accumulator != 0.0 && (*accumulator).signum() != delta_y.signum() {
+                *accumulator = 0.0;
+            }
+            *accumulator += delta_y;
+            let steps = (*accumulator / TERMINAL_ZOOM_PIXEL_STEP).trunc() as i32;
+            *accumulator -= steps as f32 * TERMINAL_ZOOM_PIXEL_STEP;
+            steps
+        }
+    }
+}
+
 impl Ashell {
     pub(crate) fn on_terminal_key_down(
         &mut self,
@@ -813,16 +837,9 @@ impl Ashell {
     ) {
         // Platform modifier (Cmd on macOS, Ctrl on Windows/Linux) + scroll → zoom terminal font size
         if event.modifiers.platform {
-            let delta = match event.delta {
-                ScrollDelta::Lines(point) => point.y * 20.0,
-                ScrollDelta::Pixels(point) => point.y.as_f32(),
-            };
-            self.terminal_zoom_accumulator += delta;
-            let step = 20.0;
-            if self.terminal_zoom_accumulator.abs() >= step {
-                let zoom_steps = (self.terminal_zoom_accumulator / step).trunc();
-                self.terminal_zoom_accumulator -= zoom_steps * step;
-                self.change_terminal_font_size(zoom_steps * 0.5, cx);
+            let zoom_steps = terminal_zoom_steps(&event.delta, &mut self.terminal_zoom_accumulator);
+            if zoom_steps != 0 {
+                self.change_terminal_font_size(zoom_steps, window, cx);
             }
             window.prevent_default();
             cx.stop_propagation();
@@ -1361,11 +1378,12 @@ mod tests {
         cell::{Cell, Flags},
     };
     use alacritty_terminal::vte::ansi::CursorShape;
+    use gpui::{ScrollDelta, point, px};
 
     use super::{
         alternate_screen_cursor_move, command_history_text, prompt_click_is_valid,
         prompt_cursor_move, sgr_prompt_click, terminal_command_text, terminal_grid_row,
-        terminal_mouse_click,
+        terminal_mouse_click, terminal_zoom_steps,
     };
     use crate::terminal::{CursorState, PromptClickMode, RenderCell, RenderSnapshot};
 
@@ -1393,6 +1411,43 @@ mod tests {
             cols,
             highlights: Default::default(),
         }
+    }
+
+    #[test]
+    fn terminal_zoom_uses_whole_pixel_steps_for_line_scrolls() {
+        let mut accumulator = 10.0;
+
+        assert_eq!(
+            terminal_zoom_steps(&ScrollDelta::Lines(point(0.0, 4.0)), &mut accumulator),
+            1
+        );
+        assert_eq!(accumulator, 0.0);
+        assert_eq!(
+            terminal_zoom_steps(&ScrollDelta::Lines(point(0.0, -3.0)), &mut accumulator),
+            -1
+        );
+    }
+
+    #[test]
+    fn terminal_zoom_accumulates_precise_scrolls_into_whole_pixel_steps() {
+        let mut accumulator = 0.0;
+
+        assert_eq!(
+            terminal_zoom_steps(
+                &ScrollDelta::Pixels(point(px(0.0), px(10.0))),
+                &mut accumulator,
+            ),
+            0
+        );
+        assert_eq!(accumulator, 10.0);
+        assert_eq!(
+            terminal_zoom_steps(
+                &ScrollDelta::Pixels(point(px(0.0), px(10.0))),
+                &mut accumulator,
+            ),
+            1
+        );
+        assert_eq!(accumulator, 0.0);
     }
 
     #[test]

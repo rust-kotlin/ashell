@@ -3761,9 +3761,9 @@ impl Ashell {
                                                                 h_flex()
                                                                     .items_center()
                                                                     .gap_3()
-                                                                    .child(pointer_button("terminal-font-size-down").label("-").on_click(window.listener_for(&view, |this, _, _, cx| this.change_terminal_font_size(-1.0, cx))))
-                                                                    .child(div().min_w(px(64.)).text_center().child(format!("{:.0}px", view.read(cx).terminal_font_size)))
-                                                                    .child(pointer_button("terminal-font-size-up").label("+").on_click(window.listener_for(&view, |this, _, _, cx| this.change_terminal_font_size(1.0, cx))))
+                                                                    .child(pointer_button("terminal-font-size-down").label("-").on_click(window.listener_for(&view, |this, _, window, cx| this.change_terminal_font_size(-1, window, cx))))
+                                                                    .child(div().min_w(px(64.)).text_center().child(format!("{:.0}px", view.read(cx).terminal_font_size())))
+                                                                    .child(pointer_button("terminal-font-size-up").label("+").on_click(window.listener_for(&view, |this, _, window, cx| this.change_terminal_font_size(1, window, cx))))
                                                                     .into_any_element()
                                                             }
                                                         })

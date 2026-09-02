@@ -7,7 +7,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use directories::BaseDirs;
 use flate2::read::GzDecoder;
@@ -767,20 +766,21 @@ async fn connect_and_authenticate(
         AuthMethod::Password => handle
             .authenticate_password(&session.user, &session.password)
             .await
-            .context("password authentication failed")?,
+            .context("password authentication failed")?
+            .success(),
         AuthMethod::Key => {
             let has_explicit_key = session_has_explicit_key(session);
             if has_explicit_key {
                 let keypair = load_session_private_key(session)?;
-                let keys = private_keys_with_algs(keypair).context("invalid private key")?;
+                let keys = private_keys_with_algs(keypair);
                 let mut success = false;
                 for key in keys {
                     match handle.authenticate_publickey(&session.user, key).await {
-                        Ok(true) => {
+                        Ok(result) if result.success() => {
                             success = true;
                             break;
                         }
-                        Ok(false) => {
+                        Ok(_) => {
                             tracing::debug!(
                                 "[sftp] public key auth failed with algorithm, trying next"
                             );
@@ -824,15 +824,15 @@ async fn connect_and_authenticate(
 
             if has_explicit_key {
                 let keypair = load_session_private_key(session)?;
-                let keys = private_keys_with_algs(keypair).context("invalid private key")?;
+                let keys = private_keys_with_algs(keypair);
                 let mut success = false;
                 for key in keys {
                     match handle.authenticate_publickey(&session.user, key).await {
-                        Ok(true) => {
+                        Ok(result) if result.success() => {
                             success = true;
                             break;
                         }
-                        Ok(false) => {
+                        Ok(_) => {
                             tracing::debug!(
                                 "[sftp] public key auth failed with algorithm, trying next"
                             );
@@ -1915,13 +1915,12 @@ async fn extract_archive_to(path: &Path, target_dir: &Path) -> Result<()> {
 #[derive(Clone)]
 struct SftpClientHandler;
 
-#[async_trait]
 impl Handler for SftpClientHandler {
     type Error = anyhow::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
+        _server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }

@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use self::config::{
     AuthMethod, LocalTerminalShell, SavedPaneLayout, SavedTabGroup, SavedTabsState,
-    SavedTerminalTab, Session,
+    SavedTerminalTab, Session, normalize_terminal_font_size,
 };
 
 use crate::{
@@ -29,6 +29,11 @@ const MIN_TERMINAL_GRID_DIMENSION: u16 = 2;
 
 fn valid_terminal_layout_size(cols: u16, rows: u16) -> bool {
     cols >= MIN_TERMINAL_GRID_DIMENSION && rows >= MIN_TERMINAL_GRID_DIMENSION
+}
+
+fn step_terminal_font_size(font_size: f32, delta: i32) -> f32 {
+    let current = normalize_terminal_font_size(font_size);
+    normalize_terminal_font_size(current + delta as f32)
 }
 
 pub(crate) fn compact_local_path(path: &std::path::Path) -> String {
@@ -997,19 +1002,30 @@ impl Ashell {
     }
 
     pub(crate) fn terminal_cell_width(&self) -> f32 {
-        (self.terminal_font_size * 0.646).max(6.0)
+        (self.terminal_font_size() * 0.646).max(6.0)
     }
 
     pub(crate) fn terminal_line_height(&self) -> f32 {
-        (self.terminal_font_size * 1.385).max(self.terminal_font_size + 2.0)
+        let font_size = self.terminal_font_size();
+        (font_size * 1.385).max(font_size + 2.0)
     }
 
-    pub(crate) fn change_terminal_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
-        self.terminal_font_size = (self.terminal_font_size + delta).clamp(10.0, 24.0);
+    pub(crate) fn terminal_font_size(&self) -> f32 {
+        normalize_terminal_font_size(self.terminal_font_size)
+    }
+
+    pub(crate) fn change_terminal_font_size(
+        &mut self,
+        delta: i32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.terminal_font_size = step_terminal_font_size(self.terminal_font_size, delta);
         self.config.set_terminal_font_size(self.terminal_font_size);
         self.save_preferences_background();
-        self.status = format!("terminal font size: {:.0}px", self.terminal_font_size).into();
+        self.status = format!("terminal font size: {:.0}px", self.terminal_font_size()).into();
         cx.notify();
+        window.refresh();
     }
 
     pub(crate) fn change_ui_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
@@ -2768,7 +2784,15 @@ impl Ashell {
 mod tests {
     use base64::Engine as _;
 
-    use super::parse_local_directory_title;
+    use super::{parse_local_directory_title, step_terminal_font_size};
+
+    #[test]
+    fn terminal_font_size_steps_from_the_displayed_whole_pixel() {
+        assert_eq!(step_terminal_font_size(12.0, 1), 13.0);
+        assert_eq!(step_terminal_font_size(12.0, -1), 11.0);
+        assert_eq!(step_terminal_font_size(11.5, 1), 13.0);
+        assert_eq!(step_terminal_font_size(12.5, -1), 12.0);
+    }
 
     #[test]
     fn local_directory_title_accepts_plain_and_base64_paths() {

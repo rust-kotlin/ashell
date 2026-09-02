@@ -5,77 +5,76 @@ edition = "2024"
 authors = ["ashell contributors"]
 description = "A GPUI Component based SSH and local terminal client"
 license = "GPL-3.0-or-later"
-rust-version = "1.85.0"
+rust-version = "1.92.0"
 
 [dependencies]
-anyhow = "1"
+anyhow = "1.0.104"
 tokio-socks = "0.5"
-alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "fcf32feacb367b75ec84dd40f041e4fd411d3cc1" }
-async-trait = "0.1"
+alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "4c129667ce56611becdc82de6e28218c80e2e88f" }
 chrono = { version = "0.4", features = ["serde"] }
 csv = "1"
 directories = "5"
 encoding_rs = "0.8"
-flate2 = "1"
+flate2 = "1.1.10"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "ca85b5588f5feea021f1ee86cb13703dc6f30ec4" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "ca85b5588f5feea021f1ee86cb13703dc6f30ec4" }
 menu = { git = "https://github.com/zed-industries/zed" }
-portable-pty = "0.8"
-rfd = "0.15"
-russh = "0.49"
-russh-keys = "0.49"
-russh-sftp = "2"
+portable-pty = "0.9.0"
+rfd = "0.17.2"
+# Reuse ring so Windows x86/x64 builds do not require aws-lc-sys and NASM.
+russh = { version = "0.63.1", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh-sftp = "2.4.0"
 rust-i18n = "3"
 sys-locale = "0.3"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-ssh-key = "0.6"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 sysinfo = "0.33"
 tar = "0.4"
 tempfile = "3"
 thiserror = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "net", "time", "fs"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "io-util", "net", "time", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time", "time"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1.26.0", features = ["v4", "serde"] }
 walkdir = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-image = { version = "0.25.9", default-features = false, features = ["png"] }
-futures = "0.3.32"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+futures = "0.3.34"
 notify = "6.1.1"
-open = "5.1"
-time = { version = "0.3.45", features = ["formatting", "local-offset"] }
+open = "5.4.2"
+time = { version = "0.3.55", features = ["formatting", "local-offset"] }
 tracing-appender = "0.2.5"
 argon2 = "0.5"
 base64 = "0.22"
 chacha20poly1305 = "0.10"
 hmac = "0.12"
 hex = "0.4"
-serialport = "4"
-rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serialport = "4.10.0"
+rand = "0.8.8"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
 sha2 = "0.10"
 
 [dev-dependencies]
-libc = "0.2"
+libc = "0.2.189"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle = "0.6"
-winrt-notification = { package = "tauri-winrt-notification", version = "=0.2.1" }
-windows = { version = "0.57", features = [
+winrt-notification = { package = "tauri-winrt-notification", version = "=0.8.1" }
+windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_System_Com",
+    "Win32_System_WinRT",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "UI_Notifications",
 ] }
-winreg = "0.52"
+winreg = "0.56.0"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
-desktop-notify = { package = "notify-rust", version = "=4.11.5", default-features = false }
+desktop-notify = { package = "notify-rust", version = "=4.18.0", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-notification-sys = "=0.6.15"

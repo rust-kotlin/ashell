@@ -45,6 +45,51 @@ use crate::{
 };
 
 const SYSTEM_HISTORY_LIMIT: usize = 20;
+const BACKEND_EVENT_TIME_BUDGET: Duration = Duration::from_millis(4);
+const MAX_BACKEND_EVENTS_PER_TICK: usize = 128;
+const MAX_BACKEND_OUTPUT_BYTES_PER_TICK: usize = 512 * 1024;
+const MAX_COALESCED_OUTPUT_BYTES: usize = 64 * 1024;
+const BACKEND_BACKLOG_WARNING_INTERVAL: Duration = Duration::from_secs(5);
+const SLOW_OPERATION_WARNING_THRESHOLD: Duration = Duration::from_millis(100);
+const WINDOW_BOUNDS_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BackendDrainOutcome {
+    changed: bool,
+    budget_exhausted: bool,
+    processed_events: usize,
+    output_bytes: usize,
+}
+
+fn backend_drain_budget_allows_more(
+    processed_events: usize,
+    output_bytes: usize,
+    elapsed: Duration,
+) -> bool {
+    processed_events < MAX_BACKEND_EVENTS_PER_TICK
+        && output_bytes < MAX_BACKEND_OUTPUT_BYTES_PER_TICK
+        && elapsed < BACKEND_EVENT_TIME_BUDGET
+}
+
+fn merge_adjacent_output(
+    tab_id: &str,
+    bytes: &mut Vec<u8>,
+    next: BackendEvent,
+) -> Result<usize, BackendEvent> {
+    match next {
+        BackendEvent::Output {
+            tab_id: next_tab_id,
+            bytes: next_bytes,
+        } if next_tab_id == tab_id
+            && bytes.len().saturating_add(next_bytes.len()) <= MAX_COALESCED_OUTPUT_BYTES =>
+        {
+            let appended = next_bytes.len();
+            bytes.extend_from_slice(&next_bytes);
+            Ok(appended)
+        }
+        event => Err(event),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) enum PaneLayout {
@@ -427,6 +472,8 @@ pub(crate) struct Ashell {
     pub(crate) runtime: Runtime,
     pub(crate) events_rx: mpsc::Receiver<BackendEvent>,
     pub(crate) events_tx: mpsc::Sender<BackendEvent>,
+    pub(crate) pending_backend_event: Option<BackendEvent>,
+    pub(crate) last_backend_backlog_warning: Option<Instant>,
     pub(crate) last_window_size: Option<gpui::Size<Pixels>>,
     pub(crate) last_sidebar_width: Option<Pixels>,
     pub(crate) pending_local_terminal_resizes: HashMap<String, (u16, u16)>,
@@ -435,6 +482,7 @@ pub(crate) struct Ashell {
     pub(crate) cmd_ctrl_pressed: bool,
     pub(crate) _subscriptions: Vec<gpui::Subscription>,
     pub(crate) last_window_bounds: Option<gpui::WindowBounds>,
+    pub(crate) window_bounds_save_task: Option<gpui::Task<()>>,
     pub(crate) save_lock: std::sync::Arc<std::sync::Mutex<()>>,
     pub(crate) save_latest_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -950,6 +998,8 @@ impl Ashell {
             runtime: Runtime::new().expect("create tokio runtime"),
             events_rx,
             events_tx,
+            pending_backend_event: None,
+            last_backend_backlog_warning: None,
             last_window_size: None,
             last_sidebar_width,
             pending_local_terminal_resizes: HashMap::new(),
@@ -958,6 +1008,7 @@ impl Ashell {
             cmd_ctrl_pressed: false,
             _subscriptions,
             last_window_bounds: Some(window.window_bounds()),
+            window_bounds_save_task: None,
             save_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             save_latest_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
@@ -1122,6 +1173,7 @@ impl Ashell {
 
         self.runtime.spawn(async move {
             let _ = tokio::task::spawn_blocking(move || {
+                let save_started_at = Instant::now();
                 let Ok(_guard) = save_lock.lock() else {
                     tracing::error!("failed to lock preferences save state");
                     return;
@@ -1131,6 +1183,13 @@ impl Ashell {
                 }
                 if let Err(err) = config_store.save_merged_preferences(local_config) {
                     tracing::error!("failed to save merged preferences in background: {err:#}");
+                }
+                let elapsed = save_started_at.elapsed();
+                if elapsed >= SLOW_OPERATION_WARNING_THRESHOLD {
+                    tracing::warn!(
+                        elapsed_ms = elapsed.as_millis(),
+                        "background preference save exceeded the latency threshold"
+                    );
                 }
             })
             .await;
@@ -1315,7 +1374,7 @@ impl Ashell {
                         let terminal_notification_activated =
                             this.handle_terminal_notification_activations(window, cx);
                         let activation_changed = this.sync_window_activation(window);
-                        let changed = this.drain_backend_events(cx);
+                        let drain_outcome = this.drain_backend_events(cx);
                         let system_sampled = this.sample_system_if_due();
                         this.sync_theme_if_due(cx);
                         let is_blinking = matches!(
@@ -1330,7 +1389,7 @@ impl Ashell {
                                 >= std::time::Duration::from_millis(600);
                         if terminal_notification_activated
                             || activation_changed
-                            || changed
+                            || drain_outcome.changed
                             || system_sampled
                             || activity_changed
                             || blink_due
@@ -1350,14 +1409,64 @@ impl Ashell {
         .detach();
     }
 
-    pub(crate) fn drain_backend_events(&mut self, cx: &mut Context<Self>) -> bool {
-        let mut changed = false;
+    fn drain_backend_events(&mut self, cx: &mut Context<Self>) -> BackendDrainOutcome {
+        let started_at = Instant::now();
+        let mut outcome = BackendDrainOutcome::default();
         let mut transfers_changed = false;
-        while let Ok(event) = self.events_rx.try_recv() {
-            let Some(event) = event.into_current() else {
+
+        loop {
+            if !backend_drain_budget_allows_more(
+                outcome.processed_events,
+                outcome.output_bytes,
+                started_at.elapsed(),
+            ) {
+                break;
+            }
+
+            let event = if let Some(event) = self.pending_backend_event.take() {
+                event
+            } else {
+                let Ok(event) = self.events_rx.try_recv() else {
+                    break;
+                };
+                event
+            };
+            outcome.processed_events += 1;
+
+            let Some(mut event) = event.into_current() else {
                 continue;
             };
-            changed = true;
+
+            if let BackendEvent::Output { tab_id, bytes } = &mut event {
+                outcome.output_bytes = outcome.output_bytes.saturating_add(bytes.len());
+                while bytes.len() < MAX_COALESCED_OUTPUT_BYTES
+                    && backend_drain_budget_allows_more(
+                        outcome.processed_events,
+                        outcome.output_bytes,
+                        started_at.elapsed(),
+                    )
+                {
+                    let Ok(next) = self.events_rx.try_recv() else {
+                        break;
+                    };
+                    let Some(next) = next.into_current() else {
+                        outcome.processed_events += 1;
+                        continue;
+                    };
+                    match merge_adjacent_output(tab_id, bytes, next) {
+                        Ok(appended) => {
+                            outcome.processed_events += 1;
+                            outcome.output_bytes = outcome.output_bytes.saturating_add(appended);
+                        }
+                        Err(next) => {
+                            self.pending_backend_event = Some(next);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            outcome.changed = true;
             match event {
                 BackendEvent::Guarded { .. } => unreachable!("guarded events are unwrapped above"),
                 BackendEvent::Output { tab_id, bytes } => {
@@ -1710,7 +1819,35 @@ impl Ashell {
         if transfers_changed {
             self.config.set_transfers(self.transfers.clone());
         }
-        changed
+
+        let limit_reached = !backend_drain_budget_allows_more(
+            outcome.processed_events,
+            outcome.output_bytes,
+            started_at.elapsed(),
+        );
+        if limit_reached
+            && self.pending_backend_event.is_none()
+            && let Ok(event) = self.events_rx.try_recv()
+        {
+            self.pending_backend_event = Some(event);
+        }
+        outcome.budget_exhausted = self.pending_backend_event.is_some();
+
+        if outcome.budget_exhausted
+            && self
+                .last_backend_backlog_warning
+                .is_none_or(|warned_at| warned_at.elapsed() >= BACKEND_BACKLOG_WARNING_INTERVAL)
+        {
+            tracing::warn!(
+                processed_events = outcome.processed_events,
+                output_bytes = outcome.output_bytes,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "backend event drain reached its UI-thread budget; deferring remaining events"
+            );
+            self.last_backend_backlog_warning = Some(Instant::now());
+        }
+
+        outcome
     }
 
     pub(crate) fn sample_system_if_due(&mut self) -> bool {
@@ -2223,6 +2360,7 @@ impl Ashell {
     }
 
     pub(crate) fn save_layout_state(&mut self, window: &mut gpui::Window, cx: &gpui::App) {
+        self.window_bounds_save_task = None;
         let should_save_tabs = self.config.remember_tabs();
         if should_save_tabs {
             self.capture_tabs_state();
@@ -2232,6 +2370,7 @@ impl Ashell {
                 .save_latest_seq
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                 + 1;
+            let save_started_at = Instant::now();
             let Ok(_guard) = self.save_lock.lock() else {
                 tracing::error!("failed to lock window layout save state");
                 return;
@@ -2245,6 +2384,13 @@ impl Ashell {
             }
             if let Err(err) = self.config.save() {
                 tracing::error!("failed to save window layout state: {err:#}");
+            }
+            let elapsed = save_started_at.elapsed();
+            if elapsed >= SLOW_OPERATION_WARNING_THRESHOLD {
+                tracing::warn!(
+                    elapsed_ms = elapsed.as_millis(),
+                    "synchronous layout save exceeded the latency threshold"
+                );
             }
         }
     }
@@ -2263,11 +2409,16 @@ impl Ashell {
         }
         self.last_window_bounds = Some(current_bounds);
 
-        // Save synchronously on the main thread. Background saves are killed by
-        // ExitProcess on Windows before they can flush during shutdown.
-        if self.capture_layout_state(window, cx) {
-            self.save_layout_state(window, cx);
-        }
+        self.window_bounds_save_task = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(WINDOW_BOUNDS_SAVE_DEBOUNCE)
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.capture_layout_state(window, cx) {
+                    this.save_preferences_background();
+                }
+            });
+        }));
     }
 
     fn save_layout_on_app_quit(&mut self, cx: &mut Context<Self>) -> gpui::Task<()> {
@@ -2284,7 +2435,15 @@ impl Ashell {
 
 #[cfg(test)]
 mod tests {
-    use super::{PaneLayout, TerminalNotificationOccasion, should_show_terminal_notification};
+    use std::time::Duration;
+
+    use crate::terminal::BackendEvent;
+
+    use super::{
+        BACKEND_EVENT_TIME_BUDGET, MAX_BACKEND_EVENTS_PER_TICK, MAX_BACKEND_OUTPUT_BYTES_PER_TICK,
+        MAX_COALESCED_OUTPUT_BYTES, PaneLayout, TerminalNotificationOccasion,
+        backend_drain_budget_allows_more, merge_adjacent_output, should_show_terminal_notification,
+    };
 
     #[test]
     fn pane_layout_queries_and_removes_tabs_in_display_order() {
@@ -2345,5 +2504,89 @@ mod tests {
             true,
             false,
         ));
+    }
+
+    #[test]
+    fn backend_drain_budget_stops_at_each_limit() {
+        assert!(backend_drain_budget_allows_more(
+            MAX_BACKEND_EVENTS_PER_TICK - 1,
+            MAX_BACKEND_OUTPUT_BYTES_PER_TICK - 1,
+            BACKEND_EVENT_TIME_BUDGET - Duration::from_nanos(1),
+        ));
+        assert!(!backend_drain_budget_allows_more(
+            MAX_BACKEND_EVENTS_PER_TICK,
+            0,
+            Duration::ZERO,
+        ));
+        assert!(!backend_drain_budget_allows_more(
+            0,
+            MAX_BACKEND_OUTPUT_BYTES_PER_TICK,
+            Duration::ZERO,
+        ));
+        assert!(!backend_drain_budget_allows_more(
+            0,
+            0,
+            BACKEND_EVENT_TIME_BUDGET,
+        ));
+    }
+
+    #[test]
+    fn merges_only_adjacent_output_for_the_same_tab_within_the_size_limit() {
+        let mut bytes = b"first".to_vec();
+        let appended = merge_adjacent_output(
+            "tab-1",
+            &mut bytes,
+            BackendEvent::Output {
+                tab_id: "tab-1".to_string(),
+                bytes: b"-second".to_vec(),
+            },
+        )
+        .expect("same-tab output should merge");
+
+        assert_eq!(appended, 7);
+        assert_eq!(bytes.as_slice(), b"first-second");
+
+        let different_tab = merge_adjacent_output(
+            "tab-1",
+            &mut bytes,
+            BackendEvent::Output {
+                tab_id: "tab-2".to_string(),
+                bytes: b"third".to_vec(),
+            },
+        )
+        .expect_err("different-tab output must preserve its event boundary");
+        assert!(matches!(
+            different_tab,
+            BackendEvent::Output { tab_id, bytes }
+                if tab_id == "tab-2" && bytes.as_slice() == b"third"
+        ));
+
+        let status = merge_adjacent_output(
+            "tab-1",
+            &mut bytes,
+            BackendEvent::Status {
+                tab_id: "tab-1".to_string(),
+                text: "ready".to_string(),
+            },
+        )
+        .expect_err("control events must preserve their event boundary");
+        assert!(matches!(
+            status,
+            BackendEvent::Status { tab_id, text }
+                if tab_id == "tab-1" && text == "ready"
+        ));
+
+        let mut nearly_full = vec![0; MAX_COALESCED_OUTPUT_BYTES - 1];
+        let oversized = merge_adjacent_output(
+            "tab-1",
+            &mut nearly_full,
+            BackendEvent::Output {
+                tab_id: "tab-1".to_string(),
+                bytes: vec![1, 2],
+            },
+        )
+        .expect_err("output beyond the coalescing limit must remain pending");
+        assert_eq!(nearly_full.len(), MAX_COALESCED_OUTPUT_BYTES - 1);
+        assert!(matches!(oversized, BackendEvent::Output { bytes, .. } if bytes == vec![1, 2]));
     }
 }
