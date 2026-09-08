@@ -226,6 +226,8 @@ pub struct SavedTabGroup {
     pub title: String,
     pub pane_root: SavedPaneLayout,
     #[serde(default)]
+    pub focused_tab_id: Option<String>,
+    #[serde(default)]
     pub tabs: Vec<SavedTerminalTab>,
 }
 
@@ -280,7 +282,10 @@ pub struct ConfigFile {
     pub dark_theme_name: String,
     #[serde(default = "default_locale")]
     pub locale: String,
-    #[serde(default = "default_terminal_font_size")]
+    #[serde(
+        default = "default_terminal_font_size",
+        deserialize_with = "deserialize_terminal_font_size"
+    )]
     pub terminal_font_size: f32,
     #[serde(default)]
     pub local_terminal_encoding: TextEncoding,
@@ -329,6 +334,8 @@ pub struct ConfigFile {
     pub sftp_file_columns_customized: bool,
     #[serde(default)]
     pub transfers: Vec<crate::terminal::Transfer>,
+    #[serde(default)]
+    pub transfers_revision: u64,
     #[serde(default)]
     pub show_hidden_files: bool,
     #[serde(default)]
@@ -409,8 +416,21 @@ fn default_terminal_font_size() -> f32 {
     12.0
 }
 
-const LEGACY_DEFAULT_TERMINAL_FONT_SIZE: f32 = 18.0;
-const LEGACY_DEFAULT_UI_FONT_SIZE: f32 = 16.0;
+pub(crate) fn normalize_terminal_font_size(font_size: f32) -> f32 {
+    if !font_size.is_finite() || font_size <= 0.0 {
+        return default_terminal_font_size();
+    }
+    // Older scroll zoom values used half pixels, which the settings label rounded to even numbers.
+    font_size.round().clamp(10.0, 24.0)
+}
+
+fn deserialize_terminal_font_size<'de, D>(deserializer: D) -> std::result::Result<f32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let font_size = f32::deserialize(deserializer)?;
+    Ok(normalize_terminal_font_size(font_size))
+}
 
 fn default_ui_font_size() -> f32 {
     14.0
@@ -487,6 +507,7 @@ impl Default for ConfigFile {
             sftp_file_columns: None,
             sftp_file_columns_customized: false,
             transfers: Vec::new(),
+            transfers_revision: 0,
             show_hidden_files: false,
             lock_layout: false,
             monitoring_position: default_monitoring_position(),
@@ -519,6 +540,7 @@ pub struct ConfigStore {
     pub(crate) path: PathBuf,
     pub(crate) cache: ConfigFile,
     write_lock: Arc<Mutex<()>>,
+    write_error: Option<String>,
 }
 
 fn config_backup_path(path: &Path) -> PathBuf {
@@ -536,7 +558,7 @@ fn decode_config_bytes(raw_bytes: &[u8], hardware_uuid: &str) -> Result<ConfigFi
     }
 }
 
-fn persist_config_bytes(path: &Path, contents: &[u8]) -> Result<()> {
+pub(crate) fn persist_config_bytes(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .context("configuration path has no parent directory")?;
@@ -689,6 +711,7 @@ impl ConfigStore {
             ConfigFile::default()
         };
 
+        cache.terminal_font_size = normalize_terminal_font_size(cache.terminal_font_size);
         if cache.sync_device_id.is_empty() {
             cache.sync_device_id = Uuid::new_v4().to_string();
         }
@@ -708,6 +731,7 @@ impl ConfigStore {
             path,
             cache,
             write_lock: Arc::new(Mutex::new(())),
+            write_error: None,
         };
         store.sync_connection_groups_from_sessions();
         Ok(store)
@@ -722,7 +746,29 @@ impl ConfigStore {
             path: PathBuf::new(),
             cache,
             write_lock: Arc::new(Mutex::new(())),
+            write_error: None,
         }
+    }
+
+    /// Keep failed configuration readable/exportable without pretending writes succeed.
+    pub(crate) fn degraded(error: String) -> Self {
+        let mut store = Self::in_memory();
+        store.path = Self::config_path().unwrap_or_default();
+        store.write_error = Some(error);
+        store
+    }
+
+    pub(crate) fn read_only_reason(&self) -> Option<&str> {
+        self.write_error.as_deref()
+    }
+
+    fn ensure_writable(&self) -> Result<()> {
+        if let Some(reason) = &self.write_error {
+            return Err(anyhow::anyhow!(
+                "configuration is read-only after a load failure: {reason}"
+            ));
+        }
+        Ok(())
     }
 
     fn config_path() -> Result<PathBuf> {
@@ -1167,13 +1213,7 @@ impl ConfigStore {
     }
 
     pub fn terminal_font_size(&self) -> f32 {
-        if self.cache.terminal_font_size <= 0.0
-            || (self.cache.terminal_font_size - LEGACY_DEFAULT_TERMINAL_FONT_SIZE).abs() < 0.01
-        {
-            default_terminal_font_size()
-        } else {
-            self.cache.terminal_font_size
-        }
+        normalize_terminal_font_size(self.cache.terminal_font_size)
     }
 
     pub fn set_theme_preferences(
@@ -1238,9 +1278,7 @@ impl ConfigStore {
 
     pub fn set_transfers(&mut self, transfers: Vec<crate::terminal::Transfer>) {
         self.cache.transfers = transfers;
-        if let Err(err) = self.save() {
-            tracing::error!("failed to save config: {err:#}");
-        }
+        self.cache.transfers_revision = self.cache.transfers_revision.saturating_add(1);
     }
 
     pub fn set_layout_state(
@@ -1267,7 +1305,7 @@ impl ConfigStore {
     }
 
     pub fn set_terminal_font_size(&mut self, terminal_font_size: f32) {
-        self.cache.terminal_font_size = terminal_font_size.max(10.0);
+        self.cache.terminal_font_size = normalize_terminal_font_size(terminal_font_size);
     }
 
     pub fn local_terminal_encoding(&self) -> TextEncoding {
@@ -1287,10 +1325,7 @@ impl ConfigStore {
     }
 
     pub fn ui_font_size(&self) -> f32 {
-        if self.cache.ui_font_size <= 0.0
-            || (self.cache.ui_font_size - LEGACY_DEFAULT_UI_FONT_SIZE).abs() < 0.01
-        {
-            // Migrate the previous application default to the current compact default.
+        if self.cache.ui_font_size <= 0.0 {
             default_ui_font_size()
         } else {
             self.cache.ui_font_size
@@ -1466,6 +1501,7 @@ impl ConfigStore {
     }
 
     pub fn save(&self) -> Result<()> {
+        self.ensure_writable()?;
         if self.path.as_os_str().is_empty() {
             return Ok(());
         }
@@ -1479,6 +1515,7 @@ impl ConfigStore {
     }
 
     pub fn save_merged_preferences(&self, local_config: ConfigFile) -> Result<()> {
+        self.ensure_writable()?;
         if self.path.as_os_str().is_empty() {
             return Ok(());
         }
@@ -1501,13 +1538,19 @@ impl ConfigStore {
             self.cache.clone()
         };
 
+        if local_config.transfers_revision >= disk_config.transfers_revision {
+            disk_config.transfers = local_config.transfers.clone();
+            disk_config.transfers_revision = local_config.transfers_revision;
+        }
+
         // Merge UI preference fields
         disk_config.follow_system_theme = local_config.follow_system_theme;
         disk_config.theme_mode = local_config.theme_mode;
         disk_config.light_theme_name = local_config.light_theme_name;
         disk_config.dark_theme_name = local_config.dark_theme_name;
         disk_config.locale = local_config.locale;
-        disk_config.terminal_font_size = local_config.terminal_font_size;
+        disk_config.terminal_font_size =
+            normalize_terminal_font_size(local_config.terminal_font_size);
         disk_config.local_terminal_encoding = local_config.local_terminal_encoding;
         disk_config.local_terminal_shell = local_config.local_terminal_shell;
         disk_config.ui_font_size = local_config.ui_font_size;
@@ -1583,6 +1626,44 @@ pub struct EnvProxy {
 }
 
 pub static ENV_PROXY: OnceLock<Option<EnvProxy>> = OnceLock::new();
+
+/// Read exactly the CONNECT headers, leaving any prefetched SSH banner buffered.
+async fn read_http_connect_response<S>(stream: S) -> Result<tokio::io::BufReader<S>>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    let mut stream = tokio::io::BufReader::new(stream);
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        if headers.len() >= 16 * 1024 {
+            return Err(anyhow::anyhow!("HTTP proxy response headers exceed 16 KiB"));
+        }
+        headers.push(
+            stream
+                .read_u8()
+                .await
+                .context("read HTTP proxy CONNECT response")?,
+        );
+    }
+    let first_line = headers
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let line = std::str::from_utf8(first_line).context("invalid HTTP proxy status line")?;
+    let mut fields = line.split_whitespace();
+    let version = fields.next().unwrap_or_default();
+    let status = fields.next().and_then(|value| value.parse::<u16>().ok());
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+        || !status.is_some_and(|code| (200..300).contains(&code))
+    {
+        return Err(anyhow::anyhow!(
+            "HTTP proxy CONNECT rejected: {}",
+            line.trim()
+        ));
+    }
+    Ok(stream)
+}
 
 pub async fn connect_proxy(session: &Session) -> Result<Box<dyn ProxyStream>> {
     let target_host = session.host.clone();
@@ -1685,13 +1766,7 @@ pub async fn connect_proxy(session: &Session) -> Result<Box<dyn ProxyStream>> {
 
                 stream.write_all(request.as_bytes()).await?;
 
-                let mut response = [0u8; 1024];
-                let n = tokio::io::AsyncReadExt::read(&mut stream, &mut response).await?;
-                let resp_str = String::from_utf8_lossy(&response[..n]);
-                if !resp_str.contains("200") && !resp_str.contains("established") {
-                    return Err(anyhow::anyhow!("HTTP proxy CONNECT failed: {}", resp_str));
-                }
-
+                let stream = read_http_connect_response(stream).await?;
                 Ok(Box::new(stream) as Box<dyn ProxyStream>)
             }
             _ => {
@@ -1899,6 +1974,100 @@ fn decrypt_config(raw: &[u8], password: &str) -> Result<ConfigFile> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn http_connect_preserves_coalesced_ssh_banner_and_bidirectional_io() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (client, mut proxy) = tokio::io::duplex(1024);
+        proxy
+            .write_all(
+                b"HTTP/1.1 200 Connection established\r\nX-Proxy: test\r\n\r\nSSH-2.0-test\r\n",
+            )
+            .await
+            .unwrap();
+        let mut client = read_http_connect_response(client).await.unwrap();
+        let mut banner = [0u8; 14];
+        client.read_exact(&mut banner).await.unwrap();
+        assert_eq!(&banner, b"SSH-2.0-test\r\n");
+        client.write_all(b"client").await.unwrap();
+        let mut response = [0; 6];
+        proxy.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"client");
+    }
+
+    #[tokio::test]
+    async fn http_connect_handles_fragmented_headers_and_rejects_false_success() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (client, mut proxy) = tokio::io::duplex(8);
+        let writer = tokio::spawn(async move {
+            for byte in b"HTTP/1.0 200 OK\r\n\r\nSSH" {
+                proxy.write_all(&[*byte]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        let mut client = read_http_connect_response(client).await.unwrap();
+        let mut banner = [0; 3];
+        client.read_exact(&mut banner).await.unwrap();
+        assert_eq!(&banner, b"SSH");
+        writer.await.unwrap();
+        let rejected =
+            &b"HTTP/1.1 407 Proxy authentication required\r\nX-Message: 200 established\r\n\r\n"[..];
+        assert!(read_http_connect_response(rejected).await.is_err());
+        let oversized = vec![b'x'; 16 * 1024 + 1];
+        assert!(
+            read_http_connect_response(oversized.as_slice())
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn degraded_configuration_reports_write_failure_and_preserves_original_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.json");
+        fs::write(&path, b"unreadable original").unwrap();
+        let mut store = ConfigStore::degraded("test load failure".into());
+        store.path = path.clone();
+        assert!(store.read_only_reason().is_some());
+        assert!(store.save().is_err());
+        assert!(store.save_merged_preferences(store.cache.clone()).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"unreadable original");
+        assert!(serde_json::to_vec(&store.cache).is_ok());
+    }
+
+    #[test]
+    fn transfer_updates_are_deferred_and_old_snapshots_cannot_restore_deleted_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::in_memory();
+        store.path = directory.path().join("sessions.json");
+        store.save().unwrap();
+        let before = fs::read(&store.path).unwrap();
+        let transfer = crate::terminal::Transfer {
+            tab_id: "a".into(),
+            tab_title: "A".into(),
+            info: crate::terminal::TransferInfo {
+                id: "upload-a".into(),
+                name: "data".into(),
+                source: "local".into(),
+                target: "/data".into(),
+                kind: crate::terminal::TransferType::Upload,
+                total_bytes: Some(10),
+            },
+            transferred: 5,
+            total: Some(10),
+            state: crate::terminal::TransferState::Interrupted("network lost".into()),
+        };
+        store.set_transfers(vec![transfer]);
+        assert_eq!(fs::read(&store.path).unwrap(), before);
+        let stale = store.cache.clone();
+        store.save_merged_preferences(stale.clone()).unwrap();
+        store.set_transfers(Vec::new());
+        store.save_merged_preferences(store.cache.clone()).unwrap();
+        store.save_merged_preferences(stale).unwrap();
+        let saved =
+            decode_config_bytes(&fs::read(&store.path).unwrap(), &get_hardware_uuid()).unwrap();
+        assert!(saved.transfers.is_empty());
+    }
+
     #[test]
     fn test_get_hardware_uuid() {
         let uuid = get_hardware_uuid();
@@ -1942,20 +2111,50 @@ mod tests {
     }
 
     #[test]
-    fn font_sizes_migrate_the_previous_defaults() {
+    fn configured_font_sizes_survive_config_reload() {
         let mut store = ConfigStore::in_memory();
 
         assert_eq!(store.terminal_font_size(), 12.0);
         assert_eq!(store.ui_font_size(), 14.0);
 
-        store.set_terminal_font_size(18.0);
+        store.set_terminal_font_size(13.0);
+        store.set_ui_font_size(16.0);
+
+        let serialized = serde_json::to_vec(&store.cache).unwrap();
+        let cache = serde_json::from_slice(&serialized).unwrap();
+        let reopened = ConfigStore {
+            cache,
+            ..ConfigStore::in_memory()
+        };
+
+        assert_eq!(reopened.terminal_font_size(), 13.0);
+        assert_eq!(reopened.ui_font_size(), 16.0);
+    }
+
+    #[test]
+    fn terminal_font_size_preserves_odd_pixels_and_normalizes_legacy_halves() {
+        let mut store = ConfigStore::in_memory();
+
+        store.set_terminal_font_size(11.0);
+        assert_eq!(store.terminal_font_size(), 11.0);
+        store.set_terminal_font_size(13.0);
+        assert_eq!(store.terminal_font_size(), 13.0);
+
+        store.cache.terminal_font_size = 10.5;
+        assert_eq!(store.terminal_font_size(), 11.0);
+        store.cache.terminal_font_size = 11.5;
         assert_eq!(store.terminal_font_size(), 12.0);
+        store.cache.terminal_font_size = 12.5;
+        assert_eq!(store.terminal_font_size(), 13.0);
+        store.cache.terminal_font_size = 13.5;
+        assert_eq!(store.terminal_font_size(), 14.0);
+    }
 
-        store.set_ui_font_size(14.0);
-        assert_eq!(store.ui_font_size(), 14.0);
+    #[test]
+    fn terminal_font_size_is_normalized_when_deserialized() {
+        let config: ConfigFile = serde_json::from_str(r#"{"terminal_font_size":11.5}"#).unwrap();
 
-        store.set_ui_font_size(20.0);
-        assert_eq!(store.ui_font_size(), 20.0);
+        assert_eq!(config.terminal_font_size, 12.0);
     }
 
     #[test]
@@ -2047,17 +2246,33 @@ mod tests {
                 groups: vec![SavedTabGroup {
                     id: "group-1".to_string(),
                     title: "~".to_string(),
-                    pane_root: SavedPaneLayout::Single {
-                        tab_id: "tab-1".to_string(),
+                    pane_root: SavedPaneLayout::Horizontal {
+                        children: vec![
+                            SavedPaneLayout::Single {
+                                tab_id: "tab-1".to_string(),
+                            },
+                            SavedPaneLayout::Single {
+                                tab_id: "tab-2".to_string(),
+                            },
+                        ],
+                        ratio: 0.5,
                     },
-                    tabs: vec![SavedTerminalTab::Local {
-                        id: "tab-1".to_string(),
-                        cwd: Some(PathBuf::from("/tmp")),
-                        terminal_encoding: TextEncoding::Utf8,
-                    }],
+                    focused_tab_id: Some("tab-2".to_string()),
+                    tabs: vec![
+                        SavedTerminalTab::Local {
+                            id: "tab-1".to_string(),
+                            cwd: Some(PathBuf::from("/tmp")),
+                            terminal_encoding: TextEncoding::Utf8,
+                        },
+                        SavedTerminalTab::Local {
+                            id: "tab-2".to_string(),
+                            cwd: Some(PathBuf::from("/tmp")),
+                            terminal_encoding: TextEncoding::Utf8,
+                        },
+                    ],
                 }],
                 active_group: Some("group-1".to_string()),
-                active_tab: Some("tab-1".to_string()),
+                active_tab: Some("tab-2".to_string()),
             }),
             ..Default::default()
         };
@@ -2072,7 +2287,24 @@ mod tests {
         );
         let restored_tabs = restored.saved_tabs.unwrap();
         assert_eq!(restored_tabs.groups.len(), 1);
-        assert_eq!(restored_tabs.active_tab.as_deref(), Some("tab-1"));
+        assert_eq!(restored_tabs.active_tab.as_deref(), Some("tab-2"));
+        assert_eq!(
+            restored_tabs.groups[0].focused_tab_id.as_deref(),
+            Some("tab-2")
+        );
+    }
+
+    #[test]
+    fn saved_tab_groups_without_focus_still_load() {
+        let group: SavedTabGroup = serde_json::from_value(serde_json::json!({
+            "id": "legacy-group",
+            "title": "Local",
+            "pane_root": { "type": "single", "tab_id": "legacy-tab" },
+            "tabs": [{ "type": "local", "id": "legacy-tab" }]
+        }))
+        .unwrap();
+        assert!(group.focused_tab_id.is_none());
+        assert_eq!(group.tabs.len(), 1);
     }
 
     #[test]
@@ -2083,6 +2315,7 @@ mod tests {
             path: path.clone(),
             cache: ConfigFile::default(),
             write_lock: Arc::new(Mutex::new(())),
+            write_error: None,
         };
 
         let session = Session {

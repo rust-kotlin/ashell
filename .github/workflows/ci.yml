@@ -53,12 +53,27 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+          components: rustfmt
+
+      - name: Identify native Rust target
+        id: rust_host
+        shell: bash
+        run: |
+          rustc -vV | sed -n 's/^host: /target=/p' >> "$GITHUB_OUTPUT"
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
+      - name: Check Rust formatting
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo fmt --all -- --check
+
+      - name: Run regression tests on native targets
+        if: matrix.target == steps.rust_host.outputs.target
+        run: cargo test --release --locked --bin ashell --target ${{ matrix.target }}
+
       - name: Build (release)
         # We build in release mode so that the release workflow can reuse the exact artifacts
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}

@@ -17,6 +17,30 @@ thread_local! {
     static LAST_DRAG_SCROLL: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
 }
 
+const TERMINAL_ZOOM_PIXEL_STEP: f32 = 20.0;
+
+fn terminal_zoom_steps(delta: &ScrollDelta, accumulator: &mut f32) -> i32 {
+    match delta {
+        ScrollDelta::Lines(point) => {
+            *accumulator = 0.0;
+            point.y.signum() as i32
+        }
+        ScrollDelta::Pixels(point) => {
+            let delta_y = point.y.as_f32();
+            if delta_y == 0.0 {
+                return 0;
+            }
+            if *accumulator != 0.0 && (*accumulator).signum() != delta_y.signum() {
+                *accumulator = 0.0;
+            }
+            *accumulator += delta_y;
+            let steps = (*accumulator / TERMINAL_ZOOM_PIXEL_STEP).trunc() as i32;
+            *accumulator -= steps as f32 * TERMINAL_ZOOM_PIXEL_STEP;
+            steps
+        }
+    }
+}
+
 impl Ashell {
     pub(crate) fn on_terminal_key_down(
         &mut self,
@@ -114,22 +138,14 @@ impl Ashell {
             }
         }
 
-        // If the active tab is disconnected and user presses Enter, reconnect
+        // Enter always reconnects the active pane. A failed connection progress
+        // left by another tab must never redirect terminal input to that tab.
         if event.keystroke.key == "enter"
             && !event.keystroke.modifiers.shift
             && !event.keystroke.modifiers.control
             && !event.keystroke.modifiers.alt
             && !event.keystroke.modifiers.platform
         {
-            if let Some(progress) = &self.connection_progress {
-                if progress.failed {
-                    self.retry_connection_progress(cx);
-                    window.prevent_default();
-                    cx.stop_propagation();
-                    return;
-                }
-            }
-
             let active_id = self.active_tab.clone();
             if let Some(active_id) = active_id {
                 let is_disconnected = self
@@ -330,6 +346,12 @@ impl Ashell {
         tab.send_backend(BackendCommand::Input(encoded));
         window.invalidate_character_coordinates();
         cx.notify();
+    }
+
+    pub(crate) fn clear_ssh_input_tracking(&mut self, tab_id: &str) {
+        self.ssh_command_buffers.remove(tab_id);
+        self.ssh_command_starts.remove(tab_id);
+        self.ssh_command_input_uncertain.remove(tab_id);
     }
 
     /// Track the current SSH shell line and persist completed commands.
@@ -813,16 +835,9 @@ impl Ashell {
     ) {
         // Platform modifier (Cmd on macOS, Ctrl on Windows/Linux) + scroll → zoom terminal font size
         if event.modifiers.platform {
-            let delta = match event.delta {
-                ScrollDelta::Lines(point) => point.y * 20.0,
-                ScrollDelta::Pixels(point) => point.y.as_f32(),
-            };
-            self.terminal_zoom_accumulator += delta;
-            let step = 20.0;
-            if self.terminal_zoom_accumulator.abs() >= step {
-                let zoom_steps = (self.terminal_zoom_accumulator / step).trunc();
-                self.terminal_zoom_accumulator -= zoom_steps * step;
-                self.change_terminal_font_size(zoom_steps * 0.5, cx);
+            let zoom_steps = terminal_zoom_steps(&event.delta, &mut self.terminal_zoom_accumulator);
+            if zoom_steps != 0 {
+                self.change_terminal_font_size(zoom_steps, window, cx);
             }
             window.prevent_default();
             cx.stop_propagation();
@@ -1331,25 +1346,30 @@ fn buffer_position_in_viewport(
     (row < snapshot.rows && position.1 < snapshot.cols).then_some((row, position.1))
 }
 
+/// Persist only text confirmed on screen; raw keystrokes may be passwords.
 fn command_history_text(rendered: Option<&str>, buffered: &str, input_uncertain: bool) -> String {
     let rendered = rendered.unwrap_or_default().trim();
     let buffered = buffered.trim();
-    if !input_uncertain && !buffered.is_empty() {
-        return buffered.to_string();
-    }
-    if rendered.is_empty() {
-        return buffered.to_string();
-    }
-    if buffered.is_empty() {
-        return rendered.to_string();
-    }
-    // Completion extends the current token; a new argument after exact raw input is stale content.
-    if rendered
-        .strip_prefix(buffered)
-        .and_then(|suffix| suffix.chars().next())
-        .is_some_and(char::is_whitespace)
+    if rendered.is_empty()
+        || rendered
+            .chars()
+            .all(|character| matches!(character, '*' | '•'))
     {
-        return buffered.to_string();
+        return String::new();
+    }
+    if !input_uncertain && !buffered.is_empty() {
+        return rendered
+            .strip_prefix(buffered)
+            .map(|_| rendered[..buffered.len()].to_string())
+            .unwrap_or_default();
+    }
+    if !buffered.is_empty()
+        && rendered
+            .strip_prefix(buffered)
+            .and_then(|suffix| suffix.chars().next())
+            .is_some_and(char::is_whitespace)
+    {
+        return rendered[..buffered.len()].to_string();
     }
     rendered.to_string()
 }
@@ -1361,11 +1381,12 @@ mod tests {
         cell::{Cell, Flags},
     };
     use alacritty_terminal::vte::ansi::CursorShape;
+    use gpui::{ScrollDelta, point, px};
 
     use super::{
         alternate_screen_cursor_move, command_history_text, prompt_click_is_valid,
         prompt_cursor_move, sgr_prompt_click, terminal_command_text, terminal_grid_row,
-        terminal_mouse_click,
+        terminal_mouse_click, terminal_zoom_steps,
     };
     use crate::terminal::{CursorState, PromptClickMode, RenderCell, RenderSnapshot};
 
@@ -1393,6 +1414,43 @@ mod tests {
             cols,
             highlights: Default::default(),
         }
+    }
+
+    #[test]
+    fn terminal_zoom_uses_whole_pixel_steps_for_line_scrolls() {
+        let mut accumulator = 10.0;
+
+        assert_eq!(
+            terminal_zoom_steps(&ScrollDelta::Lines(point(0.0, 4.0)), &mut accumulator),
+            1
+        );
+        assert_eq!(accumulator, 0.0);
+        assert_eq!(
+            terminal_zoom_steps(&ScrollDelta::Lines(point(0.0, -3.0)), &mut accumulator),
+            -1
+        );
+    }
+
+    #[test]
+    fn terminal_zoom_accumulates_precise_scrolls_into_whole_pixel_steps() {
+        let mut accumulator = 0.0;
+
+        assert_eq!(
+            terminal_zoom_steps(
+                &ScrollDelta::Pixels(point(px(0.0), px(10.0))),
+                &mut accumulator,
+            ),
+            0
+        );
+        assert_eq!(accumulator, 10.0);
+        assert_eq!(
+            terminal_zoom_steps(
+                &ScrollDelta::Pixels(point(px(0.0), px(10.0))),
+                &mut accumulator,
+            ),
+            1
+        );
+        assert_eq!(accumulator, 0.0);
     }
 
     #[test]
@@ -1602,10 +1660,23 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_raw_input_when_uncertain_screen_text_is_unavailable() {
+    fn skips_history_when_server_echo_is_unavailable() {
         let command = "sh /site/jimureport/jimureport-restart.sh";
 
-        assert_eq!(command_history_text(None, command, true), command);
+        assert_eq!(command_history_text(None, command, true), "");
+        assert_eq!(command_history_text(None, "sudo-password", false), "");
+        assert_eq!(
+            command_history_text(Some("sudo-"), "sudo-password", false),
+            ""
+        );
+        assert_eq!(
+            command_history_text(Some("********"), "sudo-password", false),
+            ""
+        );
+        assert_eq!(
+            command_history_text(Some("********"), "sudo-password", true),
+            ""
+        );
     }
 
     #[test]

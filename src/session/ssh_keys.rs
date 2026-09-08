@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use directories::BaseDirs;
 use russh::{
     client::{self, Handler},
@@ -31,31 +31,25 @@ pub fn normalize_inline_private_key(value: &str) -> String {
     normalized
 }
 
-pub fn private_keys_with_algs(keypair: PrivateKey) -> Result<Vec<PrivateKeyWithHashAlg>> {
+pub fn private_keys_with_algs(keypair: PrivateKey) -> Vec<PrivateKeyWithHashAlg> {
     let mut algs = Vec::new();
     let key_arc = Arc::new(keypair);
 
     if key_arc.algorithm().is_rsa() {
-        if let Ok(k) = PrivateKeyWithHashAlg::new(key_arc.clone(), Some(HashAlg::Sha512)) {
-            algs.push(k);
-        }
-        if let Ok(k) = PrivateKeyWithHashAlg::new(key_arc.clone(), Some(HashAlg::Sha256)) {
-            algs.push(k);
-        }
-        if let Ok(k) = PrivateKeyWithHashAlg::new(key_arc.clone(), None) {
-            algs.push(k);
-        }
-    } else if let Ok(k) = PrivateKeyWithHashAlg::new(key_arc.clone(), None) {
-        algs.push(k);
-    }
-
-    if algs.is_empty() {
-        return Err(anyhow!(
-            "Failed to construct PrivateKeyWithHashAlg for any supported hash algorithm"
+        algs.push(PrivateKeyWithHashAlg::new(
+            key_arc.clone(),
+            Some(HashAlg::Sha512),
         ));
+        algs.push(PrivateKeyWithHashAlg::new(
+            key_arc.clone(),
+            Some(HashAlg::Sha256),
+        ));
+        algs.push(PrivateKeyWithHashAlg::new(key_arc, None));
+    } else {
+        algs.push(PrivateKeyWithHashAlg::new(key_arc, None));
     }
 
-    Ok(algs)
+    algs
 }
 
 pub async fn authenticate_with_default_keys<H>(
@@ -79,12 +73,10 @@ where
         tracing::debug!("[ssh] trying default key {}", key_path.display());
         match load_secret_key(&key_path, passphrase) {
             Ok(keypair) => {
-                if let Ok(keys) = private_keys_with_algs(keypair) {
-                    for key in keys {
-                        match handle.authenticate_publickey(user, key).await {
-                            Ok(true) => return Ok(true),
-                            Ok(false) | Err(_) => continue,
-                        }
+                for key in private_keys_with_algs(keypair) {
+                    match handle.authenticate_publickey(user, key).await {
+                        Ok(result) if result.success() => return Ok(true),
+                        Ok(_) | Err(_) => continue,
                     }
                 }
             }

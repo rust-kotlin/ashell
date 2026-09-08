@@ -514,6 +514,8 @@ impl Ashell {
             cx.notify();
             return None;
         }
+        self.sync_generation = self.sync_generation.wrapping_add(1);
+        self.sync_cancellation = Some(crate::backend::connection::Cancellation::new());
         self.sync_in_progress = true;
         self.sync_status = status;
         cx.notify();
@@ -521,9 +523,22 @@ impl Ashell {
     }
 
     pub(crate) fn set_sync_backend(&mut self, backend: &str, cx: &mut Context<Self>) {
+        if self.sync_in_progress {
+            return;
+        }
         self.config.set_sync_backend(backend);
         let _ = self.config.save();
         self.sync_status = t!("sync_not_run").into();
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_sync(&mut self, cx: &mut Context<Self>) {
+        if let Some(cancellation) = self.sync_cancellation.take() {
+            cancellation.cancel();
+        }
+        self.sync_generation = self.sync_generation.wrapping_add(1);
+        self.sync_in_progress = false;
+        self.sync_status = t!("sync_cancelled").into();
         cx.notify();
     }
 
@@ -537,12 +552,24 @@ impl Ashell {
         );
         let expected_etag = self.config.sync_etag().map(str::to_string);
         let events = self.events_tx.clone();
+        let generation = self.sync_generation;
+        let cancellation = self
+            .sync_cancellation
+            .clone()
+            .expect("active sync cancellation");
         self.runtime.spawn(async move {
-            let result = match sync::upload(credentials, payload, expected_etag).await {
+            let operation = async {
+                match sync::upload(credentials, payload, expected_etag).await {
                 Ok(etag) => SyncResult::Uploaded { etag },
                 Err(err) => SyncResult::Failed(format!("{err:#}")),
+                }
             };
-            let _ = events.send(BackendEvent::SyncFinished(result));
+            let result = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => SyncResult::Failed(t!("sync_cancelled").to_string()),
+                result = operation => result,
+            };
+            let _ = events.send(BackendEvent::SyncFinished { generation, result });
         });
     }
 
@@ -551,12 +578,24 @@ impl Ashell {
             return;
         };
         let events = self.events_tx.clone();
+        let generation = self.sync_generation;
+        let cancellation = self
+            .sync_cancellation
+            .clone()
+            .expect("active sync cancellation");
         self.runtime.spawn(async move {
-            let result = match sync::download(credentials).await {
+            let operation = async {
+                match sync::download(credentials).await {
                 Ok((payload, etag)) => SyncResult::Downloaded { payload, etag },
                 Err(err) => SyncResult::Failed(format!("{err:#}")),
+                }
             };
-            let _ = events.send(BackendEvent::SyncFinished(result));
+            let result = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => SyncResult::Failed(t!("sync_cancelled").to_string()),
+                result = operation => result,
+            };
+            let _ = events.send(BackendEvent::SyncFinished { generation, result });
         });
     }
 

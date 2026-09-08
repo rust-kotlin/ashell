@@ -679,6 +679,7 @@ pub enum BackendCommand {
 
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
+    HostKeyVerification(crate::session::host_keys::HostKeyRequest),
     Guarded {
         current_generation: Arc<AtomicU32>,
         generation: u32,
@@ -756,6 +757,10 @@ pub enum BackendEvent {
         total: Option<u64>,
         state: TransferState,
     },
+    TransferInterrupted {
+        id: String,
+        reason: String,
+    },
     TransferStarted {
         tab_id: String,
         info: TransferInfo,
@@ -775,7 +780,10 @@ pub enum BackendEvent {
         tab_id: String,
         path: std::path::PathBuf,
     },
-    SyncFinished(crate::sync::SyncResult),
+    SyncFinished {
+        generation: u64,
+        result: crate::sync::SyncResult,
+    },
 }
 
 impl BackendEvent {
@@ -804,7 +812,26 @@ pub struct GuardedBackendEventSender {
     generation: u32,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct BackendAttempt {
+    current_generation: Arc<AtomicU32>,
+    generation: u32,
+}
+
+impl BackendAttempt {
+    pub(crate) fn is_current(&self) -> bool {
+        self.current_generation.load(Ordering::Acquire) == self.generation
+    }
+}
+
 impl GuardedBackendEventSender {
+    pub(crate) fn attempt(&self) -> BackendAttempt {
+        BackendAttempt {
+            current_generation: self.current_generation.clone(),
+            generation: self.generation,
+        }
+    }
+
     pub fn new(events: Sender<BackendEvent>) -> Self {
         Self {
             events,
@@ -824,6 +851,16 @@ impl GuardedBackendEventSender {
                 event: Box::new(event),
             })
             .map_err(Box::new)
+    }
+
+    /// Discard this backend's queued and future events without invalidating a replacement.
+    pub(crate) fn invalidate(&self) {
+        let _ = self.current_generation.compare_exchange(
+            self.generation,
+            self.generation.wrapping_add(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     fn next_generation(&self) -> Self {
@@ -846,8 +883,8 @@ impl GuardedBackendEventSender {
 #[derive(Clone)]
 pub enum BackendTx {
     Local(Sender<BackendCommand>),
-    Ssh(tokio::sync::mpsc::UnboundedSender<BackendCommand>),
-    Serial(tokio::sync::mpsc::UnboundedSender<BackendCommand>),
+    Ssh(crate::backend::ssh::SshHandle),
+    Serial(crate::backend::serial::SerialHandle),
     /// A restored session that is waiting for its backend to be started.
     Pending,
 }
@@ -858,9 +895,7 @@ impl BackendTx {
             Self::Local(tx) => {
                 let _ = tx.send(command);
             }
-            Self::Ssh(tx) => {
-                let _ = tx.send(command);
-            }
+            Self::Ssh(tx) => tx.send(command),
             Self::Serial(tx) => {
                 let _ = tx.send(command);
             }
@@ -1202,6 +1237,26 @@ mod terminal_tab_backend_tests {
             ),
             events_rx,
         )
+    }
+
+    #[test]
+    fn search_rows_preserve_word_spaces_without_inserting_wide_character_padding() {
+        let (mut tab, _events_rx) = pending_tab();
+        tab.resize(24, 2);
+        tab.feed("foo bar 中X".as_bytes());
+        let (start, rows) = tab.full_grid_rows();
+        let row = &rows[(-start) as usize];
+        assert_eq!(
+            row.iter()
+                .map(|(_, character)| *character)
+                .collect::<String>()
+                .trim_end(),
+            "foo bar 中X"
+        );
+        assert!(row.contains(&(3, ' ')));
+        assert!(row.contains(&(8, '中')));
+        assert!(!row.iter().any(|(col, _)| *col == 9));
+        assert!(row.contains(&(10, 'X')));
     }
 
     #[test]
@@ -2329,6 +2384,8 @@ impl TerminalTab {
     /// the first row (typically `-history_size`). Each entry in `rows_data` is
     /// a sorted `Vec<(col, char)>` for that row.
     pub fn full_grid_rows(&self) -> (i32, Vec<Vec<(i32, char)>>) {
+        use alacritty_terminal::term::cell::Flags;
+
         let grid = self.term.grid();
         let history = grid.history_size() as i32;
         let screen = grid.screen_lines() as i32;
@@ -2342,10 +2399,16 @@ impl TerminalTab {
             let mut cells: Vec<(i32, char)> = Vec::new();
             for col_idx in 0..cols {
                 let point = Point::new(line, Column(col_idx as usize));
-                let c = grid[point].c;
-                if c != ' ' && c != '\0' {
-                    cells.push((col_idx, c));
+                let cell = &grid[point];
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
                 }
+                // Keep real blanks between words; wide-character padding is
+                // already represented by the preceding character's column.
+                cells.push((col_idx, if cell.c == '\0' { ' ' } else { cell.c }));
             }
             rows_data.push(cells);
         }
@@ -2780,6 +2843,7 @@ pub enum TransferType {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum TransferState {
+    Queued,
     Running,
     Paused,
     Completed,
@@ -2792,6 +2856,7 @@ pub enum TransferState {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 enum TransferStateCompat {
+    Queued,
     Running,
     Paused,
     Completed,
@@ -2804,6 +2869,7 @@ enum TransferStateCompat {
 impl From<TransferStateCompat> for TransferState {
     fn from(value: TransferStateCompat) -> Self {
         match value {
+            TransferStateCompat::Queued => Self::Queued,
             TransferStateCompat::Running => Self::Running,
             TransferStateCompat::Paused => Self::Paused,
             TransferStateCompat::Completed => Self::Completed,
@@ -2812,6 +2878,12 @@ impl From<TransferStateCompat> for TransferState {
             TransferStateCompat::Zombie(reason) => Self::Zombie(reason),
             TransferStateCompat::Cancelled => Self::Interrupted("Cancelled".to_string()),
         }
+    }
+}
+
+impl TransferState {
+    pub(crate) fn is_active(&self) -> bool {
+        matches!(self, Self::Queued | Self::Running | Self::Paused)
     }
 }
 
@@ -2842,4 +2914,83 @@ pub struct Transfer {
     pub transferred: u64,
     pub total: Option<u64>,
     pub state: TransferState,
+}
+
+impl Transfer {
+    /// Late worker events must not revive a cancelled or interrupted record.
+    pub(crate) fn apply_progress(
+        &mut self,
+        transferred: u64,
+        total: Option<u64>,
+        state: TransferState,
+    ) -> bool {
+        if !self.state.is_active() {
+            return false;
+        }
+        self.transferred = self.transferred.max(transferred);
+        if let Some(total) = total {
+            self.total = Some(total);
+        }
+        self.state = state;
+        true
+    }
+
+    pub(crate) fn interrupt(&mut self, reason: String) -> bool {
+        self.apply_progress(self.transferred, None, TransferState::Interrupted(reason))
+    }
+}
+
+#[cfg(test)]
+mod transfer_lifecycle_tests {
+    use super::{Transfer, TransferInfo, TransferState, TransferType};
+
+    fn upload() -> Transfer {
+        Transfer {
+            tab_id: "server-a".into(),
+            tab_title: "Server A".into(),
+            info: TransferInfo {
+                id: "upload-a".into(),
+                name: "data.bin".into(),
+                source: "local".into(),
+                target: "/upload".into(),
+                kind: TransferType::Upload,
+                total_bytes: Some(100),
+            },
+            transferred: 40,
+            total: Some(100),
+            state: TransferState::Running,
+        }
+    }
+
+    #[test]
+    fn interrupted_uploads_keep_progress_and_ignore_late_worker_updates() {
+        let mut transfer = upload();
+        assert!(transfer.interrupt("network lost".into()));
+        assert!(!transfer.apply_progress(50, None, TransferState::Running));
+        assert!(!transfer.apply_progress(100, Some(100), TransferState::Completed));
+        assert_eq!(transfer.transferred, 40);
+        assert_eq!(transfer.total, Some(100));
+        assert_eq!(
+            transfer.state,
+            TransferState::Interrupted("network lost".into())
+        );
+    }
+
+    #[test]
+    fn failed_uploads_preserve_the_last_known_byte_count() {
+        let mut transfer = upload();
+        assert!(transfer.apply_progress(0, None, TransferState::Failed("connection lost".into())));
+        assert_eq!(transfer.transferred, 40);
+        assert!(!transfer.state.is_active());
+    }
+
+    #[test]
+    fn queued_records_round_trip_and_legacy_cancelled_records_still_load() {
+        let encoded = serde_json::to_string(&TransferState::Queued).unwrap();
+        let queued: TransferState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(queued, TransferState::Queued);
+        assert!(queued.is_active());
+        let cancelled: TransferState = serde_json::from_str("\"Cancelled\"").unwrap();
+        assert_eq!(cancelled, TransferState::Interrupted("Cancelled".into()));
+    }
 }

@@ -5020,7 +5020,7 @@ impl Ashell {
                     None
                 };
                 let font_family = this.terminal_font_family.clone();
-                let font_size = px(this.terminal_font_size);
+                let font_size = px(this.terminal_font_size());
                 let line_height = px(this.terminal_line_height());
                 let cell_width = px(this.terminal_cell_width());
                 let is_url_hovered = this
@@ -5080,6 +5080,7 @@ impl Ashell {
                     el = div().size_full().relative().child(el).child(
                         div().absolute().top_0().left_0().right_0().child(
                             h_flex()
+                                .occlude()
                                 .w_full()
                                 .items_center()
                                 .gap_2()
@@ -5104,7 +5105,11 @@ impl Ashell {
                                 )
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
+                                    cx.listener(move |this, _, window, cx| {
+                                        window.prevent_default();
+                                        cx.stop_propagation();
+                                        this.focus_handle.focus(window, cx);
+                                        this.focus_pane_with_id(tab_id_for_reconnect.clone());
                                         this.retry_disconnected_tab(&tab_id_for_reconnect, cx);
                                     }),
                                 ),
@@ -5608,6 +5613,16 @@ impl Render for Ashell {
                         ),
                 )
             })
+            .when_some(self.config.read_only_reason().map(str::to_string), |this, reason| {
+                this.child(h_flex().w_full().flex_none().gap_2().px_3().py_2()
+                    .bg(cx.theme().warning.opacity(0.15))
+                    .child(div().flex_1().whitespace_normal().child(t!("config_read_only_warning").to_string()))
+                    .child(pointer_button("export-recovery-config")
+                        .label(t!("config_export_recovery").to_string())
+                        .tooltip(reason)
+                        .on_click(cx.listener(|this, _, window, cx| this.export_local_config(window, cx))))
+                )
+            })
             .child(
                 div()
                     .w_full()
@@ -5720,9 +5735,10 @@ impl Render for Ashell {
                         ),
                 )
             })
-            .when_some(self.connection_progress.clone(), |this, progress| {
+            .when_some(self.active_connection_progress().filter(|_| self.active_dialog.is_none()).cloned(), |this, progress| {
                 this.child(
                     div()
+                        .occlude()
                         .absolute()
                         .top_0()
                         .left_0()
@@ -5804,24 +5820,28 @@ impl Render for Ashell {
                                                         pointer_button("ssh-connect-progress-retry")
                                                             .primary()
                                                             .label(t!("retry").to_string())
-                                                            .on_click(cx.listener(
-                                                                |this, _, _, cx| {
+                                                            .on_click(cx.listener({
+                                                                let tab_id = progress.tab_id.clone();
+                                                                move |this, _, _, cx| {
                                                                     this.retry_connection_progress(
+                                                                        &tab_id,
                                                                         cx,
                                                                     )
-                                                                },
-                                                            )),
+                                                                }
+                                                            })),
                                                     )
                                                     .child(
                                                         pointer_button("ssh-connect-progress-close")
                                                             .label(t!("cancel").to_string())
-                                                            .on_click(cx.listener(
-                                                                |this, _, _, cx| {
+                                                            .on_click(cx.listener({
+                                                                let tab_id = progress.tab_id.clone();
+                                                                move |this, _, _, cx| {
                                                                     this.cancel_connection_progress(
+                                                                        &tab_id,
                                                                         cx,
                                                                     )
-                                                                },
-                                                            )),
+                                                                }
+                                                            })),
                                                     ),
                                             )
                                         }),
@@ -5833,6 +5853,7 @@ impl Render for Ashell {
                 let view = cx.entity().clone();
                 move |_, window, cx| {
                     view.update(cx, |this, cx| {
+                        this.prompt_pending_host_key(window, cx);
                         let current_win_size = window.viewport_size();
                         let size_changed = this
                             .last_window_size

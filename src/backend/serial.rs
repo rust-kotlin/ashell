@@ -1,6 +1,42 @@
 use crate::session::config::Session;
 use crate::terminal::{BackendCommand, BackendEvent, GuardedBackendEventSender};
-use std::io::{Read, Write};
+use std::{
+    io::{Read, Write},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::Duration,
+};
+
+#[derive(Clone)]
+pub struct SerialHandle {
+    commands: mpsc::Sender<BackendCommand>,
+    owner: Arc<SerialOwner>,
+}
+
+struct SerialOwner(Arc<AtomicBool>);
+
+impl Drop for SerialOwner {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+impl SerialHandle {
+    pub fn send(&self, command: BackendCommand) -> Result<(), mpsc::SendError<BackendCommand>> {
+        if matches!(command, BackendCommand::Close) {
+            self.owner.0.store(true, Ordering::Release);
+            let _ = self.commands.send(command);
+            return Ok(());
+        }
+        if self.owner.0.load(Ordering::Acquire) {
+            return Err(mpsc::SendError(command));
+        }
+        self.commands.send(command)
+    }
+}
 
 /// Spawn the serial port backend threads.
 /// Returns a sender to send commands (like keyboard inputs) to the serial port.
@@ -9,8 +45,10 @@ pub fn spawn_serial_client(
     tab_id: String,
     session: Session,
     events_tx: GuardedBackendEventSender,
-) -> tokio::sync::mpsc::UnboundedSender<BackendCommand> {
-    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<BackendCommand>();
+) -> SerialHandle {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<BackendCommand>();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let owner = Arc::new(SerialOwner(stopped.clone()));
 
     let tab_id_clone = tab_id.clone();
     let events_tx_clone = events_tx.clone();
@@ -76,8 +114,14 @@ pub fn spawn_serial_client(
         // Spawn write thread
         let tab_id_write = tab_id_clone.clone();
         let events_tx_write = events_tx_clone.clone();
+        let write_stopped = stopped.clone();
         std::thread::spawn(move || {
-            while let Some(cmd) = cmd_rx.blocking_recv() {
+            while !write_stopped.load(Ordering::Acquire) {
+                let cmd = match cmd_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(cmd) => cmd,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 match cmd {
                     BackendCommand::Input(bytes) => {
                         if let Err(e) = port_write.write_all(&bytes) {
@@ -98,12 +142,13 @@ pub fn spawn_serial_client(
                     | BackendCommand::TerminateProcess { .. } => {}
                 }
             }
+            write_stopped.store(true, Ordering::Release);
         });
 
         // Read loop in current thread
         let mut buf = [0u8; 1024];
         let mut last_was_cr = false;
-        loop {
+        while !stopped.load(Ordering::Acquire) {
             match port.read(&mut buf) {
                 Ok(n) if n > 0 => {
                     let mut processed = Vec::with_capacity(n * 2);
@@ -141,9 +186,49 @@ pub fn spawn_serial_client(
                 }
             }
         }
+        stopped.store(true, Ordering::Release);
     });
 
-    cmd_tx
+    SerialHandle {
+        commands: cmd_tx,
+        owner,
+    }
+}
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn close_signals_both_workers_without_waiting_for_the_command_queue() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (commands, receiver) = mpsc::channel();
+        let handle = SerialHandle {
+            commands,
+            owner: Arc::new(SerialOwner(stopped.clone())),
+        };
+        handle
+            .send(BackendCommand::Input(b"queued".to_vec()))
+            .unwrap();
+        handle.send(BackendCommand::Close).unwrap();
+        assert!(stopped.load(Ordering::Acquire));
+        assert!(matches!(receiver.try_recv(), Ok(BackendCommand::Input(_))));
+    }
+
+    #[test]
+    fn dropping_the_last_serial_handle_stops_the_workers() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (commands, _receiver) = mpsc::channel();
+        let first = SerialHandle {
+            commands,
+            owner: Arc::new(SerialOwner(stopped.clone())),
+        };
+        let last = first.clone();
+        drop(first);
+        assert!(!stopped.load(Ordering::Acquire));
+        drop(last);
+        assert!(stopped.load(Ordering::Acquire));
+    }
 }
 
 #[cfg(all(test, unix))]

@@ -918,13 +918,8 @@ impl Ashell {
                 .content({
                     let view = view.clone();
                     move |content, window, cx| {
-                        let can_clear = view.read(cx).transfers.iter().any(|t| {
-                            !matches!(
-                                t.state,
-                                crate::terminal::TransferState::Running
-                                    | crate::terminal::TransferState::Paused
-                            )
-                        });
+                        let can_clear =
+                            view.read(cx).transfers.iter().any(|t| !t.state.is_active());
 
                         let clear_btn = if can_clear {
                             Some(
@@ -933,14 +928,8 @@ impl Ashell {
                                     .icon(IconName::Delete)
                                     .label(t!("clear_transfers").to_string())
                                     .on_click(window.listener_for(&view, |this, _, _, cx| {
-                                        this.transfers.retain(|t| {
-                                            matches!(
-                                                t.state,
-                                                crate::terminal::TransferState::Running
-                                                    | crate::terminal::TransferState::Paused
-                                            )
-                                        });
-                                        this.config.set_transfers(this.transfers.clone());
+                                        this.transfers.retain(|t| t.state.is_active());
+                                        this.save_transfer_records(cx);
                                         cx.notify();
                                     })),
                             )
@@ -986,11 +975,7 @@ impl Ashell {
                             );
 
                         let mut transfers = view.read(cx).transfers.clone();
-                        transfers.sort_by_key(|t| match t.state {
-                            crate::terminal::TransferState::Running
-                            | crate::terminal::TransferState::Paused => 0,
-                            _ => 1,
-                        });
+                        transfers.sort_by_key(|t| !t.state.is_active());
 
                         if transfers.is_empty() {
                             return content.child(
@@ -1003,18 +988,21 @@ impl Ashell {
                                 ),
                             );
                         }
-                        let list = v_flex().gap_2().children(transfers.into_iter().map(|t| {
-                            let (icon, _color) = match t.info.kind {
-                                crate::terminal::TransferType::Upload => {
-                                    (IconName::ArrowUp, cx.theme().primary)
-                                }
-                                crate::terminal::TransferType::Download => {
-                                    (IconName::ArrowDown, cx.theme().success)
-                                }
-                            };
+                        let list =
+                            v_flex().gap_2().children(transfers.into_iter().map(|t| {
+                                let (icon, _color) = match t.info.kind {
+                                    crate::terminal::TransferType::Upload => {
+                                        (IconName::ArrowUp, cx.theme().primary)
+                                    }
+                                    crate::terminal::TransferType::Download => {
+                                        (IconName::ArrowDown, cx.theme().success)
+                                    }
+                                };
 
-                            let (status_text, actions) =
-                                match t.state {
+                                let (status_text, actions) = match t.state {
+                                    crate::terminal::TransferState::Queued => {
+                                        (t!("transfer_queued").to_string(), h_flex().gap_1())
+                                    }
                                     crate::terminal::TransferState::Running => {
                                         let percent = t
                                             .total
@@ -1047,10 +1035,8 @@ impl Ashell {
                                         .icon(IconName::Pause)
                                         .on_click(window.listener_for(&view, {
                                             let id = t.info.id.clone();
-                                            move |this, _, _, _| {
-                                                if let Some(handle) = this.active_sftp_handle() {
-                                                    handle.pause_transfer(id.clone());
-                                                }
+                                            move |this, _, _, cx| {
+                                                this.pause_transfer(&id, cx);
                                             }
                                         }));
                                         let btn_cancel = pointer_button(SharedString::from(
@@ -1060,10 +1046,8 @@ impl Ashell {
                                         .icon(IconName::Close)
                                         .on_click(window.listener_for(&view, {
                                             let id = t.info.id.clone();
-                                            move |this, _, _, _| {
-                                                if let Some(handle) = this.active_sftp_handle() {
-                                                    handle.cancel_transfer(id.clone());
-                                                }
+                                            move |this, _, _, cx| {
+                                                this.cancel_transfer(&id, cx);
                                             }
                                         }));
                                         (txt, h_flex().gap_1().child(btn_pause).child(btn_cancel))
@@ -1077,10 +1061,8 @@ impl Ashell {
                                         .icon(IconName::Play)
                                         .on_click(window.listener_for(&view, {
                                             let id = t.info.id.clone();
-                                            move |this, _, _, _| {
-                                                if let Some(handle) = this.active_sftp_handle() {
-                                                    handle.resume_transfer(id.clone());
-                                                }
+                                            move |this, _, _, cx| {
+                                                this.resume_transfer(&id, cx);
                                             }
                                         }));
                                         let btn_cancel = pointer_button(SharedString::from(
@@ -1090,10 +1072,8 @@ impl Ashell {
                                         .icon(IconName::Close)
                                         .on_click(window.listener_for(&view, {
                                             let id = t.info.id.clone();
-                                            move |this, _, _, _| {
-                                                if let Some(handle) = this.active_sftp_handle() {
-                                                    handle.cancel_transfer(id.clone());
-                                                }
+                                            move |this, _, _, cx| {
+                                                this.cancel_transfer(&id, cx);
                                             }
                                         }));
                                         (txt, h_flex().gap_1().child(btn_resume).child(btn_cancel))
@@ -1125,14 +1105,21 @@ impl Ashell {
                                             ))
                                             .ghost()
                                             .icon(IconName::Folder)
-                                            .on_click({
+                                            .on_click(window.listener_for(&view, {
                                                 let target = t.info.target.clone();
-                                                move |_, _, _| {
-                                                    let _ = std::process::Command::new("open")
-                                                        .arg(&target)
-                                                        .spawn();
+                                                move |this, _, window, cx| {
+                                                    if let Err(error) = open::that(&target) {
+                                                        let message = t!(
+                                                            "open_download_directory_failed",
+                                                            reason = error.to_string()
+                                                        )
+                                                        .to_string();
+                                                        this.status = message.clone().into();
+                                                        window.push_notification(gpui_component::notification::Notification::error(message), cx);
+                                                        cx.notify();
+                                                    }
                                                 }
-                                            });
+                                            }));
                                             actions = actions.child(btn_folder);
                                         }
                                         let btn_remove = pointer_button(SharedString::from(
@@ -1181,74 +1168,87 @@ impl Ashell {
                                     }
                                 };
 
-                            let percent = match t.state {
-                                crate::terminal::TransferState::Completed => 100.0,
-                                _ => t
-                                    .total
-                                    .map(|tot| t.transferred as f64 / tot as f64 * 100.0)
-                                    .unwrap_or(0.0),
-                            };
-
-                            v_flex()
-                                .gap_1()
-                                .p_2()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .bg(cx.theme().muted)
-                                .child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
+                                let actions =
+                                    if t.state.is_active() {
+                                        actions.child(
                                             pointer_button(SharedString::from(format!(
-                                                "icon-{}",
+                                                "remove-{}",
                                                 t.info.id
                                             )))
-                                            .icon(icon)
                                             .ghost()
-                                            .disabled(true),
+                                            .icon(IconName::Delete)
+                                            .tooltip(t!("remove_transfer_record").to_string())
+                                            .on_click(window.listener_for(&view, {
+                                                let id = t.info.id.clone();
+                                                move |this, _, _, cx| this.remove_transfer(&id, cx)
+                                            })),
                                         )
-                                        .child(
-                                            v_flex()
-                                                .flex_1()
-                                                .min_w(px(0.))
-                                                .overflow_hidden()
-                                                .child(
-                                                    div()
-                                                        .text_size(px(12.))
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .text_color(cx.theme().foreground)
-                                                        .overflow_hidden()
-                                                        .child(t.info.name.clone()),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_size(px(10.))
-                                                        .text_color(cx.theme().muted_foreground)
-                                                        .overflow_hidden()
-                                                        .child(format!(
-                                                            "{}: {}",
-                                                            t!("session"),
-                                                            t.tab_title
-                                                        )),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_size(px(11.))
-                                                        .text_color(cx.theme().muted_foreground)
-                                                        .child(status_text.clone()),
-                                                ),
-                                        )
-                                        .child(actions),
-                                )
-                                .when(
-                                    matches!(
-                                        t.state,
-                                        crate::terminal::TransferState::Running
-                                            | crate::terminal::TransferState::Paused
-                                    ),
-                                    |this| {
+                                    } else {
+                                        actions
+                                    };
+
+                                let percent = match t.state {
+                                    crate::terminal::TransferState::Completed => 100.0,
+                                    _ => t
+                                        .total
+                                        .map(|tot| t.transferred as f64 / tot as f64 * 100.0)
+                                        .unwrap_or(0.0),
+                                };
+
+                                v_flex()
+                                    .gap_1()
+                                    .p_2()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .bg(cx.theme().muted)
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                pointer_button(SharedString::from(format!(
+                                                    "icon-{}",
+                                                    t.info.id
+                                                )))
+                                                .icon(icon)
+                                                .ghost()
+                                                .disabled(true),
+                                            )
+                                            .child(
+                                                v_flex()
+                                                    .flex_1()
+                                                    .min_w(px(0.))
+                                                    .overflow_hidden()
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(12.))
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .text_color(cx.theme().foreground)
+                                                            .overflow_hidden()
+                                                            .child(t.info.name.clone()),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(10.))
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .overflow_hidden()
+                                                            .child(format!(
+                                                                "{}: {}",
+                                                                t!("session"),
+                                                                t.tab_title
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(11.))
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child(status_text.clone()),
+                                                    ),
+                                            )
+                                            .child(actions),
+                                    )
+                                    .when(t.state.is_active(), |this| {
                                         this.child(
                                             Progress::new(format!("progress-{}", t.info.id))
                                                 .with_size(px(4.))
@@ -1256,9 +1256,8 @@ impl Ashell {
                                                 .color(cx.theme().primary)
                                                 .w_full(),
                                         )
-                                    },
-                                )
-                        }));
+                                    })
+                            }));
 
                         let scroll_handle = window
                             .use_keyed_state("transfers-scroll", cx, |_, _| {
@@ -1306,193 +1305,198 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let view = cx.entity();
-        let selected_entries = self
-            .active_sftp()
-            .map(|s| s.selected_entries.clone())
-            .unwrap_or_default();
-        if selected_entries.is_empty() {
+        if self.active_dialog.is_some() {
             return;
         }
-
-        let has_system_path = selected_entries.iter().any(|path| {
-            let p = path.as_str();
-            p.starts_with("/bin/")
-                || p == "/bin"
-                || p.starts_with("/etc/")
-                || p == "/etc"
-                || p.starts_with("/usr/")
-                || p == "/usr"
-                || p.starts_with("/var/")
-                || p == "/var"
-                || p.starts_with("/sys/")
-                || p == "/sys"
-                || p.starts_with("/dev/")
-                || p == "/dev"
-                || p.starts_with("/boot/")
-                || p == "/boot"
-                || p.starts_with("/lib/")
-                || p == "/lib"
-                || p.starts_with("/opt/")
-                || p == "/opt"
-                || p.starts_with("/run/")
-                || p == "/run"
-                || p.starts_with("/sbin/")
-                || p == "/sbin"
+        let Some(group_id) = self.active_group.clone() else {
+            return;
+        };
+        let Some(handle) = self
+            .active_sftp_handle()
+            .cloned()
+            .filter(|handle| !handle.is_closed())
+        else {
+            return;
+        };
+        let mut paths: Vec<String> = self
+            .active_sftp()
+            .map(|state| state.selected_entries.iter().cloned().collect())
+            .unwrap_or_default();
+        if paths.is_empty() {
+            return;
+        }
+        paths.sort();
+        let paths = std::sync::Arc::new(paths);
+        let connection_name = self
+            .tab_groups
+            .iter()
+            .find(|group| group.id == group_id)
+            .map(|group| group.title.clone())
+            .unwrap_or_default();
+        let has_system_path = paths.iter().any(|path| {
+            [
+                "/bin", "/etc", "/usr", "/var", "/sys", "/dev", "/boot", "/lib", "/opt", "/run",
+                "/sbin",
+            ]
+            .iter()
+            .any(|root| path == root || path.starts_with(&format!("{root}/")))
         });
-
-        window.open_dialog(cx, move |dialog: Dialog, _window, _| {
+        self.active_dialog = Some(crate::app::DialogKind::SftpDelete);
+        let view = cx.entity();
+        window.open_dialog(cx, move |dialog: Dialog, window, _| {
             dialog
                 .title(t!("confirm_delete").to_string())
                 .w(px(500.))
                 .keyboard(false)
-                .on_ok({
+                .on_close({
                     let view = view.clone();
-                    let paths_to_delete: Vec<String> =
-                        selected_entries.clone().into_iter().collect();
-                    move |_, window, cx| {
+                    move |_, _, cx| {
                         view.update(cx, |this, cx| {
-                            if let Some(handle) = this.active_sftp_handle() {
-                                let _ = handle.commands.send(
-                                    crate::sftp::SftpCommand::DeletePaths(paths_to_delete.clone()),
-                                );
-                            }
-                            if let Some(sftp) = this.active_sftp_mut() {
-                                sftp.selected_entries.clear();
+                            if this.active_dialog == Some(crate::app::DialogKind::SftpDelete) {
+                                this.active_dialog = None;
                             }
                             cx.notify();
                         });
-                        window.close_dialog(cx);
-                        true
+                    }
+                })
+                .on_ok({
+                    let view = view.clone();
+                    let handle = handle.clone();
+                    let group_id = group_id.clone();
+                    let paths = paths.clone();
+                    move |_, _, cx| {
+                        view.update(cx, |this, cx| {
+                            this.submit_sftp_delete(&group_id, &handle, &paths, cx)
+                        })
                     }
                 })
                 .content({
+                    let paths = paths.clone();
+                    let connection_name = connection_name.clone();
                     let view = view.clone();
-                    move |content, _window, cx| {
-                        let scroll_handle = view.read(cx).sftp_delete_scroll_handle.clone();
-                        let selected_paths: Vec<String> = view
-                            .read(cx)
-                            .active_sftp()
-                            .map(|s| s.selected_entries.clone().into_iter().collect())
-                            .unwrap_or_default();
-
-                        let warning_block = if has_system_path {
-                            Some(
-                                div()
-                                    .w_full()
-                                    .p_3()
-                                    .mb_3()
-                                    .rounded_md()
-                                    .bg(gpui::rgba(0xff00001a))
-                                    .border_1()
-                                    .border_color(gpui::rgba(0xff000080))
-                                    .child(
-                                        div()
-                                            .text_color(gpui::rgba(0xff0000ff))
-                                            .font_weight(FontWeight::BOLD)
-                                            .child(t!("system_path_warning").to_string()),
-                                    ),
-                            )
-                        } else {
-                            None
-                        };
-
-                        let paths_list = div()
-                            .relative()
-                            .max_h(px(200.))
-                            .w_full()
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .bg(cx.theme().background)
-                            .rounded_md()
-                            .child(
-                                v_flex()
-                                    .id("delete-scroll-view")
-                                    .size_full()
-                                    .track_scroll(&scroll_handle)
-                                    .overflow_y_scroll()
-                                    .p_2()
-                                    .gap_1()
-                                    .children(selected_paths.into_iter().map(|path| {
-                                        div()
-                                            .text_size(ui_rems(0.917))
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(path)
-                                    })),
-                            )
-                            .child(
-                                div().absolute().top_0().bottom_0().right_0().child(
-                                    gpui_component::scroll::Scrollbar::vertical(&scroll_handle)
-                                        .scrollbar_show(
-                                            gpui_component::scroll::ScrollbarShow::Always,
-                                        ),
-                                ),
-                            );
-
+                    let handle = handle.clone();
+                    let group_id = group_id.clone();
+                    move |content, _, cx| {
+                        let scroll = view.read(cx).sftp_delete_scroll_handle.clone();
+                        let unavailable = handle.is_closed()
+                            || !view
+                                .read(cx)
+                                .sftp_handles
+                                .get(&group_id)
+                                .is_some_and(|current| current.same_connection(&handle));
                         content.child(
                             v_flex()
-                                .w_full()
                                 .gap_2()
-                                .children(warning_block)
+                                .when(unavailable, |this| {
+                                    this.child(
+                                        div()
+                                            .text_color(cx.theme().danger)
+                                            .child(t!("sftp_connection_unavailable").to_string()),
+                                    )
+                                })
                                 .child(
-                                    div().text_size(ui_rems(1.0)).mb_2().child(
-                                        t!(
-                                            "confirm_delete_desc",
-                                            count = view
-                                                .read(cx)
-                                                .active_sftp()
-                                                .map(|s| s.selected_entries.len())
-                                                .unwrap_or(0)
-                                        )
+                                    t!("delete_from_connection", name = connection_name.as_str())
                                         .to_string(),
-                                    ),
                                 )
-                                .child(paths_list),
+                                .when(has_system_path, |this| {
+                                    this.child(
+                                        div()
+                                            .text_color(cx.theme().danger)
+                                            .child(t!("system_path_warning").to_string()),
+                                    )
+                                })
+                                .child(t!("confirm_delete_desc", count = paths.len()).to_string())
+                                .child(
+                                    div()
+                                        .id("delete-scroll-view")
+                                        .max_h(px(200.))
+                                        .overflow_y_scroll()
+                                        .track_scroll(&scroll)
+                                        .p_2()
+                                        .border_1()
+                                        .border_color(cx.theme().border)
+                                        .child(v_flex().gap_1().children(
+                                            paths.iter().cloned().map(|path| div().child(path)),
+                                        )),
+                                ),
                         )
                     }
                 })
                 .footer({
                     let view = view.clone();
-                    let paths_to_delete: Vec<String> =
-                        selected_entries.clone().into_iter().collect();
+                    let handle = handle.clone();
+                    let group_id = group_id.clone();
+                    let paths = paths.clone();
                     h_flex()
                         .w_full()
                         .justify_end()
                         .gap_2()
                         .child(
-                            pointer_button("cancel")
+                            pointer_button("delete-cancel")
                                 .ghost()
                                 .label(t!("cancel").to_string())
-                                .on_click(move |_, window, cx| {
+                                .on_click(window.listener_for(&view, |this, _, window, cx| {
+                                    this.active_dialog = None;
                                     window.close_dialog(cx);
-                                }),
+                                    cx.notify();
+                                })),
                         )
                         .child(
-                            pointer_button("confirm")
+                            pointer_button("delete-confirm")
                                 .danger()
                                 .label(t!("confirm").to_string())
-                                .on_click({
-                                    let view = view.clone();
-                                    move |_, window, cx| {
-                                        view.update(cx, |this, cx| {
-                                            if let Some(handle) = this.active_sftp_handle() {
-                                                let _ = handle.commands.send(
-                                                    crate::sftp::SftpCommand::DeletePaths(
-                                                        paths_to_delete.clone(),
-                                                    ),
-                                                );
-                                            }
-                                            if let Some(sftp) = this.active_sftp_mut() {
-                                                sftp.selected_entries.clear();
-                                            }
-                                            cx.notify();
-                                        });
+                                .on_click(move |_, window, cx| {
+                                    if view.update(cx, |this, cx| {
+                                        this.submit_sftp_delete(&group_id, &handle, &paths, cx)
+                                    }) {
                                         window.close_dialog(cx);
                                     }
                                 }),
                         )
                 })
         });
+    }
+
+    /// Confirmation is bound to the connection and paths the user reviewed.
+    fn submit_sftp_delete(
+        &mut self,
+        group_id: &str,
+        handle: &crate::sftp::SftpHandle,
+        paths: &[String],
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if handle.is_closed()
+            || !self
+                .sftp_handles
+                .get(group_id)
+                .is_some_and(|current| current.same_connection(handle))
+        {
+            self.status = t!("sftp_connection_unavailable").into();
+            cx.notify();
+            return false;
+        }
+        if handle
+            .commands
+            .send(crate::sftp::SftpCommand::DeletePaths(paths.to_vec()))
+            .is_err()
+        {
+            self.status = t!("sftp_connection_unavailable").into();
+            cx.notify();
+            return false;
+        }
+        if let Some(state) = self
+            .tab_groups
+            .iter_mut()
+            .find(|group| group.id == group_id)
+            .and_then(|group| group.sftp.as_mut())
+        {
+            for path in paths {
+                state.selected_entries.remove(path);
+            }
+        }
+        self.active_dialog = None;
+        cx.notify();
+        true
     }
 
     pub(crate) fn show_terminate_process_dialog(
@@ -1919,12 +1923,14 @@ impl Ashell {
         if self.active_dialog.is_some() {
             return;
         }
-        let Some((group_id, _)) = self.active_sftp_dialog_target() else {
+        let Some((group_id, handle)) = self.active_sftp_dialog_target() else {
             return;
         };
 
         self.active_dialog = Some(crate::app::DialogKind::SftpRename);
         self.sftp_rename_state = Some(crate::app::SftpRenameState {
+            id: uuid::Uuid::new_v4().to_string(),
+            connection_id: handle.connection_id().to_string(),
             group_id,
             old_path: remote_path.clone(),
             in_flight: false,
@@ -2080,7 +2086,12 @@ impl Ashell {
         if new_path == state.old_path {
             return;
         }
-        let Some(handle) = self.sftp_handles.get(&state.group_id).cloned() else {
+        let Some(handle) = self
+            .sftp_handles
+            .get(&state.group_id)
+            .filter(|handle| !handle.is_closed() && handle.connection_id() == state.connection_id)
+            .cloned()
+        else {
             if let Some(state) = self.sftp_rename_state.as_mut() {
                 state.error = Some(t!("sftp_connection_unavailable").to_string());
             }
@@ -2094,7 +2105,7 @@ impl Ashell {
         }
         cx.notify();
 
-        let group_id = state.group_id;
+        let dialog_id = state.id;
         let old_path = state.old_path;
         let response = handle.rename_path(old_path.clone(), new_path);
         cx.spawn_in(window, async move |this, cx| {
@@ -2106,9 +2117,10 @@ impl Ashell {
                     let _ = this.update_in(cx, |this, window, cx| {
                         let is_current = this.active_dialog
                             == Some(crate::app::DialogKind::SftpRename)
-                            && this.sftp_rename_state.as_ref().is_some_and(|state| {
-                                state.group_id == group_id && state.old_path == old_path
-                            });
+                            && this
+                                .sftp_rename_state
+                                .as_ref()
+                                .is_some_and(|state| state.id == dialog_id);
                         if is_current {
                             this.active_dialog = None;
                             this.sftp_rename_state = None;
@@ -2120,9 +2132,11 @@ impl Ashell {
                 }
                 Err(error) => {
                     let _ = this.update(cx, |this, cx| {
-                        if let Some(state) = this.sftp_rename_state.as_mut().filter(|state| {
-                            state.group_id == group_id && state.old_path == old_path
-                        }) {
+                        if let Some(state) = this
+                            .sftp_rename_state
+                            .as_mut()
+                            .filter(|state| state.id == dialog_id)
+                        {
                             state.in_flight = false;
                             state.error = Some(t!("rename_failed", err = error).to_string());
                             cx.notify();
@@ -2273,7 +2287,7 @@ impl Ashell {
         if self.active_dialog.is_some() {
             return;
         }
-        let Some((group_id, _)) = self.active_sftp_dialog_target() else {
+        let Some((group_id, handle)) = self.active_sftp_dialog_target() else {
             return;
         };
         let bounds = Self::initial_sftp_editor_bounds(window.viewport_size());
@@ -2286,6 +2300,8 @@ impl Ashell {
 
         self.active_dialog = Some(crate::app::DialogKind::SftpEditor);
         self.sftp_editor_state = Some(crate::app::SftpEditorState {
+            id: uuid::Uuid::new_v4().to_string(),
+            connection_id: handle.connection_id().to_string(),
             group_id,
             remote_path: remote_path.clone(),
             raw_content: Vec::new(),
@@ -2296,6 +2312,7 @@ impl Ashell {
             loaded: false,
             loading: true,
             saving: false,
+            confirm_close: false,
             message: None,
             error: None,
             bounds,
@@ -2329,13 +2346,7 @@ impl Ashell {
                 .overlay_closable(false)
                 .on_cancel({
                     let view = view.clone();
-                    move |_, _, cx| {
-                        !view
-                            .read(cx)
-                            .sftp_editor_state
-                            .as_ref()
-                            .is_some_and(|state| state.saving)
-                    }
+                    move |_, _, cx| view.update(cx, |this, cx| this.can_close_sftp_editor(cx))
                 })
                 .on_close({
                     let view = view.clone();
@@ -2575,25 +2586,36 @@ impl Ashell {
                                                                 .on_click(window.listener_for(
                                                                     &view,
                                                                     |this, _, window, cx| {
-                                                                        if this
-                                                                            .sftp_editor_state
-                                                                            .as_ref()
-                                                                            .is_some_and(|state| {
-                                                                                state.saving
-                                                                            })
-                                                                        {
-                                                                            return;
+                                                                        if this.can_close_sftp_editor(cx) {
+                                                                            this.close_sftp_editor(window, cx);
                                                                         }
-                                                                        this.active_dialog = None;
-                                                                        this.sftp_editor_state =
-                                                                            None;
-                                                                        window.close_dialog(cx);
-                                                                        cx.notify();
                                                                     },
                                                                 )),
                                                         ),
                                                 ),
                                         )
+                                        .when(state.as_ref().is_some_and(|state| state.confirm_close), |this| {
+                                            this.child(v_flex().gap_2().p_3().bg(cx.theme().warning.opacity(0.15))
+                                                .child(t!("editor_close_unsaved").to_string())
+                                                .child(h_flex().gap_2().justify_end()
+                                                    .child(pointer_button("editor-keep-editing").ghost().disabled(saving)
+                                                        .label(t!("editor_keep_editing").to_string())
+                                                        .on_click(window.listener_for(&view, |this, _, _, cx| {
+                                                            if let Some(state) = this.sftp_editor_state.as_mut() { state.confirm_close = false; }
+                                                            cx.notify();
+                                                        })))
+                                                    .child(pointer_button("editor-discard").danger().disabled(saving)
+                                                        .label(t!("editor_discard_changes").to_string())
+                                                        .on_click(window.listener_for(&view, |this, _, window, cx| this.close_sftp_editor(window, cx))))
+                                                    .child(pointer_button("editor-save-close").primary().disabled(saving)
+                                                        .label(t!("editor_save_and_close").to_string())
+                                                        .on_click(window.listener_for(&view, |this, _, window, cx| {
+                                                            if this.can_close_sftp_editor(cx) { this.close_sftp_editor(window, cx); }
+                                                            else { this.save_sftp_editor_content(window, cx); }
+                                                        })))
+                                                )
+                                            )
+                                        })
                                         .child(
                                             v_flex()
                                                 .flex_1()
@@ -2896,6 +2918,38 @@ impl Ashell {
         self.load_sftp_editor_content(window, cx);
     }
 
+    /// Both Escape and the close button preserve drafts until the user decides.
+    fn can_close_sftp_editor(&mut self, cx: &mut Context<Self>) -> bool {
+        let current = self.sftp_editor_input.read(cx).value().to_string();
+        let Some(state) = self.sftp_editor_state.as_mut() else {
+            return true;
+        };
+        if state.saving {
+            return false;
+        }
+        if state.loaded && current != state.original_content {
+            state.confirm_close = true;
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
+    /// Closing a custom dialog does not invoke the component's on_close handler.
+    fn close_sftp_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .sftp_editor_state
+            .as_ref()
+            .is_some_and(|state| state.saving)
+        {
+            return;
+        }
+        self.active_dialog = None;
+        self.sftp_editor_state = None;
+        window.close_dialog(cx);
+        cx.notify();
+    }
+
     pub(crate) fn set_sftp_editor_encoding(
         &mut self,
         encoding: TextEncoding,
@@ -2945,7 +2999,12 @@ impl Ashell {
         let Some(state) = self.sftp_editor_state.clone() else {
             return;
         };
-        let Some(handle) = self.sftp_handles.get(&state.group_id).cloned() else {
+        let Some(handle) = self
+            .sftp_handles
+            .get(&state.group_id)
+            .filter(|handle| !handle.is_closed() && handle.connection_id() == state.connection_id)
+            .cloned()
+        else {
             if let Some(state) = self.sftp_editor_state.as_mut() {
                 state.loading = false;
                 state.error = Some(t!("sftp_connection_unavailable").to_string());
@@ -2963,7 +3022,7 @@ impl Ashell {
         }
         cx.notify();
 
-        let group_id = state.group_id;
+        let dialog_id = state.id;
         let remote_path = state.remote_path;
         let response = handle.read_text_file(remote_path.clone());
         cx.spawn_in(window, async move |this, cx| {
@@ -2973,9 +3032,10 @@ impl Ashell {
             let _ = gpui::AsyncWindowContext::update(cx, |window, cx| {
                 let _ = this.update(cx, |this, cx| {
                     let is_current = this.active_dialog == Some(crate::app::DialogKind::SftpEditor)
-                        && this.sftp_editor_state.as_ref().is_some_and(|state| {
-                            state.group_id == group_id && state.remote_path == remote_path
-                        });
+                        && this
+                            .sftp_editor_state
+                            .as_ref()
+                            .is_some_and(|state| state.id == dialog_id);
                     if !is_current {
                         return;
                     }
@@ -3065,7 +3125,12 @@ impl Ashell {
             cx.notify();
             return;
         }
-        let Some(handle) = self.sftp_handles.get(&state.group_id).cloned() else {
+        let Some(handle) = self
+            .sftp_handles
+            .get(&state.group_id)
+            .filter(|handle| !handle.is_closed() && handle.connection_id() == state.connection_id)
+            .cloned()
+        else {
             if let Some(state) = self.sftp_editor_state.as_mut() {
                 state.error = Some(t!("sftp_connection_unavailable").to_string());
             }
@@ -3080,7 +3145,7 @@ impl Ashell {
         }
         cx.notify();
 
-        let group_id = state.group_id;
+        let dialog_id = state.id;
         let remote_path = state.remote_path;
         let saved_bytes = encoded_content.clone();
         let response = handle.write_text_file(remote_path.clone(), encoded_content);
@@ -3088,15 +3153,18 @@ impl Ashell {
             let result = response
                 .await
                 .unwrap_or_else(|_| Err(t!("sftp_connection_unavailable").to_string()));
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
+                let content_unchanged =
+                    this.sftp_editor_input.read(cx).value().as_ref() == content.as_str();
                 let Some(state) = this
                     .sftp_editor_state
                     .as_mut()
-                    .filter(|state| state.group_id == group_id && state.remote_path == remote_path)
+                    .filter(|state| state.id == dialog_id)
                 else {
                     return;
                 };
                 state.saving = false;
+                let close_after_save = result.is_ok() && content_unchanged && state.confirm_close;
                 match result {
                     Ok(()) => {
                         state.raw_content = saved_bytes;
@@ -3111,6 +3179,9 @@ impl Ashell {
                     }
                 }
                 cx.notify();
+                if close_after_save {
+                    this.close_sftp_editor(window, cx);
+                }
             });
             Ok::<(), anyhow::Error>(())
         })
@@ -3313,21 +3384,35 @@ impl Ashell {
                                                     .gap_2()
                                                     .items_start()
                                                     .child(div().flex_none().child("•"))
-                                                    .child(div().flex_1().min_w(px(0.)).child(t!("about_tip_backspace"))),
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w(px(0.))
+                                                            .child(t!("about_tip_backspace")),
+                                                    ),
                                             )
                                             .child(
                                                 h_flex()
                                                     .gap_2()
                                                     .items_start()
                                                     .child(div().flex_none().child("•"))
-                                                    .child(div().flex_1().min_w(px(0.)).child(t!("about_tip_close_shortcuts"))),
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w(px(0.))
+                                                            .child(t!("about_tip_close_shortcuts")),
+                                                    ),
                                             )
                                             .child(
                                                 h_flex()
                                                     .gap_2()
                                                     .items_start()
                                                     .child(div().flex_none().child("•"))
-                                                    .child(div().flex_1().min_w(px(0.)).child(t!("about_tip_conflict_shortcuts"))),
+                                                    .child(
+                                                        div().flex_1().min_w(px(0.)).child(t!(
+                                                            "about_tip_conflict_shortcuts"
+                                                        )),
+                                                    ),
                                             ),
                                     ),
                             ),
@@ -3761,9 +3846,9 @@ impl Ashell {
                                                                 h_flex()
                                                                     .items_center()
                                                                     .gap_3()
-                                                                    .child(pointer_button("terminal-font-size-down").label("-").on_click(window.listener_for(&view, |this, _, _, cx| this.change_terminal_font_size(-1.0, cx))))
-                                                                    .child(div().min_w(px(64.)).text_center().child(format!("{:.0}px", view.read(cx).terminal_font_size)))
-                                                                    .child(pointer_button("terminal-font-size-up").label("+").on_click(window.listener_for(&view, |this, _, _, cx| this.change_terminal_font_size(1.0, cx))))
+                                                                    .child(pointer_button("terminal-font-size-down").label("-").on_click(window.listener_for(&view, |this, _, window, cx| this.change_terminal_font_size(-1, window, cx))))
+                                                                    .child(div().min_w(px(64.)).text_center().child(format!("{:.0}px", view.read(cx).terminal_font_size())))
+                                                                    .child(pointer_button("terminal-font-size-up").label("+").on_click(window.listener_for(&view, |this, _, window, cx| this.change_terminal_font_size(1, window, cx))))
                                                                     .into_any_element()
                                                             }
                                                         })
@@ -4277,14 +4362,14 @@ impl Ashell {
                                                                 h_flex()
                                                                     .gap_2()
                                                                     .child(
-                                                                        pointer_button("sync-backend-webdav")
+                                                                        pointer_button("sync-backend-webdav").disabled(in_progress)
 
                                                                             .label("WebDAV")
                                                                             .when(!is_s3, |button| button.primary())
                                                                             .on_click(window.listener_for(&view, |this, _, _, cx| this.set_sync_backend("webdav", cx)))
                                                                     )
                                                                     .child(
-                                                                        pointer_button("sync-backend-s3")
+                                                                        pointer_button("sync-backend-s3").disabled(in_progress)
 
                                                                             .label("S3")
                                                                             .when(is_s3, |button| button.primary())
@@ -4312,6 +4397,11 @@ impl Ashell {
                                                                     .child(pointer_button("sync-download").disabled(in_progress).label(t!("sync_download").to_string()).on_click(window.listener_for(&view, |this, _, _, cx| this.download_sync_config(cx))))
                                                                     .child(pointer_button("sync-upload").disabled(in_progress).label(t!("sync_upload").to_string()).on_click(window.listener_for(&view, |this, _, _, cx| this.upload_sync_config(cx)))),
                                                             )
+                                                            .when(in_progress, |this| this.child(
+                                                                pointer_button("sync-cancel")
+                                                                    .label(t!("cancel").to_string())
+                                                                    .on_click(window.listener_for(&view, |this, _, _, cx| this.cancel_sync(cx)))
+                                                            ))
                                                             .child(div().text_sm().text_color(cx.theme().muted_foreground).child(status))
                                                     }
                                                 }))

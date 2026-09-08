@@ -97,8 +97,7 @@ impl Ashell {
         self.search_target_tab = Some(self.tabs[tab_index].id.clone());
         let tab = &self.tabs[tab_index];
 
-        let query_lower = query.to_lowercase();
-        let query_byte_len = query.len();
+        let query_lower = lowercase_search_text(&query);
 
         // Search the ENTIRE terminal buffer (scrollback + visible screen).
         // full_grid_rows returns grid line indices; the first row is at
@@ -112,31 +111,12 @@ impl Ashell {
                 continue;
             }
 
-            // Build text string and byte→column index mapping.
-            let mut text = String::with_capacity(row.len());
-            let mut byte_to_col: Vec<i32> = Vec::new();
-            for &(col, c) in row {
-                text.push(c);
-                while byte_to_col.len() < text.len() {
-                    byte_to_col.push(col);
-                }
-            }
-            let text_lower = text.to_lowercase();
-
-            // Grid line index for this row.
             let abs_row = grid_start + row_idx as i32;
-
-            let mut search_start = 0;
-            while let Some(pos) = text_lower[search_start..].find(&query_lower) {
-                let abs = search_start + pos;
-                let start_col = byte_to_col[abs];
-                let end_byte = (abs + query_byte_len).min(byte_to_col.len());
-                let end_col = byte_to_col[end_byte - 1];
-                for c in start_col..=end_col {
-                    matches.push((abs_row, c));
-                }
-                search_start = abs + query_byte_len;
-            }
+            matches.extend(
+                search_row_columns(row, &query_lower)
+                    .into_iter()
+                    .map(|col| (abs_row, col)),
+            );
         }
 
         matches.sort_unstable();
@@ -399,6 +379,30 @@ impl Ashell {
     }
 }
 
+/// Normalize query and row characters in the same way, including expansions.
+fn lowercase_search_text(text: &str) -> String {
+    text.chars().flat_map(char::to_lowercase).collect()
+}
+
+/// Map normalized UTF-8 bytes back to the original terminal columns.
+fn search_row_columns(row: &[(i32, char)], query_lower: &str) -> Vec<i32> {
+    if query_lower.is_empty() {
+        return Vec::new();
+    }
+    let mut text = String::new();
+    let mut byte_to_col = Vec::new();
+    for &(col, character) in row {
+        text.extend(character.to_lowercase());
+        byte_to_col.resize(text.len(), col);
+    }
+    let mut columns = Vec::new();
+    for (start, matched) in text.match_indices(query_lower) {
+        let end = start + matched.len() - 1;
+        columns.extend(byte_to_col[start]..=byte_to_col[end]);
+    }
+    columns
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /// Count distinct match groups in a sorted list of (row, col) positions.
@@ -438,7 +442,40 @@ fn next_match_group_index(matches: &[(i32, i32)], start: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_match_groups, find_nth_match_start};
+    use super::{
+        count_match_groups, find_nth_match_start, lowercase_search_text, search_row_columns,
+    };
+
+    #[test]
+    fn unicode_search_preserves_columns_when_case_conversion_changes_length() {
+        let row = [(0, 'K'), (1, 'İ'), (2, 'x'), (3, '中'), (5, 'X')];
+        assert_eq!(
+            search_row_columns(&row, &lowercase_search_text("K")),
+            vec![0]
+        );
+        assert_eq!(
+            search_row_columns(&row, &lowercase_search_text("İ")),
+            vec![1]
+        );
+        assert_eq!(search_row_columns(&row, "x"), vec![2, 5]);
+        assert_eq!(search_row_columns(&row, "中x"), vec![3, 4, 5]);
+        assert!(search_row_columns(&row, "").is_empty());
+    }
+
+    #[test]
+    fn searches_word_spaces_without_matching_text_across_them() {
+        let row = "foo bar"
+            .chars()
+            .enumerate()
+            .map(|(col, character)| (col as i32, character))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            search_row_columns(&row, "foo bar"),
+            (0..7).collect::<Vec<_>>()
+        );
+        assert_eq!(search_row_columns(&row, "bar"), vec![4, 5, 6]);
+        assert!(search_row_columns(&row, "foobar").is_empty());
+    }
 
     #[test]
     fn groups_consecutive_search_matches_by_row() {

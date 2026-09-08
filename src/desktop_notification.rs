@@ -1,5 +1,12 @@
+#[cfg(any(target_os = "windows", test))]
+use std::sync::mpsc::{SyncSender, TrySendError};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::{collections::VecDeque, sync::Mutex};
+#[cfg(target_os = "windows")]
+use std::{
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
 #[cfg(target_os = "macos")]
 const APP_BUNDLE_ID: &str = "dev.ashell.app";
@@ -11,6 +18,10 @@ const APP_USER_MODEL_ID: &str = "dev.ashell.app";
 const MAX_PENDING_TERMINAL_NOTIFICATION_ACTIVATIONS: usize = 64;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 static TERMINAL_NOTIFICATION_ACTIVATIONS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+#[cfg(target_os = "windows")]
+static WINDOWS_NOTIFICATION_CLEAR_SENDER: OnceLock<SyncSender<()>> = OnceLock::new();
+#[cfg(target_os = "windows")]
+const SLOW_WINDOWS_NOTIFICATION_CLEAR_THRESHOLD: Duration = Duration::from_millis(100);
 
 pub(crate) fn initialize() {
     #[cfg(target_os = "macos")]
@@ -32,6 +43,65 @@ pub(crate) fn initialize() {
         ))
     } {
         tracing::warn!("failed to set Windows application identity: {error}");
+    }
+
+    #[cfg(target_os = "windows")]
+    initialize_windows_notification_clear_worker();
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn enqueue_coalesced_signal(sender: &SyncSender<()>) -> bool {
+    match sender.try_send(()) {
+        Ok(()) | Err(TrySendError::Full(())) => true,
+        Err(TrySendError::Disconnected(())) => false,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn initialize_windows_notification_clear_worker() {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    if WINDOWS_NOTIFICATION_CLEAR_SENDER.set(sender).is_err() {
+        return;
+    }
+
+    if let Err(error) = std::thread::Builder::new()
+        .name("windows-notification-clear".to_string())
+        .spawn(move || {
+            use windows::Win32::System::WinRT::{
+                RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize,
+            };
+
+            if let Err(error) = unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
+                tracing::warn!("failed to initialize WinRT notification worker: {error}");
+                return;
+            }
+
+            while receiver.recv().is_ok() {
+                let started_at = Instant::now();
+                clear_windows_notification_history();
+                let elapsed = started_at.elapsed();
+                if elapsed >= SLOW_WINDOWS_NOTIFICATION_CLEAR_THRESHOLD {
+                    tracing::warn!(
+                        elapsed_ms = elapsed.as_millis(),
+                        "Windows notification history clear exceeded the latency threshold"
+                    );
+                }
+            }
+
+            unsafe { RoUninitialize() };
+        })
+    {
+        tracing::warn!("failed to start Windows notification clear worker: {error}");
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[allow(deprecated)]
+fn clear_windows_notification_history() {
+    use windows::UI::Notifications::ToastNotificationManager;
+
+    if let Err(error) = ToastNotificationManager::History().and_then(|history| history.Clear()) {
+        tracing::warn!("failed to clear Windows notification history: {error}");
     }
 }
 
@@ -98,7 +168,7 @@ fn show_windows_notification(
         .text2(body)
         .duration(winrt_notification::Duration::Short)
         .sound(None)
-        .on_activated(move || {
+        .on_activated(move |_| {
             queue_terminal_notification_activation(activation_tab_id.clone());
             Ok(())
         })
@@ -196,11 +266,12 @@ pub(crate) fn clear_current_app_delivered_notifications() {
 
     #[cfg(target_os = "windows")]
     {
-        use windows::UI::Notifications::ToastNotificationManager;
-
-        if let Err(error) = ToastNotificationManager::History().and_then(|history| history.Clear())
-        {
-            tracing::warn!("failed to clear Windows notification history: {error}");
+        let Some(sender) = WINDOWS_NOTIFICATION_CLEAR_SENDER.get() else {
+            tracing::warn!("Windows notification clear worker is unavailable");
+            return;
+        };
+        if !enqueue_coalesced_signal(sender) {
+            tracing::warn!("Windows notification clear worker disconnected");
         }
     }
 }
@@ -225,9 +296,11 @@ fn set_windows_taskbar_badge(window_handle: isize, unread: bool) -> windows::cor
         unsafe { CoCreateInstance(&TaskbarList, None::<&IUnknown>, CLSCTX_INPROC_SERVER)? };
     unsafe { taskbar.HrInit()? };
 
-    let hwnd = HWND(window_handle);
+    let hwnd = HWND(window_handle as *mut std::ffi::c_void);
     if !unread {
-        return unsafe { taskbar.SetOverlayIcon(hwnd, HICON(0), PCWSTR::null()) };
+        return unsafe {
+            taskbar.SetOverlayIcon(hwnd, HICON(std::ptr::null_mut()), PCWSTR::null())
+        };
     }
 
     let icon_resource = windows_badge_icon_resource();
@@ -288,4 +361,21 @@ fn windows_badge_pixel_is_red(x: usize, y: usize) -> bool {
     let dx = x as f32 - 7.5;
     let dy = y as f32 - 7.5;
     dx * dx + dy * dy <= 42.25
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enqueue_coalesced_signal;
+
+    #[test]
+    fn coalesces_pending_non_blocking_worker_signals() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+
+        assert!(enqueue_coalesced_signal(&sender));
+        assert!(enqueue_coalesced_signal(&sender));
+        assert_eq!(receiver.try_iter().count(), 1);
+
+        drop(receiver);
+        assert!(!enqueue_coalesced_signal(&sender));
+    }
 }

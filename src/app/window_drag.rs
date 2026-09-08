@@ -25,7 +25,7 @@ pub(crate) fn start_window_drag(window: &gpui::Window) {
             // loop can take over the pointer.
             let _ = ReleaseCapture();
             if let Err(err) = PostMessageW(
-                HWND(handle as _),
+                Some(HWND(handle as _)),
                 WM_SYSCOMMAND,
                 WPARAM((SC_MOVE | HTCAPTION) as usize),
                 LPARAM(0),

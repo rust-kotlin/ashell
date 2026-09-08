@@ -17,6 +17,14 @@ use crate::session::config::Session;
 const SYNC_FILE_NAME: &str = "ashell-sync.json";
 const FORMAT_VERSION: u32 = 1;
 
+fn sync_client() -> Result<Client> {
+    Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .context("create configuration sync client")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncPayload {
     pub schema_version: u32,
@@ -127,7 +135,7 @@ async fn upload_webdav(
     body: Vec<u8>,
     expected_etag: Option<String>,
 ) -> Result<Option<String>> {
-    let client = Client::new();
+    let client = sync_client()?;
     let mut request = client
         .put(sync_url(endpoint))
         .basic_auth(username, Some(password))
@@ -197,7 +205,7 @@ async fn download_webdav(
     username: &str,
     password: &str,
 ) -> Result<(Vec<u8>, Option<String>)> {
-    let response = Client::new()
+    let response = sync_client()?
         .get(sync_url(endpoint))
         .basic_auth(username, Some(password))
         .send()
@@ -280,7 +288,7 @@ async fn upload_s3(
     } else {
         headers.insert(header::IF_NONE_MATCH, header::HeaderValue::from_static("*"));
     }
-    let response = Client::new()
+    let response = sync_client()?
         .put(url)
         .headers(headers)
         .body(body)
@@ -309,7 +317,7 @@ async fn upload_s3(
 async fn download_s3(config: &S3Config) -> Result<(Vec<u8>, Option<String>)> {
     let url = s3_url(config)?;
     let headers = signed_s3_headers("GET", &url, &[], config)?;
-    let response = Client::new()
+    let response = sync_client()?
         .get(url)
         .headers(headers)
         .send()
