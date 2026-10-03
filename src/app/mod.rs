@@ -421,6 +421,7 @@ pub(crate) struct Ashell {
     pub(crate) search_bar_bounds: Option<Bounds<Pixels>>,
 
     pub(crate) system_tab_id: Option<String>,
+    pub(crate) last_applied_system_tab_id: Option<String>,
     pub(crate) sftp_handles: std::collections::HashMap<String, crate::sftp::SftpHandle>,
 
     pub(crate) remote_sample_in_flight: bool,
@@ -449,7 +450,6 @@ pub(crate) struct HoveredUrl {
 #[derive(Clone)]
 pub(crate) enum SelectorEntry {
     Local,
-    NewSsh,
     Saved(String),
 }
 
@@ -944,6 +944,7 @@ impl Ashell {
             search_bar_bounds: None,
 
             system_tab_id: None,
+            last_applied_system_tab_id: None,
             sftp_handles: std::collections::HashMap::new(),
 
             remote_sample_in_flight: false,
@@ -1283,7 +1284,11 @@ impl Ashell {
     }
 
     fn on_window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let was_active = self.window_active;
         self.sync_window_activation(window);
+        if !was_active && self.window_active {
+            window.activate_window();
+        }
         cx.notify();
     }
 
@@ -1390,6 +1395,7 @@ impl Ashell {
                         tab.disconnected_reason = None;
                     }
                     self.sync_sftp_path_from_terminal_title(&tab_id, cx);
+                    self.sync_sftp_to_active_tab();
                     self.sync_system_tab_to_active_group();
                     if self.system_tab_id.as_deref() == Some(tab_id.as_str()) {
                         self.system_status = None;
@@ -1488,6 +1494,12 @@ impl Ashell {
                     if self.is_connected_system_tab(&tab_id) {
                         self.remote_sample_in_flight = false;
                         self.system_status = None;
+                        if self.last_applied_system_tab_id.as_deref() != Some(&tab_id) {
+                            self.last_applied_system_tab_id = Some(tab_id.clone());
+                            self.cpu_history.clear();
+                            self.net_rx_history.clear();
+                            self.net_tx_history.clear();
+                        }
                         self.apply_system_snapshot(snapshot);
                     }
                 }
@@ -1496,6 +1508,11 @@ impl Ashell {
                         self.remote_sample_in_flight = false;
                         self.system_status = Some(reason.clone().into());
                         self.status = reason.into();
+                        self.last_applied_system_tab_id = Some(tab_id);
+                        self.system = SystemSnapshot::default();
+                        self.cpu_history.clear();
+                        self.net_rx_history.clear();
+                        self.net_tx_history.clear();
                     }
                 }
                 BackendEvent::RemoteProcesses { tab_id, processes } => {
@@ -1734,6 +1751,12 @@ impl Ashell {
                 }
                 return false;
             }
+            if self.last_applied_system_tab_id.is_some() {
+                self.last_applied_system_tab_id = None;
+                self.cpu_history.clear();
+                self.net_rx_history.clear();
+                self.net_tx_history.clear();
+            }
             let snapshot = self.system_sampler.sample();
             self.apply_system_snapshot(snapshot);
             return true;
@@ -1760,6 +1783,7 @@ impl Ashell {
         self.cpu_history.clear();
         self.net_rx_history.clear();
         self.net_tx_history.clear();
+        self.last_applied_system_tab_id = None;
         self.remote_sample_in_flight = false;
         self.remote_processes_in_flight = false;
         self.remote_processes.clear();

@@ -731,50 +731,6 @@ impl Ashell {
                                 )
                                 .child(
                                     div()
-                                        .w_full()
-                                        .p_2()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(if selected_index == 1 {
-                                            _cx.theme().primary
-                                        } else {
-                                            _cx.theme().border
-                                        })
-                                        .bg(if selected_index == 1 {
-                                            _cx.theme().tab_active
-                                        } else {
-                                            _cx.theme().muted
-                                        })
-                                        .cursor_pointer()
-                                        .hover(|this| this.bg(_cx.theme().secondary))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            window.listener_for(&view, |this, _, window, cx| {
-                                                this.active_dialog = None;
-                                                window.close_dialog(cx);
-                                                this.open_new_ssh_dialog(window, cx);
-                                                cx.notify();
-                                            }),
-                                        )
-                                        .child(
-                                            v_flex()
-                                                .gap_1()
-                                                .child(
-                                                    div()
-                                                        .text_size(ui_rems(1.0))
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .child(t!("new_connection")),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_size(ui_rems(0.917))
-                                                        .text_color(_cx.theme().muted_foreground)
-                                                        .child(t!("create_or_edit_ssh_session")),
-                                                ),
-                                        ),
-                                )
-                                .child(
-                                    div()
                                         .relative()
                                         .max_h(px(320.))
                                         .size_full()
@@ -790,7 +746,7 @@ impl Ashell {
                                                         |(ix, session)| {
                                                             let connect_id = session.id.clone();
                                                             let is_selected =
-                                                                selected_index == ix + 2;
+                                                                selected_index == ix + 1;
                                                             let name = session.name.clone();
                                                             let detail = if session.protocol
                                                                 == "serial"

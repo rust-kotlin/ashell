@@ -1884,10 +1884,26 @@ impl Ashell {
         };
         let mem_pct = self.system.mem_percent;
         let swap_pct = self.system.swap_percent;
-        let mem_detail = self.system.mem_detail.clone();
-        let swap_detail = self.system.swap_detail.clone();
-        let net_rx = self.system.net_rx.clone();
-        let net_tx = self.system.net_tx.clone();
+        let mem_detail = if self.system.mem_detail.is_empty() {
+            "-- / --".to_string()
+        } else {
+            self.system.mem_detail.clone()
+        };
+        let swap_detail = if self.system.swap_detail.is_empty() {
+            "-- / --".to_string()
+        } else {
+            self.system.swap_detail.clone()
+        };
+        let net_rx = if self.system.net_rx.is_empty() {
+            "--".to_string()
+        } else {
+            self.system.net_rx.clone()
+        };
+        let net_tx = if self.system.net_tx.is_empty() {
+            "--".to_string()
+        } else {
+            self.system.net_tx.clone()
+        };
 
         let (disk_used, disk_total) = self.system.disks.iter().fold((0u64, 0u64), |(u, t), d| {
             (u + (d.total_bytes - d.available_bytes), t + d.total_bytes)
@@ -2208,7 +2224,11 @@ impl Ashell {
                                 div()
                                     .text_size(ui_rems(0.833))
                                     .text_color(muted_fg)
-                                    .child(format!("{:.0}%", disk_pct)),
+                                    .child(if disk_total > 0 {
+                                        format!("{:.0}%", disk_pct)
+                                    } else {
+                                        "--".to_string()
+                                    }),
                             ),
                     )
                     .child(
@@ -2222,40 +2242,72 @@ impl Ashell {
                                     .track_scroll(&self.disk_scroll_handle)
                                     .overflow_y_scroll()
                                     .size_full()
-                                    .children(disks.iter().map(|disk| {
-                                        let pct = if disk.total_bytes > 0 {
-                                            (disk.total_bytes - disk.available_bytes) as f64
-                                                / disk.total_bytes as f64
-                                                * 100.0
-                                        } else {
-                                            0.0
-                                        };
-                                        let mount_short = disk.mount.clone();
-                                        let mount_id = format!("disk-{}", mount_short);
-                                        h_flex()
-                                            .w_full()
-                                            .items_center()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .text_size(ui_rems(0.667))
-                                                    .text_color(muted_fg)
-                                                    .child(mount_short),
-                                            )
-                                            .child(
-                                                Progress::new(mount_id)
-                                                    .value(pct as f32)
-                                                    .color(disk_color)
-                                                    .with_size(px(4.))
-                                                    .flex_1(),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(ui_rems(0.667))
-                                                    .text_color(muted_fg)
-                                                    .child(format!("{:.0}%", pct)),
-                                            )
-                                    })),
+                                    .children(if disks.is_empty() {
+                                        vec![
+                                            h_flex()
+                                                .w_full()
+                                                .items_center()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .w(px(20.))
+                                                        .h(px(8.))
+                                                        .rounded_sm()
+                                                        .bg(cx.theme().skeleton),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .h(px(4.))
+                                                        .rounded_full()
+                                                        .bg(cx.theme().skeleton.opacity(0.4)),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w(px(22.))
+                                                        .h(px(8.))
+                                                        .rounded_sm()
+                                                        .bg(cx.theme().skeleton.opacity(0.7)),
+                                                )
+                                                .into_any_element(),
+                                        ]
+                                    } else {
+                                        disks.iter().map(|disk| {
+                                            let pct = if disk.total_bytes > 0 {
+                                                (disk.total_bytes - disk.available_bytes) as f64
+                                                    / disk.total_bytes as f64
+                                                    * 100.0
+                                            } else {
+                                                0.0
+                                            };
+                                            let mount_short = disk.mount.clone();
+                                            let mount_id = format!("disk-{}", mount_short);
+                                            h_flex()
+                                                .w_full()
+                                                .items_center()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .text_size(ui_rems(0.667))
+                                                        .text_color(muted_fg)
+                                                        .child(mount_short),
+                                                )
+                                                .child(
+                                                    Progress::new(mount_id)
+                                                        .value(pct as f32)
+                                                        .color(disk_color)
+                                                        .with_size(px(4.))
+                                                        .flex_1(),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(ui_rems(0.667))
+                                                        .text_color(muted_fg)
+                                                        .child(format!("{:.0}%", pct)),
+                                                )
+                                                .into_any_element()
+                                        }).collect()
+                                    }),
                             )
                             .child(
                                 div()
@@ -2313,7 +2365,32 @@ impl Ashell {
         let disk_color = cx.theme().chart_5;
         let net_color = cx.theme().chart_4;
         let muted_fg = cx.theme().muted_foreground;
+        let mem_detail = if self.system.mem_detail.is_empty() {
+            "-- / --".to_string()
+        } else {
+            self.system.mem_detail.clone()
+        };
+        let swap_detail = if self.system.swap_detail.is_empty() {
+            "-- / --".to_string()
+        } else {
+            self.system.swap_detail.clone()
+        };
+        let net_rx = if self.system.net_rx.is_empty() {
+            "--".to_string()
+        } else {
+            self.system.net_rx.clone()
+        };
+        let net_tx = if self.system.net_tx.is_empty() {
+            "--".to_string()
+        } else {
+            self.system.net_tx.clone()
+        };
         let active_is_ssh = matches!(self.active_kind(), Some(TabKind::Ssh));
+        let is_connecting_ssh = self
+            .active_tab
+            .as_ref()
+            .and_then(|active_id| self.tabs.iter().find(|tab| tab.id == *active_id))
+            .is_some_and(|tab| tab.kind == TabKind::Ssh && !tab.connected && tab.disconnected_reason.is_none());
         let (monitor_title, monitor_detail) = self
             .active_tab
             .as_ref()
@@ -2323,6 +2400,8 @@ impl Ashell {
             .unwrap_or_else(|| (t!("system_info").to_string(), t!("live").to_string()));
         let status_color = if interactive {
             cx.theme().success
+        } else if is_connecting_ssh {
+            cx.theme().warning
         } else if active_is_ssh {
             cx.theme().danger
         } else {
@@ -2448,7 +2527,7 @@ impl Ashell {
                                 div()
                                     .text_size(ui_rems(0.85))
                                     .text_color(muted_fg)
-                                    .child(self.system.mem_detail.clone()),
+                                    .child(mem_detail),
                             ),
                     )
                     .child(
@@ -2475,7 +2554,7 @@ impl Ashell {
                                 div()
                                     .text_size(ui_rems(0.85))
                                     .text_color(muted_fg)
-                                    .child(self.system.swap_detail.clone()),
+                                    .child(swap_detail),
                             ),
                     )
                     .child(
@@ -2514,49 +2593,146 @@ impl Ashell {
                         div()
                             .relative()
                             .w_full()
+                            .h(px(90.))
                             .child(
                                 v_flex()
                                     .id("sidebar-disk-scroll")
                                     .track_scroll(&self.disk_scroll_handle)
                                     .overflow_y_scroll()
-                                    .max_h(px(90.))
+                                    .size_full()
                                     .gap_2()
-                                    .children(self.system.disks.iter().map(|disk| {
-                                        let pct = if disk.total_bytes > 0 {
-                                            (disk.total_bytes - disk.available_bytes) as f64
-                                                / disk.total_bytes as f64
-                                                * 100.0
-                                        } else {
-                                            0.0
-                                        };
-                                        let mount_short = disk.mount.clone();
-                                        let mount_id = format!("sidebar-disk-{}", mount_short);
-                                        v_flex()
-                                            .gap_0p5()
-                                            .child(
-                                                h_flex()
-                                                    .justify_between()
-                                                    .child(
-                                                        div()
-                                                            .text_size(ui_rems(0.75))
-                                                            .text_color(muted_fg)
-                                                            .child(mount_short),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_size(ui_rems(0.75))
-                                                            .text_color(muted_fg)
-                                                            .child(format!("{:.1}%", pct)),
-                                                    ),
-                                            )
-                                            .child(
-                                                Progress::new(mount_id)
-                                                    .value(pct as f32)
-                                                    .color(disk_color)
-                                                    .with_size(px(4.))
-                                                    .w_full(),
-                                            )
-                                    })),
+                                    .children(if self.system.disks.is_empty() {
+                                        vec![
+                                            v_flex()
+                                                .gap_0p5()
+                                                .child(
+                                                    h_flex()
+                                                        .justify_between()
+                                                        .items_center()
+                                                        .h(px(14.))
+                                                        .child(
+                                                            div()
+                                                                .w(px(44.))
+                                                                .h(px(10.))
+                                                                .rounded_sm()
+                                                                .bg(cx.theme().skeleton),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .w(px(28.))
+                                                                .h(px(10.))
+                                                                .rounded_sm()
+                                                                .bg(cx.theme().skeleton.opacity(0.7)),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w_full()
+                                                        .h(px(4.))
+                                                        .rounded_full()
+                                                        .bg(cx.theme().skeleton.opacity(0.4)),
+                                                )
+                                                .into_any_element(),
+                                            v_flex()
+                                                .gap_0p5()
+                                                .child(
+                                                    h_flex()
+                                                        .justify_between()
+                                                        .items_center()
+                                                        .h(px(14.))
+                                                        .child(
+                                                            div()
+                                                                .w(px(64.))
+                                                                .h(px(10.))
+                                                                .rounded_sm()
+                                                                .bg(cx.theme().skeleton),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .w(px(32.))
+                                                                .h(px(10.))
+                                                                .rounded_sm()
+                                                                .bg(cx.theme().skeleton.opacity(0.7)),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w_full()
+                                                        .h(px(4.))
+                                                        .rounded_full()
+                                                        .bg(cx.theme().skeleton.opacity(0.4)),
+                                                )
+                                                .into_any_element(),
+                                            v_flex()
+                                                .gap_0p5()
+                                                .child(
+                                                    h_flex()
+                                                        .justify_between()
+                                                        .items_center()
+                                                        .h(px(14.))
+                                                        .child(
+                                                            div()
+                                                                .w(px(36.))
+                                                                .h(px(10.))
+                                                                .rounded_sm()
+                                                                .bg(cx.theme().skeleton),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .w(px(26.))
+                                                                .h(px(10.))
+                                                                .rounded_sm()
+                                                                .bg(cx.theme().skeleton.opacity(0.7)),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w_full()
+                                                        .h(px(4.))
+                                                        .rounded_full()
+                                                        .bg(cx.theme().skeleton.opacity(0.4)),
+                                                )
+                                                .into_any_element(),
+                                        ]
+                                    } else {
+                                        self.system.disks.iter().map(|disk| {
+                                            let pct = if disk.total_bytes > 0 {
+                                                (disk.total_bytes - disk.available_bytes) as f64
+                                                    / disk.total_bytes as f64
+                                                    * 100.0
+                                            } else {
+                                                0.0
+                                            };
+                                            let mount_short = disk.mount.clone();
+                                            let mount_id = format!("sidebar-disk-{}", mount_short);
+                                            v_flex()
+                                                .gap_0p5()
+                                                .child(
+                                                    h_flex()
+                                                        .justify_between()
+                                                        .child(
+                                                            div()
+                                                                .text_size(ui_rems(0.75))
+                                                                .text_color(muted_fg)
+                                                                .child(mount_short),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(ui_rems(0.75))
+                                                                .text_color(muted_fg)
+                                                                .child(format!("{:.1}%", pct)),
+                                                        ),
+                                                )
+                                                .child(
+                                                    Progress::new(mount_id)
+                                                        .value(pct as f32)
+                                                        .color(disk_color)
+                                                        .with_size(px(4.))
+                                                        .w_full(),
+                                                )
+                                                .into_any_element()
+                                        }).collect()
+                                    }),
                             )
                             .child(
                                 div()
@@ -2621,7 +2797,7 @@ impl Ashell {
                                     .child(
                                         div()
                                             .text_size(ui_rems(0.75))
-                                            .child(self.system.net_rx.clone()),
+                                            .child(net_rx),
                                     ),
                             )
                             .child(
@@ -2639,7 +2815,7 @@ impl Ashell {
                                     .child(
                                         div()
                                             .text_size(ui_rems(0.75))
-                                            .child(self.system.net_tx.clone()),
+                                            .child(net_tx),
                                     ),
                             ),
                     ),
@@ -5311,7 +5487,12 @@ impl Render for Ashell {
             }
         }
 
-        let has_ssh_session = self.active_ssh_session().is_some();
+        let has_ssh_session = self.active_ssh_session().is_some()
+            || self
+                .active_group
+                .as_ref()
+                .and_then(|id| self.tab_groups.iter().find(|g| &g.id == id))
+                .is_some_and(|g| g.sftp.is_some());
         let is_monitor_bottom = self.config.monitoring_position() == "Bottom";
         let is_active_ssh_connected = self
             .active_tab

@@ -1267,7 +1267,7 @@ impl Ashell {
     }
 
     pub(crate) fn selector_entries(&self) -> Vec<SelectorEntry> {
-        let mut entries = vec![SelectorEntry::Local, SelectorEntry::NewSsh];
+        let mut entries = vec![SelectorEntry::Local];
         entries.extend(
             self.config
                 .sessions()
@@ -1278,11 +1278,7 @@ impl Ashell {
     }
 
     pub(crate) fn default_selector_index(&self) -> usize {
-        if self.config.sessions().is_empty() {
-            0
-        } else {
-            2
-        }
+        0
     }
 
     pub(crate) fn move_selector_selection(&mut self, delta: i32, cx: &mut Context<Self>) {
@@ -1294,8 +1290,8 @@ impl Ashell {
         let next = (current + delta).clamp(0, entries.len() as i32 - 1) as usize;
         if next != self.selector_selection {
             self.selector_selection = next;
-            if next >= 2 {
-                self.selector_scroll_handle.scroll_to_item(next - 2);
+            if next >= 1 {
+                self.selector_scroll_handle.scroll_to_item(next - 1);
             }
             cx.notify();
         }
@@ -1316,10 +1312,6 @@ impl Ashell {
             SelectorEntry::Local => {
                 self.open_local(cx);
                 window.close_dialog(cx);
-            }
-            SelectorEntry::NewSsh => {
-                window.close_dialog(cx);
-                self.open_new_ssh_dialog(window, cx);
             }
             SelectorEntry::Saved(session_id) => {
                 self.connect_saved_session(session_id, window, cx);
@@ -2111,12 +2103,28 @@ impl Ashell {
     }
 
     pub(crate) fn active_ssh_session(&self) -> Option<(String, Session)> {
-        let active_id = self.active_tab.as_ref()?;
-        let tab = self.tabs.iter().find(|tab| &tab.id == active_id)?;
-        if !tab.connected {
-            return None;
+        if let Some(active_id) = self.active_tab.as_ref() {
+            if let Some(tab) = self.tabs.iter().find(|tab| &tab.id == active_id) {
+                if tab.kind == TabKind::Ssh {
+                    if let Some(session) = tab.session.clone() {
+                        return Some((tab.id.clone(), session));
+                    }
+                }
+            }
         }
-        Some((tab.id.clone(), tab.session.clone()?))
+        if let Some(group_id) = self.active_group.as_ref() {
+            if let Some(group) = self.tab_groups.iter().find(|g| &g.id == group_id) {
+                let pane_tab_ids = group.pane_root.tab_ids();
+                for tab in &self.tabs {
+                    if pane_tab_ids.contains(&tab.id.as_str()) && tab.kind == TabKind::Ssh {
+                        if let Some(session) = tab.session.clone() {
+                            return Some((tab.id.clone(), session));
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub(crate) fn active_session_id(&self) -> Option<&str> {
@@ -2536,7 +2544,7 @@ impl Ashell {
         let Some(group_id) = self.active_group.clone() else {
             return;
         };
-        let target = self.active_tab.as_ref().and_then(|active_id| {
+        let mut target = self.active_tab.as_ref().and_then(|active_id| {
             self.tabs
                 .iter()
                 .find(|tab| {
@@ -2544,12 +2552,49 @@ impl Ashell {
                 })
                 .and_then(|tab| tab.session.clone().map(|session| (tab.id.clone(), session)))
         });
-        let target_tab_id = target.as_ref().map(|(tab_id, _)| tab_id.as_str());
+
+        if target.is_none() {
+            if let Some(group) = self.tab_groups.iter().find(|g| g.id == group_id) {
+                let pane_tab_ids = group.pane_root.tab_ids();
+                target = self
+                    .tabs
+                    .iter()
+                    .find(|tab| {
+                        pane_tab_ids.contains(&tab.id.as_str())
+                            && tab.kind == TabKind::Ssh
+                            && (tab.connected || force)
+                    })
+                    .and_then(|tab| tab.session.clone().map(|session| (tab.id.clone(), session)));
+            }
+        }
+
         let current_tab_id = self
             .tab_groups
             .iter()
             .find(|group| group.id == group_id)
             .and_then(|group| group.sftp_tab_id.clone());
+
+        let group_has_ssh = self
+            .tab_groups
+            .iter()
+            .find(|g| g.id == group_id)
+            .map(|g| {
+                let pane_tab_ids = g.pane_root.tab_ids();
+                self.tabs
+                    .iter()
+                    .any(|t| pane_tab_ids.contains(&t.id.as_str()) && t.kind == TabKind::Ssh)
+            })
+            .unwrap_or(false);
+
+        if target.is_none()
+            && !force
+            && group_has_ssh
+            && (self.sftp_handles.contains_key(&group_id) || current_tab_id.is_some())
+        {
+            return;
+        }
+
+        let target_tab_id = target.as_ref().map(|(tab_id, _)| tab_id.as_str());
         let current_session_id = current_tab_id.as_ref().and_then(|tab_id| {
             self.tabs
                 .iter()
@@ -2560,7 +2605,7 @@ impl Ashell {
         let target_session_id = target.as_ref().map(|(_, session)| session.id.as_str());
 
         if !force {
-            if current_tab_id.as_deref() == target_tab_id {
+            if current_tab_id.as_deref() == target_tab_id && target_tab_id.is_some() {
                 return;
             }
             if current_session_id.as_deref() == target_session_id
@@ -2605,12 +2650,51 @@ impl Ashell {
     }
 
     pub(crate) fn sync_system_tab_to_active_group(&mut self) {
-        let active_ssh_tab = self.active_tab.as_ref().and_then(|id| {
-            self.tabs
-                .iter()
-                .find(|tab| tab.id == *id && tab.kind == TabKind::Ssh)
+        let active_group = self.active_group.as_ref().and_then(|group_id| {
+            self.tab_groups.iter().find(|group| &group.id == group_id)
         });
-        let new_id = active_ssh_tab.map(|tab| tab.id.clone());
+
+        if let Some(current_sys_id) = &self.system_tab_id {
+            if let Some(group) = active_group {
+                let pane_tab_ids = group.pane_root.tab_ids();
+                if pane_tab_ids.contains(&current_sys_id.as_str()) {
+                    if self
+                        .tabs
+                        .iter()
+                        .any(|t| &t.id == current_sys_id && t.kind == TabKind::Ssh && t.connected)
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+
+        let new_id = self
+            .active_tab
+            .as_ref()
+            .and_then(|id| {
+                self.tabs
+                    .iter()
+                    .find(|tab| tab.id == *id && tab.kind == TabKind::Ssh)
+                    .map(|tab| tab.id.clone())
+            })
+            .or_else(|| {
+                active_group.and_then(|group| {
+                    let pane_tab_ids = group.pane_root.tab_ids();
+                    self.tabs
+                        .iter()
+                        .find(|tab| {
+                            pane_tab_ids.contains(&tab.id.as_str())
+                                && tab.kind == TabKind::Ssh
+                                && tab.connected
+                        })
+                        .map(|tab| tab.id.clone())
+                })
+            });
+
+        let active_ssh_tab = new_id
+            .as_ref()
+            .and_then(|id| self.tabs.iter().find(|tab| &tab.id == id && tab.kind == TabKind::Ssh));
         let active_ssh_status = active_ssh_tab.and_then(|tab| {
             (!tab.connected).then(|| {
                 tab.disconnected_reason
@@ -2621,13 +2705,24 @@ impl Ashell {
 
         if self.system_tab_id != new_id {
             self.system_tab_id = new_id;
-            self.reset_system_monitor_state();
+            self.remote_sample_in_flight = false;
+            self.remote_processes_in_flight = false;
+            self.remote_ports_in_flight = false;
+
             if let Some(status) = active_ssh_status {
                 self.system_status = Some(status.clone().into());
                 self.remote_process_status = Some(status.into());
+                self.system = crate::system::SystemSnapshot::default();
+                self.cpu_history.clear();
+                self.net_rx_history.clear();
+                self.net_tx_history.clear();
+                self.remote_processes.clear();
+                self.remote_ports.clear();
+                self.last_applied_system_tab_id = self.system_tab_id.clone();
             } else {
                 self.system_status = None;
             }
+
             self.request_active_system_snapshot();
             if self.active_dialog == Some(crate::app::DialogKind::Processes) {
                 self.request_active_process_snapshot();
