@@ -409,9 +409,6 @@ fn default_terminal_font_size() -> f32 {
     12.0
 }
 
-const LEGACY_DEFAULT_TERMINAL_FONT_SIZE: f32 = 18.0;
-const LEGACY_DEFAULT_UI_FONT_SIZE: f32 = 16.0;
-
 fn default_ui_font_size() -> f32 {
     14.0
 }
@@ -1167,9 +1164,7 @@ impl ConfigStore {
     }
 
     pub fn terminal_font_size(&self) -> f32 {
-        if self.cache.terminal_font_size <= 0.0
-            || (self.cache.terminal_font_size - LEGACY_DEFAULT_TERMINAL_FONT_SIZE).abs() < 0.01
-        {
+        if self.cache.terminal_font_size <= 0.0 {
             default_terminal_font_size()
         } else {
             self.cache.terminal_font_size
@@ -1287,10 +1282,7 @@ impl ConfigStore {
     }
 
     pub fn ui_font_size(&self) -> f32 {
-        if self.cache.ui_font_size <= 0.0
-            || (self.cache.ui_font_size - LEGACY_DEFAULT_UI_FONT_SIZE).abs() < 0.01
-        {
-            // Migrate the previous application default to the current compact default.
+        if self.cache.ui_font_size <= 0.0 {
             default_ui_font_size()
         } else {
             self.cache.ui_font_size
@@ -1942,17 +1934,17 @@ mod tests {
     }
 
     #[test]
-    fn font_sizes_migrate_the_previous_defaults() {
+    fn font_sizes_preserve_user_configurations() {
         let mut store = ConfigStore::in_memory();
 
         assert_eq!(store.terminal_font_size(), 12.0);
         assert_eq!(store.ui_font_size(), 14.0);
 
         store.set_terminal_font_size(18.0);
-        assert_eq!(store.terminal_font_size(), 12.0);
+        assert_eq!(store.terminal_font_size(), 18.0);
 
-        store.set_ui_font_size(14.0);
-        assert_eq!(store.ui_font_size(), 14.0);
+        store.set_ui_font_size(16.0);
+        assert_eq!(store.ui_font_size(), 16.0);
 
         store.set_ui_font_size(20.0);
         assert_eq!(store.ui_font_size(), 20.0);
