@@ -5221,13 +5221,8 @@ impl Ashell {
                     .when(is_url_hovered, |d| d.cursor_pointer())
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            let active_tab_changed =
-                                this.active_tab.as_deref() != Some(tab_id_clone2.as_str());
+                        cx.listener(move |this, _, _, cx| {
                             this.focus_pane_with_id(tab_id_clone2.clone());
-                            if active_tab_changed {
-                                this.prompt_active_ssh_reconnect_if_needed(window, cx);
-                            }
                             cx.notify();
                         }),
                     )
@@ -5291,6 +5286,7 @@ impl Ashell {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, _, cx| {
+                                        this.focus_pane_with_id(tab_id_for_reconnect.clone());
                                         this.retry_disconnected_tab(&tab_id_for_reconnect, cx);
                                     }),
                                 ),

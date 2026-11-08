@@ -302,7 +302,7 @@ impl Ashell {
         }
     }
 
-    pub(crate) fn restore_saved_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn restore_saved_tabs(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if !self.config.remember_tabs() {
             return;
         }
@@ -481,23 +481,6 @@ impl Ashell {
         self.sync_sftp_to_active_tab();
         self.sync_system_tab_to_active_group();
         self.status = "tabs restored".into();
-
-        // Defer the dialog until the restored view has been mounted. This also
-        // ensures that only the currently focused restored SSH tab is prompted.
-        let prompt_tab_id = self.active_tab.as_ref().and_then(|tab_id| {
-            self.tabs
-                .iter()
-                .find(|tab| tab.id == *tab_id && tab.kind == TabKind::Ssh && !tab.connected)
-                .map(|tab| tab.id.clone())
-        });
-        if let Some(prompt_tab_id) = prompt_tab_id {
-            let view = cx.entity();
-            window.defer(cx, move |window, cx| {
-                view.update(cx, |this, cx| {
-                    this.show_ssh_reconnect_dialog(prompt_tab_id, window, cx);
-                });
-            });
-        }
         cx.notify();
     }
 
@@ -1794,7 +1777,6 @@ impl Ashell {
 
     pub(crate) fn activate_tab(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         let previous_active_tab = self.active_tab.clone();
-        let active_tab_changed = previous_active_tab.as_deref() != Some(id.as_str());
         // Save current group state
         if let Some(group_id) = self.active_group.clone() {
             if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id) {
@@ -1839,9 +1821,6 @@ impl Ashell {
         self.sync_system_tab_to_active_group();
         self.update_terminal_focus(previous_active_tab.as_deref());
         self.save_tabs_state_background();
-        if active_tab_changed {
-            self.prompt_active_ssh_reconnect_if_needed(window, cx);
-        }
         cx.notify();
     }
 
@@ -2349,7 +2328,6 @@ impl Ashell {
         }
         if active_tab_changed {
             self.update_terminal_focus(previous_active_tab.as_deref());
-            self.prompt_active_ssh_reconnect_if_needed(window, cx);
         }
     }
 
@@ -2492,9 +2470,6 @@ impl Ashell {
         self.sync_system_tab_to_active_group();
         self.update_terminal_focus(previous_active_tab.as_deref());
         self.save_tabs_state_background();
-        if previous_active_tab != self.active_tab {
-            self.prompt_active_ssh_reconnect_if_needed(window, cx);
-        }
         cx.notify();
     }
 

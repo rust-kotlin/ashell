@@ -255,7 +255,6 @@ pub(crate) enum DialogKind {
     SftpEditor,
     Processes,
     Ports,
-    SshReconnect,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
