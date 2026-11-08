@@ -4458,6 +4458,10 @@ impl Ashell {
                         IconName::PanelLeftClose
                     })
                     .tooltip(t!("settings_toggle_sidebar").to_string())
+                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.sidebar_collapsed = !this.sidebar_collapsed;
                         this.is_layout_reset = false;
@@ -4657,8 +4661,10 @@ impl Ashell {
                                                         ),
                                                 )
                                                 .cursor_pointer()
-                                                .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                                .on_mouse_down(MouseButton::Left, |_, window, cx| {
                                                     window.prevent_default();
+                                                    // 阻止冒泡到融合标题栏的窗口拖动区，避免点击被拖动吞掉
+                                                    cx.stop_propagation();
                                                 })
                                                 .on_click(cx.listener(
                                                     move |this, _, window, cx| {
@@ -4689,6 +4695,10 @@ impl Ashell {
                     .items_center()
                     .gap_1()
                     .pr(px(6.))
+                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    })
                     .child(
                         pointer_button("open-selector")
                             .ghost()
