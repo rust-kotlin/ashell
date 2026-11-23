@@ -97,6 +97,70 @@ fn other_login_shells_do_not_get_bash_or_zsh_hooks() {
 }
 
 #[test]
+fn unsafe_temp_paths_fall_back_before_writes_or_cleanup() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let fixture = tempfile::tempdir().unwrap();
+    let login = fixture.path().join("bash");
+    fs::write(&login, "#!/bin/sh\nprintf '%s' \"$1\"\n").unwrap();
+    fs::set_permissions(&login, fs::Permissions::from_mode(0o700)).unwrap();
+    // Exercise the production guard with harmless stand-ins after the guard.
+    let (guard, _) = include_str!("launch.sh")
+        .split_once("readonly dir rc")
+        .unwrap();
+    let guard = guard.replace("/tmp/ashell-osc7.", r#""$TEST_ROOT"/ashell-osc7."#);
+    let probe = format!("mktemp() {{ printf '%s' \"$CANDIDATE\"; }}\n{guard}\nprintf accepted");
+    let run = |path: &Path| {
+        Command::new("/bin/sh")
+            .args(["-c", &probe])
+            .env_clear()
+            .env("TEST_ROOT", fixture.path())
+            .env("SHELL", &login)
+            .env("CANDIDATE", path)
+            .output()
+            .unwrap()
+            .stdout
+    };
+    let valid = fixture.path().join("ashell-osc7.aB0cD123");
+    fs::create_dir(&valid).unwrap();
+    assert_eq!(run(&valid), b"accepted");
+    let link = fixture.path().join("ashell-osc7.12345678");
+    symlink(&valid, &link).unwrap();
+    let dotted = fixture.path().join("ashell-osc7.bad.name");
+    fs::create_dir(&dotted).unwrap();
+    for path in [
+        Path::new(""),
+        Path::new("/"),
+        fixture.path(),
+        &link,
+        &dotted,
+        &fixture.path().join("ashell-osc7.ABCDEFGH"),
+    ] {
+        assert_eq!(run(path), b"-l", "{path:?}");
+    }
+}
+
+#[test]
+fn normal_exit_cleans_the_generated_startup_file_and_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = tempfile::tempdir().unwrap();
+    let shell = fixture.path().join("bash");
+    fs::write(&shell, "#!/bin/sh\n[ -f \"$ENV\" ] && printf %s \"$ENV\"\n").unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new("/bin/sh")
+        .args(["-c", &osc7_login_command()])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", fixture.path())
+        .env("SHELL", shell)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let init = String::from_utf8(output.stdout).unwrap();
+    assert!(init.starts_with("/tmp/ashell-osc7.") && init.ends_with("/bash-init"));
+    assert!(!Path::new(&init).parent().unwrap().exists());
+}
+
+#[test]
 fn server_identification_selects_compatible_launchers() {
     for (server, supported) in [
         ("SSH-2.0-OpenSSH_9.6p1 Ubuntu", true),

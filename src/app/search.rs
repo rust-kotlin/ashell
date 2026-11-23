@@ -211,9 +211,9 @@ impl Ashell {
         };
 
         if let Some(tab) = tab {
-            let snapshot = tab.render_snapshot(false);
-            let display_offset = snapshot.display_offset as i32;
-            let rows = snapshot.rows as i32;
+            let offset = tab.display_offset();
+            let display_offset = offset as i32;
+            let rows = i32::from(tab.rows);
 
             // viewport row = grid_line + display_offset
             let vp_row = target_grid_line + display_offset;
@@ -223,10 +223,10 @@ impl Ashell {
                 // Scroll so the target grid line appears near the top.
                 // display_offset = -grid_line puts it at viewport row 0.
                 let new_offset = (-target_grid_line).max(0) as usize;
-                if new_offset > snapshot.display_offset {
-                    tab.scroll_up_by(new_offset - snapshot.display_offset);
-                } else if new_offset < snapshot.display_offset {
-                    tab.scroll_down_by(snapshot.display_offset - new_offset);
+                if new_offset > offset {
+                    tab.scroll_up_by(new_offset - offset);
+                } else if new_offset < offset {
+                    tab.scroll_down_by(offset - new_offset);
                 }
             }
         }
@@ -249,9 +249,8 @@ impl Ashell {
         }
 
         let tab = self.tabs.get(self.search_tab_index()?)?;
-        let snapshot = tab.render_snapshot(false);
-        let display_offset = snapshot.display_offset as i32;
-        let rows = snapshot.rows as i32;
+        let display_offset = tab.display_offset() as i32;
+        let rows = i32::from(tab.rows);
 
         let mut map = HashMap::new();
 

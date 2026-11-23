@@ -106,11 +106,11 @@ impl Ashell {
             let has_error = sftp.directory_errors.contains_key(&path);
             let has_cache = sftp.directory_cache.contains_key(&path);
             if sftp.expanded_directories.contains(&path) && !has_error && has_cache {
-                sftp.expanded_directories.remove(&path);
+                sftp.set_directory_expanded(&path, false);
                 cx.notify();
                 return;
             }
-            sftp.expanded_directories.insert(path.clone());
+            sftp.set_directory_expanded(&path, true);
             should_load = (has_error || !has_cache) && !sftp.loading_directories.contains(&path);
             if should_load {
                 sftp.begin_directory_load(&path);
@@ -166,26 +166,32 @@ impl Ashell {
     pub(crate) fn select_sftp_entry(
         &mut self,
         entry: RemoteEntry,
-        visible_paths: &[String],
+        visible_entries: &[RemoteEntry],
         extend_range: bool,
         cx: &mut Context<Self>,
     ) {
         if extend_range {
             if let Some(sftp) = self.active_sftp_mut() {
                 let target_path = entry.full_path.clone();
-                let target_index = visible_paths.iter().position(|path| path == &target_path);
-                let anchor_index = sftp
-                    .selection_anchor
-                    .as_ref()
-                    .and_then(|anchor| visible_paths.iter().position(|path| path == anchor));
+                let target_index = visible_entries
+                    .iter()
+                    .position(|entry| entry.full_path == target_path);
+                let anchor_index = sftp.selection_anchor.as_ref().and_then(|anchor| {
+                    visible_entries
+                        .iter()
+                        .position(|entry| &entry.full_path == anchor)
+                });
 
                 sftp.selected_entries.clear();
                 if let Some(target_index) = target_index {
                     let anchor_index = anchor_index.unwrap_or(target_index);
                     let start = anchor_index.min(target_index);
                     let end = anchor_index.max(target_index);
-                    sftp.selected_entries
-                        .extend(visible_paths[start..=end].iter().cloned());
+                    sftp.selected_entries.extend(
+                        visible_entries[start..=end]
+                            .iter()
+                            .map(|entry| entry.full_path.clone()),
+                    );
                 } else {
                     sftp.selected_entries.insert(target_path.clone());
                 }

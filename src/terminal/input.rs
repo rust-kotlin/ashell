@@ -204,7 +204,7 @@ impl Ashell {
             return;
         };
 
-        if tab.render_snapshot(false).display_offset > 0 {
+        if tab.display_offset() > 0 {
             tab.scroll_to_bottom();
         }
 
@@ -263,7 +263,7 @@ impl Ashell {
             return;
         };
 
-        if tab.render_snapshot(false).display_offset > 0 {
+        if tab.display_offset() > 0 {
             tab.scroll_to_bottom();
         }
         tab.clear_selection();
@@ -320,7 +320,7 @@ impl Ashell {
             return;
         };
 
-        if tab.render_snapshot(false).display_offset > 0 {
+        if tab.display_offset() > 0 {
             tab.scroll_to_bottom();
         }
         tab.clear_selection();
@@ -668,26 +668,17 @@ impl Ashell {
         }
 
         // Track URL hover
-        let mut hovered_url = None;
         let cmd_ctrl_pressed = event.modifiers.platform;
-        if let Some((row, col, _side)) = self.terminal_grid_point_and_side(event.position) {
-            if let Some(snapshot) = self.active_snapshot() {
-                if let Some(active_id) = &self.active_tab {
-                    if let Some((url, url_cells)) = crate::terminal::highlight::find_url_at_cell(
-                        &snapshot.cells,
-                        snapshot.rows,
-                        row,
-                        col,
-                    ) {
-                        hovered_url = Some(crate::app::HoveredUrl {
-                            url,
-                            tab_id: active_id.clone(),
-                            cells: url_cells,
-                        });
-                    }
-                }
-            }
-        }
+        let hit = self.terminal_grid_point_and_side(event.position);
+        let hovered_url = hit.and_then(|(row, col, _)| {
+            let tab = self.active_terminal_tab()?;
+            let (url, cells) = tab.url_at_cell(row, col)?;
+            Some(crate::app::HoveredUrl {
+                url,
+                cells,
+                tab_id: tab.id.clone(),
+            })
+        });
 
         if self.hovered_url != hovered_url || self.cmd_ctrl_pressed != cmd_ctrl_pressed {
             self.hovered_url = hovered_url;
@@ -698,17 +689,16 @@ impl Ashell {
         if !self.terminal_selecting || event.pressed_button != Some(MouseButton::Left) {
             return;
         }
-        let Some((row, col, side)) = self.terminal_grid_point_and_side(event.position) else {
+        let Some((row, col, side)) = hit else {
             return;
         };
         let Some(active_id) = self.active_tab.clone() else {
             return;
         };
-        let snapshot = match self.active_snapshot() {
-            Some(s) => s,
-            None => return,
+        let Some(tab) = self.active_terminal_tab() else {
+            return;
         };
-        let max_row = snapshot.rows.saturating_sub(1);
+        let max_row = usize::from(tab.rows).saturating_sub(1);
 
         let mut scroll_delta = 0i32;
         if max_row >= 6 {
@@ -787,14 +777,14 @@ impl Ashell {
         let local_y = (position.y - bounds.origin.y).max(px(0.));
         let cell_width = px(self.terminal_cell_width());
         let line_height = px(self.terminal_line_height());
-        let snapshot = self.active_snapshot()?;
-        let max_col = snapshot.cols.saturating_sub(1);
+        let tab = self.active_terminal_tab()?;
+        let max_col = usize::from(tab.cols).saturating_sub(1);
         let col = ((local_x / cell_width).floor() as usize).min(max_col);
         let row = terminal_grid_row(
             local_y.as_f32(),
             bounds.size.height.as_f32(),
             line_height.as_f32(),
-            snapshot.rows,
+            usize::from(tab.rows),
         );
         let cell_offset_x = px(local_x.as_f32() % cell_width.as_f32());
         let side = if cell_offset_x >= (cell_width / 2.) {

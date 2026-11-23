@@ -2020,16 +2020,12 @@ impl Ashell {
         if event.button == MouseButton::Left {
             if event.modifiers.platform {
                 if let Some((row, col, _side)) = self.terminal_grid_point_and_side(event.position) {
-                    if let Some(snapshot) = self.active_snapshot() {
-                        if let Some((url, _)) = crate::terminal::highlight::find_url_at_cell(
-                            &snapshot.cells,
-                            snapshot.rows,
-                            row,
-                            col,
-                        ) {
-                            let _ = open::that(&url);
-                            return;
-                        }
+                    if let Some((url, _)) = self
+                        .active_terminal_tab()
+                        .and_then(|tab| tab.url_at_cell(row, col))
+                    {
+                        let _ = open::that(&url);
+                        return;
                     }
                 }
             }
@@ -2059,11 +2055,9 @@ impl Ashell {
         cx.notify();
     }
 
-    pub(crate) fn active_snapshot(&self) -> Option<RenderSnapshot> {
-        self.active_tab
-            .as_ref()
-            .and_then(|id| self.tabs.iter().find(|t| &t.id == id))
-            .map(|t| t.render_snapshot(self.config.keyword_highlight()))
+    pub(crate) fn active_terminal_tab(&self) -> Option<&TerminalTab> {
+        let id = self.active_tab.as_ref()?;
+        self.tabs.iter().find(|tab| &tab.id == id)
     }
 
     pub(crate) fn active_kind(&self) -> Option<TabKind> {

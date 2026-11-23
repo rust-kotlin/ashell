@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -569,6 +568,31 @@ impl Ashell {
     ) -> impl IntoElement {
         let active_sftp = self.active_sftp();
 
+        let outer = v_flex()
+            .gap_0()
+            .min_w(px(0.))
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .flex_1()
+            .when(active_sftp.is_some(), |outer| {
+                outer.on_drop(
+                    cx.listener(|this, paths: &gpui::ExternalPaths, _window, cx| {
+                        let paths_to_upload: Vec<String> = paths
+                            .0
+                            .iter()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .collect();
+                        this.upload_sftp_files_batch(paths_to_upload, cx);
+                    }),
+                )
+            });
+
+        if self.sftp_panel_minimized {
+            return outer
+                .child(self.render_sftp_minimized_bar(cx))
+                .into_any_element();
+        }
+
         let show_hidden_files = self.show_hidden_files;
         let auto_follow = self.config.cache.sftp_auto_follow;
         let report_directory = self.config.cache.ssh_report_directory;
@@ -696,18 +720,12 @@ impl Ashell {
                     })),
             );
         let Some(sftp) = active_sftp else {
-            let outer = v_flex()
-                .gap_0()
-                .min_w(px(0.))
-                .border_color(cx.theme().border)
-                .bg(cx.theme().background)
-                .flex_1()
+            return outer
                 .child(
                     v_flex()
                         .flex_1()
                         .min_w(px(0.))
                         .min_h(px(0.))
-                        .when(self.sftp_panel_minimized, |this| this.hidden())
                         .child(header)
                         .child(
                             v_flex()
@@ -723,25 +741,19 @@ impl Ashell {
                                 ),
                         ),
                 )
-                .when(self.sftp_panel_minimized, |this| {
-                    this.child(self.render_sftp_minimized_bar(cx))
-                });
-            return outer.into_any_element();
+                .into_any_element();
         };
 
         let selected_path = sftp.selected_path.clone();
-        let entries = sftp
-            .current_entries()
-            .iter()
-            .filter(|entry| self.show_hidden_files || !entry.name.starts_with('.'))
-            .cloned()
-            .collect::<Vec<_>>();
-        let tree_rows = sftp.tree_rows(self.show_hidden_files);
+        let listing = sftp.directory_view(self.show_hidden_files);
+        let entries = listing.entries;
+        let tree_rows = listing.tree;
         let current_path = sftp.current_path.clone();
         let current_loading = sftp.loading_directories.contains(&current_path);
         let current_error = sftp.directory_errors.get(&current_path).cloned();
         let selected_entries = sftp.selected_entries.clone();
         let all_selected = !entries.is_empty()
+            && selected_entries.len() >= entries.len()
             && entries
                 .iter()
                 .all(|e| selected_entries.contains(&e.full_path));
@@ -888,29 +900,11 @@ impl Ashell {
                 )
             });
 
-        let mut outer = v_flex()
-            .gap_0()
-            .min_w(px(0.))
-            .border_color(cx.theme().border)
-            .bg(cx.theme().background)
-            .flex_1()
-            .on_drop(
-                cx.listener(|this, paths: &gpui::ExternalPaths, _window, cx| {
-                    let paths_to_upload: Vec<String> = paths
-                        .0
-                        .iter()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .collect();
-                    this.upload_sftp_files_batch(paths_to_upload, cx);
-                }),
-            );
-
-        outer = outer.child(
+        let outer = outer.child(
             v_flex()
                 .flex_1()
                 .min_w(px(0.))
                 .min_h(px(0.))
-                .when(self.sftp_panel_minimized, |this| this.hidden())
                 .child(header)
                 .child(
                     h_flex()
@@ -1469,11 +1463,6 @@ impl Ashell {
                                                     let selected_path = selected_path.clone();
                                                     let view = view.clone();
                                                     let theme = cx.theme().clone();
-                                                    let visible_entry_paths: Arc<[String]> = entries
-                                                        .iter()
-                                                        .map(|entry| entry.full_path.clone())
-                                                        .collect::<Vec<_>>()
-                                                        .into();
                                                     let horizontal_scroll_handle =
                                                         file_columns_scroll_handle.clone();
                                                     uniform_list(
@@ -1539,9 +1528,7 @@ impl Ashell {
                                                                                         let entry =
                                                                                             entry
                                                                                                 .clone();
-                                                                                        let visible_entry_paths =
-                                                                                            visible_entry_paths
-                                                                                                .clone();
+                                                                                        let visible_entries = entries.clone();
                                                                                         move |this,
                                                                                               event: &MouseDownEvent,
                                                                                               _,
@@ -1550,7 +1537,7 @@ impl Ashell {
                                                                                             this.select_sftp_entry(
                                                                                                 entry
                                                                                                     .clone(),
-                                                                                                &visible_entry_paths,
+                                                                                                &visible_entries,
                                                                                                 event
                                                                                                     .modifiers
                                                                                                     .shift,
@@ -1904,10 +1891,6 @@ impl Ashell {
                 ),
             ),
         );
-        outer = outer.when(self.sftp_panel_minimized, |this| {
-            this.child(self.render_sftp_minimized_bar(cx))
-        });
-
         outer.into_any_element()
     }
 
@@ -5556,7 +5539,7 @@ impl Render for Ashell {
             if let Some(scrollbar) = self.terminal_scrollbars.get(&active_id) {
                 if let Some(new_display_offset) = scrollbar.future_display_offset.take() {
                     if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active_id) {
-                        let current = tab.render_snapshot(false).display_offset;
+                        let current = tab.display_offset();
                         match new_display_offset.cmp(&current) {
                             std::cmp::Ordering::Greater => {
                                 tab.scroll_up_by(new_display_offset - current)
@@ -5569,9 +5552,9 @@ impl Render for Ashell {
                     }
                 }
             }
-            if let Some(snapshot) = self.active_snapshot().as_ref() {
+            if let Some(tab) = self.active_terminal_tab() {
                 if let Some(scrollbar) = self.terminal_scrollbars.get(&active_id) {
-                    scrollbar.update(snapshot, px(self.terminal_line_height()));
+                    scrollbar.update(tab, px(self.terminal_line_height()));
                 }
             }
         }

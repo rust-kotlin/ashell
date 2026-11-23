@@ -896,7 +896,7 @@ impl Ashell {
                                                     | crate::terminal::TransferState::Paused
                                             )
                                         });
-                                        this.config.set_transfers(this.transfers.clone());
+                                        this.save_transfers_background();
                                         cx.notify();
                                     })),
                             )

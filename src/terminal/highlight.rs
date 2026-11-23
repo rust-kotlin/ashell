@@ -1148,36 +1148,61 @@ fn rendered_text_character(cell: &alacritty_terminal::term::cell::Cell) -> Optio
     }
 }
 
-pub fn find_url_at_cell(
-    cells: &[RenderCell],
-    rows: usize,
-    row: usize,
-    col: usize,
-) -> Option<(String, Vec<(usize, usize)>)> {
-    let logical_lines = build_logical_lines(cells, rows);
-    for line in logical_lines {
-        let text = line.text.as_str();
-        for m in find_urls(text) {
-            let url_len = find_url_len(&text[m..]);
-            let mut url_cells = Vec::with_capacity(url_len);
-            let mut matched = false;
-            for i in 0..url_len {
-                let idx = m + i;
-                if idx < line.byte_to_cell.len() {
-                    let (r, c) = line.byte_to_cell[idx];
-                    if r == row && c == col {
-                        matched = true;
-                    }
-                    url_cells.push((r, c));
+impl super::TerminalTab {
+    pub(crate) fn url_at_cell(
+        &self,
+        row: usize,
+        col: usize,
+    ) -> Option<(String, Vec<(usize, usize)>)> {
+        use alacritty_terminal::{
+            index::{Column, Line},
+            term::cell::Flags,
+        };
+        let rows = usize::from(self.rows);
+        let cols = usize::from(self.cols);
+        if row >= rows || col >= cols {
+            return None;
+        }
+        let grid = self.term.grid();
+        let grid_line = |r: usize| Line(r as i32 - grid.display_offset() as i32);
+        let ch = rendered_text_character(&grid[grid_line(row)][Column(col)])?;
+        if ch.is_whitespace() {
+            return None;
+        }
+
+        // A URL may span soft-wrapped screen rows, but never a hard line break.
+        let wraps = |r| {
+            grid[grid_line(r)][Column(cols - 1)]
+                .flags
+                .contains(Flags::WRAPLINE)
+        };
+        let mut first = row;
+        while first > 0 && wraps(first - 1) {
+            first -= 1;
+        }
+        let mut text = String::with_capacity(cols);
+        let mut byte_to_cell = Vec::with_capacity(cols);
+        for r in first..rows {
+            let line = &grid[grid_line(r)];
+            for c in 0..cols {
+                if let Some(ch) = rendered_text_character(&line[Column(c)]) {
+                    text.push(ch);
+                    byte_to_cell.resize(text.len(), (r, c));
                 }
             }
-            if matched {
-                let url_str = text[m..m + url_len].to_string();
-                return Some((url_str, url_cells));
+            if !wraps(r) {
+                break;
             }
         }
+        for start in find_urls(&text) {
+            let end = start + find_url_len(&text[start..]);
+            let cells = &byte_to_cell[start..end];
+            if cells.contains(&(row, col)) {
+                return Some((text[start..end].to_owned(), cells.to_vec()));
+            }
+        }
+        None
     }
-    None
 }
 
 #[cfg(test)]

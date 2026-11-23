@@ -330,6 +330,8 @@ pub struct ConfigFile {
     #[serde(default)]
     pub transfers: Vec<crate::terminal::Transfer>,
     #[serde(default)]
+    pub transfer_history_revision: u64,
+    #[serde(default)]
     pub show_hidden_files: bool,
     #[serde(default = "default_enabled")]
     pub sftp_auto_follow: bool,
@@ -492,6 +494,7 @@ impl Default for ConfigFile {
             sftp_file_columns: None,
             sftp_file_columns_customized: false,
             transfers: Vec::new(),
+            transfer_history_revision: 0,
             show_hidden_files: false,
             sftp_auto_follow: default_enabled(),
             ssh_report_directory: default_enabled(),
@@ -1241,13 +1244,6 @@ impl ConfigStore {
         self.cache.transfers.clone()
     }
 
-    pub fn set_transfers(&mut self, transfers: Vec<crate::terminal::Transfer>) {
-        self.cache.transfers = transfers;
-        if let Err(err) = self.save() {
-            tracing::error!("failed to save config: {err:#}");
-        }
-    }
-
     pub fn set_layout_state(
         &mut self,
         window_bounds: Option<SavedWindowBounds>,
@@ -1480,7 +1476,7 @@ impl ConfigStore {
         write_config_bytes(&self.path, &encrypted_bytes)
     }
 
-    pub fn save_merged_preferences(&self, local_config: ConfigFile) -> Result<()> {
+    pub fn save_merged_preferences(self) -> Result<()> {
         if self.path.as_os_str().is_empty() {
             return Ok(());
         }
@@ -1503,6 +1499,7 @@ impl ConfigStore {
             self.cache.clone()
         };
 
+        let local_config = self.cache;
         // Merge UI preference fields
         disk_config.follow_system_theme = local_config.follow_system_theme;
         disk_config.theme_mode = local_config.theme_mode;
@@ -1523,6 +1520,10 @@ impl ConfigStore {
         if local_config.command_history_revision >= disk_config.command_history_revision {
             disk_config.command_history = local_config.command_history;
             disk_config.command_history_revision = local_config.command_history_revision;
+        }
+        if local_config.transfer_history_revision > disk_config.transfer_history_revision {
+            disk_config.transfers = local_config.transfers;
+            disk_config.transfer_history_revision = local_config.transfer_history_revision;
         }
         disk_config.remember_tabs = local_config.remember_tabs;
         disk_config.saved_tabs = local_config.saved_tabs;
@@ -2156,15 +2157,40 @@ mod tests {
             vec!["pwd".to_string(), "ls -la".to_string()],
         );
 
+        local_config.transfer_history_revision = 2;
+        local_config.transfers.push(crate::terminal::Transfer {
+            tab_id: "tab".into(),
+            tab_title: "test".into(),
+            transferred: 10,
+            total: Some(10),
+            state: crate::terminal::TransferState::Completed,
+            info: crate::terminal::TransferInfo {
+                id: "transfer".into(),
+                name: "file".into(),
+                source: "/a".into(),
+                target: "/b".into(),
+                kind: crate::terminal::TransferType::Download,
+                total_bytes: Some(10),
+            },
+        });
         let mut stale_config = local_config.clone();
+        stale_config.transfers.clear();
+        stale_config.transfer_history_revision = 1;
         stale_config.command_history.clear();
         stale_config.command_history_revision = 1;
-        store.save_merged_preferences(local_config).unwrap();
-        store.save_merged_preferences(stale_config).unwrap();
+        store.cache = local_config;
+        store.clone().save_merged_preferences().unwrap();
+        store.cache = stale_config;
+        store.save_merged_preferences().unwrap();
 
         let loaded_bytes = fs::read(&path).unwrap();
         let decrypted = decrypt_config(&loaded_bytes, &get_hardware_uuid()).unwrap();
 
+        assert_eq!(decrypted.transfer_history_revision, 2);
+        assert_eq!(
+            decrypted.transfers[0].state,
+            crate::terminal::TransferState::Completed
+        );
         assert_eq!(decrypted.ui_font_size, 18.0);
         assert_eq!(decrypted.terminal_font_size, 20.0);
         assert_eq!(decrypted.local_terminal_encoding, TextEncoding::Gbk);

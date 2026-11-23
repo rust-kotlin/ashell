@@ -1023,8 +1023,17 @@ pub(crate) struct PendingDirectorySync {
     pub progress_visible: bool,
 }
 
+#[derive(Clone)]
+pub(crate) struct SftpDirectoryView {
+    path: String,
+    show_hidden: bool,
+    pub(crate) entries: Arc<[RemoteEntry]>,
+    pub(crate) tree: Arc<[SftpTreeRow]>,
+}
+
 #[derive(Clone, Default)]
 pub struct SftpUiState {
+    pub(crate) cached_view: std::cell::RefCell<Option<SftpDirectoryView>>,
     pub current_path: String,
     pub(crate) notice: Option<(String, Instant)>,
     pub(crate) pending_sync: Option<PendingDirectorySync>,
@@ -1107,28 +1116,65 @@ impl SftpUiState {
             .unwrap_or(&[])
     }
 
+    pub(crate) fn directory_view(&self, show_hidden: bool) -> SftpDirectoryView {
+        let mut cache = self.cached_view.borrow_mut();
+        if let Some(view) = cache.as_ref()
+            && view.path == self.current_path
+            && view.show_hidden == show_hidden
+        {
+            return view.clone();
+        }
+        let view = SftpDirectoryView {
+            path: self.current_path.clone(),
+            show_hidden,
+            entries: self
+                .current_entries()
+                .iter()
+                .filter(|entry| show_hidden || !entry.name.starts_with('.'))
+                .cloned()
+                .collect(),
+            tree: self.tree_rows(show_hidden).into(),
+        };
+        *cache = Some(view.clone());
+        view
+    }
+
+    pub(crate) fn set_directory_expanded(&mut self, path: &str, expanded: bool) {
+        if expanded {
+            self.expanded_directories.insert(path.to_owned());
+        } else {
+            self.expanded_directories.remove(path);
+        }
+        self.cached_view.get_mut().take();
+    }
+
     pub(crate) fn begin_directory_load(&mut self, path: &str) {
+        self.cached_view.get_mut().take();
         self.loading_directories.insert(path.to_string());
         self.directory_errors.remove(path);
     }
 
     pub(crate) fn apply_directory_entries(&mut self, path: String, entries: Vec<RemoteEntry>) {
+        self.cached_view.get_mut().take();
         self.loading_directories.remove(&path);
         self.directory_errors.remove(&path);
         self.directory_cache.insert(path, entries);
     }
 
     pub(crate) fn apply_directory_error(&mut self, path: String, reason: String) {
+        self.cached_view.get_mut().take();
         self.loading_directories.remove(&path);
         self.directory_errors.insert(path, reason);
     }
 
     pub(crate) fn expand_to(&mut self, path: &str) {
+        self.cached_view.get_mut().take();
         self.expanded_directories
             .extend(crate::sftp::remote_path_ancestors(path));
     }
 
     pub(crate) fn collapse_all(&mut self) {
+        self.cached_view.get_mut().take();
         self.expanded_directories.clear();
         self.expanded_directories.insert("/".to_string());
     }
@@ -1142,13 +1188,6 @@ impl SftpUiState {
             depth: usize,
             show_hidden: bool,
         ) {
-            let visible_directories = state.directory_cache.get(&path).map(|entries| {
-                entries
-                    .iter()
-                    .filter(|entry| entry.is_dir && (show_hidden || !entry.name.starts_with('.')))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            });
             let expanded = state.expanded_directories.contains(&path);
 
             rows.push(SftpTreeRow {
@@ -1163,13 +1202,16 @@ impl SftpUiState {
             if !expanded {
                 return;
             }
-            if let Some(directories) = visible_directories {
-                for directory in directories {
+            if let Some(entries) = state.directory_cache.get(&path) {
+                for directory in entries
+                    .iter()
+                    .filter(|entry| entry.is_dir && (show_hidden || !entry.name.starts_with('.')))
+                {
                     append_rows(
                         rows,
                         state,
-                        directory.full_path,
-                        directory.name,
+                        directory.full_path.clone(),
+                        directory.name.clone(),
                         depth + 1,
                         show_hidden,
                     );
@@ -1254,6 +1296,39 @@ mod sftp_ui_tests {
 
         assert_eq!(state.current_path, "/home/demo");
         assert_eq!(state.directory_cache["/var"][0].full_path, "/var/log");
+    }
+
+    #[test]
+    fn directory_view_reuses_rows_until_the_listing_changes() {
+        use std::sync::Arc;
+        let mut state = SftpUiState {
+            current_path: "/".into(),
+            ..Default::default()
+        };
+        state.apply_directory_entries(
+            "/".into(),
+            vec![directory("src", "/src"), directory(".git", "/.git")],
+        );
+        let first = state.directory_view(false);
+        let reused = state.directory_view(false);
+        assert!(Arc::ptr_eq(&first.entries, &reused.entries));
+        assert!(Arc::ptr_eq(&first.tree, &reused.tree));
+        assert_eq!(first.entries.len(), 1);
+        assert_eq!(state.directory_view(true).entries.len(), 2);
+        state.set_directory_expanded("/", true);
+        assert_eq!(state.directory_view(false).tree.len(), 2);
+        state.begin_directory_load("/src");
+        assert!(state.directory_view(false).tree[1].loading);
+        state.apply_directory_error("/src".into(), "denied".into());
+        assert_eq!(
+            state.directory_view(false).tree[1].error.as_deref(),
+            Some("denied")
+        );
+        state.current_path = "/src".into();
+        state.apply_directory_entries("/src".into(), vec![directory("child", "/src/child")]);
+        assert_eq!(state.directory_view(false).entries[0].name, "child");
+        state.collapse_all();
+        assert_eq!(state.directory_view(false).tree.len(), 2);
     }
 
     #[test]
@@ -1348,6 +1423,21 @@ mod terminal_tab_backend_tests {
             ),
             events_rx,
         )
+    }
+
+    #[test]
+    fn pointer_url_lookup_follows_soft_wraps_and_scrollback() {
+        let (mut tab, _events) = pending_tab();
+        tab.resize(16, 4);
+        tab.feed(b"other row\r\nhttps://example.com/path\r\nnext");
+        let (url, cells) = tab.url_at_cell(2, 1).unwrap();
+        assert_eq!(url, "https://example.com/path");
+        assert!(cells.contains(&(1, 0)) && cells.contains(&(2, 1)));
+        assert!(tab.url_at_cell(0, 1).is_none());
+        assert!(tab.url_at_cell(2, 15).is_none());
+        tab.feed(b"\r\nmore\r\nlines");
+        tab.scroll_up_by(2);
+        assert_eq!(tab.url_at_cell(2, 1).unwrap().0, url);
     }
 
     #[test]
@@ -2476,6 +2566,14 @@ impl TerminalTab {
             prompt_row_offset: target_buffer.0.saturating_sub(current_prompt_start.0),
             relative_click_valid: target_buffer >= current_prompt_start,
         })
+    }
+
+    pub(crate) fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    pub(crate) fn history_size(&self) -> usize {
+        self.term.grid().history_size()
     }
 
     pub fn render_snapshot(&self, keyword_highlight: bool) -> RenderSnapshot {

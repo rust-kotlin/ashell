@@ -1,6 +1,5 @@
-# ENV lets Bash run this bootstrap as an interactive login shell. Switch
-# back to native Bash mode before running the normal login profiles.
-set +o posix
+# Bash entered POSIX mode to load ENV. Brush is already in its native mode.
+if [[ ${SHELL##*/} == bash ]]; then set +o posix; fi
 if [[ ${ASHELL_PREVIOUS_PROMPT_COMMAND+x} ]]; then
     PROMPT_COMMAND="$ASHELL_PREVIOUS_PROMPT_COMMAND"
     unset ASHELL_PREVIOUS_PROMPT_COMMAND
@@ -26,7 +25,7 @@ case $(declare -p PROMPT_COMMAND 2>/dev/null) in
     'declare -a'*) PROMPT_COMMAND=(__ashell_report_directory "${PROMPT_COMMAND[@]}") ;;
     *) PROMPT_COMMAND="__ashell_report_directory"${PROMPT_COMMAND:+$'\n'$PROMPT_COMMAND} ;;
 esac
-# Older Bash first enters this file from its prompt command. Run the user's
+# Brush and older Bash first enter this file from the prompt command. Run the user's
 # configured prompt commands for that initial prompt as well.
 if [[ ${__ashell_first_prompt-} == 1 ]]; then
     unset __ashell_first_prompt

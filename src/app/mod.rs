@@ -195,12 +195,12 @@ pub(crate) struct TerminalScrollbarHandle {
 }
 
 impl TerminalScrollbarHandle {
-    pub(crate) fn update(&self, snapshot: &terminal::RenderSnapshot, line_height: Pixels) {
+    pub(crate) fn update(&self, tab: &terminal::TerminalTab, line_height: Pixels) {
         self.state.replace(Some(TerminalScrollbarState {
             line_height,
-            total_lines: snapshot.history_size + snapshot.rows,
-            viewport_lines: snapshot.rows,
-            display_offset: snapshot.display_offset,
+            total_lines: tab.history_size() + usize::from(tab.rows),
+            viewport_lines: usize::from(tab.rows),
+            display_offset: tab.display_offset(),
         }));
     }
 }
@@ -364,6 +364,8 @@ pub(crate) struct Ashell {
     pub(crate) sftp_delete_scroll_handle: gpui::ScrollHandle,
     pub(crate) show_hidden_files: bool,
     pub(crate) transfers: Vec<crate::terminal::Transfer>,
+    last_transfer_save: Instant,
+    transfer_progress_dirty: bool,
     pub(crate) show_transfers_dialog: bool,
     pub(crate) show_command_history: bool,
     pub(crate) ssh_command_buffers: HashMap<String, String>,
@@ -398,7 +400,8 @@ pub(crate) struct Ashell {
     pub(crate) config: ConfigStore,
     pub(crate) active_title_bar_style: crate::session::config::TitleBarStyle,
     pub(crate) cursor_style: crate::session::config::CursorStyle,
-    pub(crate) system_sampler: SystemSampler,
+    system_sampler: Option<SystemSampler>,
+    local_sample_pending: bool,
     pub(crate) recording_action: Option<String>,
     pub(crate) active_dialog: Option<DialogKind>,
     /// Error message when a recorded keybinding conflicts with another
@@ -410,7 +413,6 @@ pub(crate) struct Ashell {
     pub(crate) net_rx_history: Vec<f32>,
     pub(crate) net_tx_history: Vec<f32>,
     pub(crate) last_system_sample: Instant,
-    pub(crate) last_theme_sync: Instant,
 
     pub(crate) search_input: Entity<InputState>,
     pub(crate) search_active: bool,
@@ -436,7 +438,8 @@ pub(crate) struct Ashell {
     pub(crate) cmd_ctrl_pressed: bool,
     pub(crate) _subscriptions: Vec<gpui::Subscription>,
     pub(crate) last_window_bounds: Option<gpui::WindowBounds>,
-    pub(crate) save_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    layout_save_due: Option<Instant>,
+    saved_preferences_seq: std::sync::Arc<std::sync::Mutex<u64>>,
     pub(crate) save_latest_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -714,6 +717,11 @@ impl Ashell {
             ),
             cx.observe_window_activation(window, Self::on_window_activation_changed),
             cx.observe_window_bounds(window, Self::on_window_bounds_changed),
+            cx.observe_window_appearance(window, |this, window, cx| {
+                if this.follow_system_theme {
+                    Theme::sync_system_appearance(Some(window), cx);
+                }
+            }),
             cx.on_app_quit(Self::save_layout_on_app_quit),
         ];
 
@@ -722,8 +730,6 @@ impl Ashell {
         let body_panels = cx.new(|_| ResizableState::default());
         let sftp_tree_panels = cx.new(|_| ResizableState::default());
         let sftp_file_columns = cx.new(|_| ResizableState::default());
-        let mut system_sampler = SystemSampler::new();
-        let system = system_sampler.sample();
         let default_light_theme_name = ThemeRegistry::global(cx).default_light_theme().name.clone();
         let default_dark_theme_name = ThemeRegistry::global(cx).default_dark_theme().name.clone();
         let follow_system_theme = config.follow_system_theme();
@@ -894,6 +900,8 @@ impl Ashell {
                 }
                 transfers
             },
+            last_transfer_save: Instant::now(),
+            transfer_progress_dirty: false,
             show_transfers_dialog: false,
             show_command_history: false,
             ssh_command_buffers: HashMap::new(),
@@ -924,17 +932,17 @@ impl Ashell {
             status: "ready".into(),
             active_title_bar_style: config.title_bar_style(),
             config,
-            system_sampler,
+            system_sampler: None,
+            local_sample_pending: false,
             recording_action: None,
             active_dialog: None,
             keybind_error: None,
             keybinds_suspended: false,
-            system,
+            system: SystemSnapshot::default(),
             cpu_history: Vec::with_capacity(SYSTEM_HISTORY_LIMIT),
             net_rx_history: Vec::with_capacity(SYSTEM_HISTORY_LIMIT),
             net_tx_history: Vec::with_capacity(SYSTEM_HISTORY_LIMIT),
-            last_system_sample: Instant::now(),
-            last_theme_sync: Instant::now(),
+            last_system_sample: Instant::now() - SystemSampler::interval(),
 
             search_input,
             search_active: false,
@@ -960,7 +968,8 @@ impl Ashell {
             cmd_ctrl_pressed: false,
             _subscriptions,
             last_window_bounds: Some(window.window_bounds()),
-            save_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            layout_save_due: None,
+            saved_preferences_seq: std::sync::Arc::new(std::sync::Mutex::new(0)),
             save_latest_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
@@ -1116,26 +1125,25 @@ impl Ashell {
     }
 
     pub(crate) fn save_preferences_background(&mut self) {
-        let local_config = self.config.cache.clone();
         let config_store = self.config.clone();
         let latest_seq = self.save_latest_seq.clone();
         let current_seq = latest_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let save_lock = self.save_lock.clone();
+        let saved_seq = self.saved_preferences_seq.clone();
 
-        self.runtime.spawn(async move {
-            let _ = tokio::task::spawn_blocking(move || {
-                let Ok(_guard) = save_lock.lock() else {
-                    tracing::error!("failed to lock preferences save state");
-                    return;
-                };
-                if current_seq < latest_seq.load(std::sync::atomic::Ordering::SeqCst) {
-                    return;
+        self.runtime.spawn_blocking(move || {
+            let Ok(mut saved) = saved_seq.lock() else {
+                tracing::error!("failed to lock preferences save state");
+                return;
+            };
+            if current_seq < latest_seq.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            match config_store.save_merged_preferences() {
+                Ok(()) => *saved = current_seq,
+                Err(err) => {
+                    tracing::error!("failed to save merged preferences in background: {err:#}")
                 }
-                if let Err(err) = config_store.save_merged_preferences(local_config) {
-                    tracing::error!("failed to save merged preferences in background: {err:#}");
-                }
-            })
-            .await;
+            }
         });
     }
 
@@ -1313,24 +1321,30 @@ impl Ashell {
     pub(crate) fn start_event_pump(&self, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
             let mut last_blink_time = std::time::Instant::now();
+            let mut poll_delay = Duration::from_millis(16);
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
+                cx.background_executor().timer(poll_delay).await;
                 if this
                     .update_in(cx, |this, window, cx| {
                         let terminal_notification_activated =
                             this.handle_terminal_notification_activations(window, cx);
                         let activation_changed = this.sync_window_activation(window);
-                        let changed = this.drain_backend_events(cx);
-                        let system_sampled = this.sample_system_if_due();
-                        this.sync_theme_if_due(cx);
+                        let (changed, budget_reached) = this.drain_backend_events(cx);
+                        poll_delay = Duration::from_millis(if budget_reached { 1 } else { 16 });
+                        this.sample_system_if_due(cx);
                         let is_blinking = matches!(
                             this.cursor_style,
                             crate::session::config::CursorStyle::Blink
                                 | crate::session::config::CursorStyle::BeamBlink
                         );
                         let now = std::time::Instant::now();
+                        if this.layout_save_due.is_some_and(|due| now >= due) {
+                            this.layout_save_due = None;
+                            if this.config.remember_tabs() {
+                                this.capture_tabs_state();
+                            }
+                            this.save_preferences_background();
+                        }
                         let activity_changed = this.expire_terminal_activity(now);
                         let blink_due = is_blinking
                             && now.duration_since(last_blink_time)
@@ -1338,7 +1352,6 @@ impl Ashell {
                         if terminal_notification_activated
                             || activation_changed
                             || changed
-                            || system_sampled
                             || activity_changed
                             || blink_due
                         {
@@ -1357,10 +1370,18 @@ impl Ashell {
         .detach();
     }
 
-    pub(crate) fn drain_backend_events(&mut self, cx: &mut Context<Self>) -> bool {
+    fn drain_backend_events(&mut self, cx: &mut Context<Self>) -> (bool, bool) {
         let mut changed = false;
-        let mut transfers_changed = false;
-        while let Ok(event) = self.events_rx.try_recv() {
+        let mut transfer_state_changed = false;
+        // Leave time for input and painting even if a terminal produces output continuously.
+        let deadline = Instant::now() + Duration::from_millis(6);
+        let budget_reached = loop {
+            if Instant::now() >= deadline {
+                break true;
+            }
+            let Ok(event) = self.events_rx.try_recv() else {
+                break false;
+            };
             let Some(event) = event.into_current() else {
                 continue;
             };
@@ -1613,8 +1634,9 @@ impl Ashell {
                         if let Some(total) = total {
                             t.total = Some(total);
                         }
+                        transfer_state_changed |= t.state != state;
                         t.state = state;
-                        transfers_changed = true;
+                        self.transfer_progress_dirty = true;
                     }
                 }
                 BackendEvent::TransferStarted { tab_id, info } => {
@@ -1633,7 +1655,7 @@ impl Ashell {
                     if self.transfers.len() > 100 {
                         self.transfers.truncate(100);
                     }
-                    transfers_changed = true;
+                    transfer_state_changed = true;
                 }
                 BackendEvent::SftpHome { tab_id, home } => {
                     let home = crate::sftp::normalize_remote_path(&home, "/", "/");
@@ -1716,7 +1738,7 @@ impl Ashell {
                     }
                 }
             }
-        }
+        };
         if changed {
             for tab in &mut self.tabs {
                 if tab.remote_directories.finish_batch()
@@ -1733,44 +1755,59 @@ impl Ashell {
         if let Some(sftp) = self.active_sftp_mut() {
             changed |= sftp.update_notice(Instant::now());
         }
-        if transfers_changed {
-            self.config.set_transfers(self.transfers.clone());
+        if transfer_state_changed
+            || (self.transfer_progress_dirty
+                && self.last_transfer_save.elapsed() >= Duration::from_secs(2))
+        {
+            self.save_transfers_background();
         }
-        changed
+        (changed, budget_reached)
     }
 
-    pub(crate) fn sample_system_if_due(&mut self) -> bool {
-        if self.last_system_sample.elapsed() >= SystemSampler::interval() {
-            self.last_system_sample = Instant::now();
-            let ssh_connected = self.system_tab_id.as_deref().and_then(|tab_id| {
-                self.tabs
-                    .iter()
-                    .find(|tab| tab.id == tab_id && tab.kind == TabKind::Ssh)
-                    .map(|tab| tab.connected)
-            });
-            if let Some(connected) = ssh_connected {
-                if connected {
-                    self.request_active_system_snapshot();
-                    if self.active_dialog == Some(DialogKind::Processes) {
-                        self.request_active_process_snapshot();
-                    }
-                    if self.active_dialog == Some(DialogKind::Ports) {
-                        self.request_active_port_snapshot();
-                    }
-                }
-                return false;
-            }
-            if self.last_applied_system_tab_id.is_some() {
-                self.last_applied_system_tab_id = None;
-                self.cpu_history.clear();
-                self.net_rx_history.clear();
-                self.net_tx_history.clear();
-            }
-            let snapshot = self.system_sampler.sample();
-            self.apply_system_snapshot(snapshot);
-            return true;
+    fn sample_system_if_due(&mut self, cx: &mut Context<Self>) {
+        if self.last_system_sample.elapsed() < SystemSampler::interval() {
+            return;
         }
-        false
+        self.last_system_sample = Instant::now();
+        if let Some(id) = &self.system_tab_id {
+            if self.tabs.iter().any(|tab| &tab.id == id && tab.connected) {
+                self.request_active_system_snapshot();
+                if self.active_dialog == Some(DialogKind::Processes) {
+                    self.request_active_process_snapshot();
+                }
+                if self.active_dialog == Some(DialogKind::Ports) {
+                    self.request_active_port_snapshot();
+                }
+            }
+            return;
+        }
+        if self.local_sample_pending {
+            return;
+        }
+        self.local_sample_pending = true;
+        let sampler = self.system_sampler.take();
+        let sample = cx.background_executor().spawn(async move {
+            let mut sampler = sampler.unwrap_or_else(SystemSampler::new);
+            let snapshot = sampler.sample();
+            (sampler, snapshot)
+        });
+        cx.spawn(async move |this, cx| {
+            let (sampler, snapshot) = sample.await;
+            let _ = this.update(cx, |this, cx| {
+                this.local_sample_pending = false;
+                this.system_sampler = Some(sampler);
+                if this.system_tab_id.is_none() {
+                    if this.last_applied_system_tab_id.take().is_some() {
+                        this.cpu_history.clear();
+                        this.net_rx_history.clear();
+                        this.net_tx_history.clear();
+                    }
+                    this.apply_system_snapshot(snapshot);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn apply_system_snapshot(&mut self, snapshot: SystemSnapshot) {
@@ -1803,14 +1840,6 @@ impl Ashell {
         self.remote_process_status = None;
         self.remote_ports_status = None;
         self.expanded_process_pid = None;
-    }
-
-    pub(crate) fn sync_theme_if_due(&mut self, cx: &mut Context<Self>) {
-        if self.follow_system_theme && self.last_theme_sync.elapsed() >= Duration::from_secs(1) {
-            self.last_theme_sync = Instant::now();
-            Theme::sync_system_appearance(None, cx);
-            cx.refresh_windows();
-        }
     }
 
     pub(crate) fn request_active_system_snapshot(&mut self) {
@@ -1945,8 +1974,7 @@ impl Ashell {
         cell_width: f32,
         line_height: f32,
     ) -> Option<Bounds<Pixels>> {
-        let snapshot = self.active_snapshot()?;
-        let cursor = snapshot.cursor?;
+        let cursor = self.active_terminal_tab()?.cursor_state()?;
         let x = element_bounds.origin.x
             + px(cell_width) * cursor.col as f32
             + px(cell_width) * range_utf16.start as f32;
@@ -1957,9 +1985,25 @@ impl Ashell {
         ))
     }
 
+    fn capture_transfer_history(&mut self) {
+        self.config.cache.transfers.clone_from(&self.transfers);
+        self.config.cache.transfer_history_revision = self
+            .config
+            .cache
+            .transfer_history_revision
+            .saturating_add(1);
+        self.transfer_progress_dirty = false;
+        self.last_transfer_save = Instant::now();
+    }
+
+    fn save_transfers_background(&mut self) {
+        self.capture_transfer_history();
+        self.save_preferences_background();
+    }
+
     pub(crate) fn remove_transfer(&mut self, transfer_id: &str, cx: &mut Context<Self>) {
         self.transfers.retain(|t| t.info.id != transfer_id);
-        self.config.set_transfers(self.transfers.clone());
+        self.save_transfers_background();
         cx.notify();
     }
 
@@ -2252,25 +2296,35 @@ impl Ashell {
         if should_save_tabs {
             self.capture_tabs_state();
         }
-        if self.capture_layout_state(window, cx) || should_save_tabs {
-            let current_seq = self
-                .save_latest_seq
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                + 1;
-            let Ok(_guard) = self.save_lock.lock() else {
-                tracing::error!("failed to lock window layout save state");
-                return;
-            };
-            if current_seq
-                < self
-                    .save_latest_seq
-                    .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                return;
-            }
-            if let Err(err) = self.config.save() {
-                tracing::error!("failed to save window layout state: {err:#}");
-            }
+        let pending_transfers = self.transfer_progress_dirty;
+        if pending_transfers {
+            self.capture_transfer_history();
+        }
+        let pending_layout = self.layout_save_due.take().is_some();
+        let layout_valid = self.capture_layout_state(window, cx);
+        let Ok(mut saved) = self.saved_preferences_seq.lock() else {
+            tracing::error!("failed to lock window layout save state");
+            return;
+        };
+        let latest = self
+            .save_latest_seq
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if !layout_valid
+            && !should_save_tabs
+            && !pending_transfers
+            && !pending_layout
+            && *saved == latest
+        {
+            return;
+        }
+        // Supersede queued snapshots and finish the final write before the window closes.
+        let current_seq = self
+            .save_latest_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        match self.config.save() {
+            Ok(()) => *saved = current_seq,
+            Err(err) => tracing::error!("failed to save window layout state: {err:#}"),
         }
     }
 
@@ -2288,10 +2342,8 @@ impl Ashell {
         }
         self.last_window_bounds = Some(current_bounds);
 
-        // Save synchronously on the main thread. Background saves are killed by
-        // ExitProcess on Windows before they can flush during shutdown.
         if self.capture_layout_state(window, cx) {
-            self.save_layout_state(window, cx);
+            self.layout_save_due = Some(Instant::now() + Duration::from_millis(250));
         }
     }
 

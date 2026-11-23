@@ -1207,7 +1207,8 @@ fn osc7_login_command() -> String {
         .replace('\n', "\\0012")
         .replace('\'', "\\0047")
         .replace('!', "\\0041");
-    format!("sh -c 'exec sh -c \"$(printf %b \"$1\")\"' ashell '{encoded}'")
+    // Replace the SSH command shell so brush doesn't suspend the interactive child.
+    format!("exec sh -c 'exec sh -c \"$(printf %b \"$1\")\"' ashell '{encoded}'")
 }
 
 fn supports_posix_launcher(server_id: &[u8]) -> bool {
