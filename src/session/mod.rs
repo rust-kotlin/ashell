@@ -122,17 +122,9 @@ fn connecting_sftp_state() -> crate::terminal::SftpUiState {
     expanded_directories.insert("/".to_string());
     crate::terminal::SftpUiState {
         current_path: "/".into(),
-        status: rust_i18n::t!("sftp_connecting").to_string(),
-        directory_cache: std::collections::HashMap::new(),
         expanded_directories,
-        loading_directories: std::collections::HashSet::new(),
-        directory_errors: std::collections::HashMap::new(),
-        selected_path: None,
-        selection_anchor: None,
-        preview: None,
-        selected_entries: std::collections::HashSet::new(),
         home_dir: "/".into(),
-        home_dir_resolved: false,
+        ..Default::default()
     }
 }
 
@@ -204,7 +196,6 @@ impl Ashell {
                     return;
                 }
                 tab.title = title.clone();
-                tab.dynamic_title = title.clone();
                 tab.local_cwd = Some(path);
                 true
             } else {
@@ -1353,6 +1344,7 @@ impl Ashell {
             session.clone(),
             DEFAULT_COLS,
             DEFAULT_ROWS,
+            self.config.cache.ssh_report_directory,
             backend_events.clone(),
         );
         self.tabs.push(TerminalTab::new_ssh(
@@ -1701,6 +1693,7 @@ impl Ashell {
                         session.clone(),
                         cols,
                         rows,
+                        self.config.cache.ssh_report_directory,
                         backend_events.clone(),
                     );
                     self.tabs[ix].set_backend(backend);
@@ -1710,7 +1703,6 @@ impl Ashell {
             self.tabs[ix].connected = false;
             self.tabs[ix].status = "connecting".into();
             self.tabs[ix].disconnected_reason = None;
-            self.tabs[ix].terminal_title_received = false;
 
             if tab_kind == crate::terminal::TabKind::Ssh
                 && self.active_tab.as_deref() == Some(tab_id)
@@ -2187,6 +2179,7 @@ impl Ashell {
                     session.clone(),
                     DEFAULT_COLS,
                     DEFAULT_ROWS,
+                    self.config.cache.ssh_report_directory,
                     backend_events.clone(),
                 );
                 TerminalTab::new_ssh(new_id.clone(), &session, backend, backend_events.clone())
@@ -2617,6 +2610,18 @@ impl Ashell {
     }
 
     pub(crate) fn sync_sftp_to_active_tab(&mut self) {
+        self.check_terminal_directory = true;
+        for group in &mut self.tab_groups {
+            if let Some(sftp) = &mut group.sftp {
+                if sftp.pending_sync.as_ref().is_some_and(|sync| {
+                    Some(&group.id) != self.active_group.as_ref()
+                        || Some(&sync.tab_id) != self.active_tab.as_ref()
+                }) {
+                    sftp.pending_sync = None;
+                    sftp.last_terminal_directory = None;
+                }
+            }
+        }
         self.update_active_sftp_binding(false);
     }
 

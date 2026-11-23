@@ -15,10 +15,10 @@ impl Ashell {
     }
 
     pub(crate) fn active_sftp_mut(&mut self) -> Option<&mut terminal::SftpUiState> {
-        let active_id = self.active_group.clone()?;
+        let active_id = self.active_group.as_ref()?;
         self.tab_groups
             .iter_mut()
-            .find(|g| g.id == active_id)
+            .find(|g| &g.id == active_id)
             .and_then(|g| g.sftp.as_mut())
     }
 
@@ -28,7 +28,27 @@ impl Ashell {
             .and_then(|id| self.sftp_handles.get(id))
     }
 
+    pub(crate) fn show_sftp_notice(&mut self, group_id: &str, text: String, error: bool) {
+        if let Some(sftp) = self
+            .tab_groups
+            .iter_mut()
+            .find(|group| group.id == group_id)
+            .and_then(|group| group.sftp.as_mut())
+        {
+            sftp.show_notice(text, error);
+        }
+    }
+
     pub(crate) fn navigate_sftp(&mut self, path: String, cx: &mut Context<Self>) {
+        self.open_sftp_directory(path, None, cx);
+    }
+
+    pub(crate) fn open_sftp_directory(
+        &mut self,
+        path: String,
+        entries: Option<Vec<RemoteEntry>>,
+        cx: &mut Context<Self>,
+    ) {
         let Some((current_path, home_dir)) = self
             .active_sftp()
             .map(|sftp| (sftp.current_path.clone(), sftp.home_dir.clone()))
@@ -43,14 +63,20 @@ impl Ashell {
         tracing::info!("[sftp] navigating to directory: '{}'", path);
         let ancestors = crate::sftp::remote_path_ancestors(&path);
         let mut paths_to_load = Vec::new();
+        let load_target = entries.is_none();
         if let Some(sftp) = self.active_sftp_mut() {
+            sftp.pending_sync = None;
             sftp.current_path = path.clone();
             sftp.selected_path = None;
             sftp.selection_anchor = None;
             sftp.preview = None;
             sftp.selected_entries.clear();
             sftp.expand_to(&path);
-            sftp.begin_directory_load(&path);
+            if let Some(entries) = entries {
+                sftp.apply_directory_entries(path.clone(), entries);
+            } else {
+                sftp.begin_directory_load(&path);
+            }
             for ancestor in ancestors {
                 if ancestor != path
                     && !sftp.directory_cache.contains_key(&ancestor)
@@ -65,7 +91,9 @@ impl Ashell {
         for ancestor in paths_to_load {
             handle.list_dir(ancestor);
         }
-        handle.list_dir(path);
+        if load_target {
+            handle.list_dir(path);
+        }
         cx.notify();
     }
 
@@ -286,6 +314,7 @@ impl Ashell {
         let Some(handle) = self.active_sftp_handle().cloned() else {
             return;
         };
+        let group_id = self.active_group.clone();
         let path_prompt = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -311,7 +340,13 @@ impl Ashell {
                 }
                 Ok(Err(err)) => {
                     this.update(cx, |this, cx| {
-                        this.status = format!("download picker failed: {err}").into();
+                        if let Some(group_id) = group_id.as_deref() {
+                            this.show_sftp_notice(
+                                group_id,
+                                format!("download picker failed: {err}"),
+                                true,
+                            );
+                        }
                         cx.notify();
                     })?;
                 }
@@ -330,6 +365,7 @@ impl Ashell {
             .active_sftp()
             .map(|sftp| sftp.current_path.clone())
             .unwrap_or_else(|| "/".into());
+        let group_id = self.active_group.clone();
         let path_prompt = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -355,7 +391,13 @@ impl Ashell {
                 }
                 Ok(Err(err)) => {
                     this.update(cx, |this, cx| {
-                        this.status = format!("upload picker failed: {err}").into();
+                        if let Some(group_id) = group_id.as_deref() {
+                            this.show_sftp_notice(
+                                group_id,
+                                format!("upload picker failed: {err}"),
+                                true,
+                            );
+                        }
                         cx.notify();
                     })?;
                 }
@@ -374,6 +416,7 @@ impl Ashell {
             .active_sftp()
             .map(|sftp| sftp.current_path.clone())
             .unwrap_or_else(|| "/".into());
+        let group_id = self.active_group.clone();
         let path_prompt = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -399,7 +442,13 @@ impl Ashell {
                 }
                 Ok(Err(err)) => {
                     this.update(cx, |this, cx| {
-                        this.status = format!("upload picker failed: {err}").into();
+                        if let Some(group_id) = group_id.as_deref() {
+                            this.show_sftp_notice(
+                                group_id,
+                                format!("upload picker failed: {err}"),
+                                true,
+                            );
+                        }
                         cx.notify();
                     })?;
                 }

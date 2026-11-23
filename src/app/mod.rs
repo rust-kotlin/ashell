@@ -352,6 +352,7 @@ pub(crate) struct Ashell {
     pub(crate) connection_scroll_handle: gpui::ScrollHandle,
     pub(crate) saved_sessions_overflowing: bool,
     pub(crate) connection_progress: Option<ConnectionProgress>,
+    pub(crate) check_terminal_directory: bool,
     pub(crate) pending_sftp_path_sync: Option<String>,
     pub(crate) sftp_context_menu: Option<SftpContextMenuState>,
     pub(crate) sftp_rename_input: Entity<InputState>,
@@ -868,6 +869,7 @@ impl Ashell {
             connection_scroll_handle: gpui::ScrollHandle::new(),
             saved_sessions_overflowing: false,
             connection_progress: None,
+            check_terminal_directory: true,
             pending_sftp_path_sync: Some("/".into()),
             sftp_context_menu: None,
             sftp_rename_input,
@@ -1262,6 +1264,7 @@ impl Ashell {
     pub(crate) fn update_terminal_focus(&mut self, previous_tab_id: Option<&str>) {
         let active_tab_id = self.active_tab.clone();
         if previous_tab_id != active_tab_id.as_deref() {
+            self.pending_sftp_path_sync = self.active_sftp().map(|sftp| sftp.current_path.clone());
             if let Some(previous_tab_id) = previous_tab_id {
                 if let Some(tab) = self.tabs.iter().find(|tab| tab.id == previous_tab_id) {
                     tab.report_focus(false);
@@ -1393,7 +1396,7 @@ impl Ashell {
                         tab.connected = true;
                         tab.disconnected_reason = None;
                     }
-                    self.sync_sftp_path_from_terminal_title(&tab_id, cx);
+                    self.check_terminal_directory = true;
                     self.sync_sftp_to_active_tab();
                     self.sync_system_tab_to_active_group();
                     if self.system_tab_id.as_deref() == Some(tab_id.as_str()) {
@@ -1471,22 +1474,18 @@ impl Ashell {
                         }
                     }
                 }
-                BackendEvent::SftpStatus { tab_id, text } => {
-                    let group_id = self
+                BackendEvent::SftpStatus {
+                    tab_id,
+                    text,
+                    error,
+                } => {
+                    if let Some(sftp) = self
                         .tab_groups
                         .iter_mut()
-                        .find(|group| group.sftp_tab_id.as_deref() == Some(tab_id.as_str()))
-                        .map(|group| {
-                            if let Some(sftp) = group.sftp.as_mut() {
-                                sftp.status = text.clone();
-                            }
-                            group.id.clone()
-                        });
-                    if group_id
-                        .as_ref()
-                        .is_some_and(|group_id| self.active_group.as_ref() == Some(group_id))
+                        .find(|group| group.sftp_tab_id.as_ref() == Some(&tab_id))
+                        .and_then(|group| group.sftp.as_mut())
                     {
-                        self.status = text.into();
+                        sftp.show_notice(text, error);
                     }
                 }
                 BackendEvent::RemoteSystem { tab_id, snapshot } => {
@@ -1674,18 +1673,13 @@ impl Ashell {
                     }
                     if sync_active_path {
                         self.pending_sftp_path_sync = Some(home);
-                        self.sync_sftp_path_from_terminal_title(&tab_id, cx);
+                        self.check_terminal_directory = true;
                     }
                 }
                 BackendEvent::TerminalTitleChanged { tab_id, title } => {
-                    let local_path = crate::session::parse_local_directory_title(&title);
-                    if let Some(path) = local_path {
+                    if let Some(path) = crate::session::parse_local_directory_title(&title) {
                         self.apply_local_directory_change(&tab_id, path);
-                    } else if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        tab.dynamic_title = title;
-                        tab.terminal_title_received = true;
                     }
-                    self.sync_sftp_path_from_terminal_title(&tab_id, cx);
                 }
                 BackendEvent::TerminalBell { tab_id } => {
                     let body = t!("terminal_attention_required").to_string();
@@ -1722,6 +1716,22 @@ impl Ashell {
                     }
                 }
             }
+        }
+        if changed {
+            for tab in &mut self.tabs {
+                if tab.remote_directories.finish_batch()
+                    && self.active_tab.as_ref() == Some(&tab.id)
+                {
+                    self.check_terminal_directory = true;
+                }
+            }
+        }
+        if std::mem::take(&mut self.check_terminal_directory) && self.config.cache.sftp_auto_follow
+        {
+            self.sync_cwd_from_terminal(false, cx);
+        }
+        if let Some(sftp) = self.active_sftp_mut() {
+            changed |= sftp.update_notice(Instant::now());
         }
         if transfers_changed {
             self.config.set_transfers(self.transfers.clone());
@@ -1992,6 +2002,7 @@ impl Ashell {
                     session.clone(),
                     self.tabs[ix].cols,
                     self.tabs[ix].rows,
+                    self.config.cache.ssh_report_directory,
                     backend_events.clone(),
                 ),
                 _ => continue,
@@ -2002,7 +2013,6 @@ impl Ashell {
             self.tabs[ix].connected = false;
             self.tabs[ix].status = "connecting".into();
             self.tabs[ix].disconnected_reason = None;
-            self.tabs[ix].terminal_title_received = false;
 
             if tab_kind == crate::terminal::TabKind::Ssh
                 && self.active_tab.as_deref() == Some(tab_id.as_str())
@@ -2030,100 +2040,92 @@ impl Ashell {
         cx.notify();
     }
 
-    pub(crate) fn sync_cwd_from_terminal(
-        &mut self,
-        _window: &mut gpui::Window,
-        cx: &mut Context<Self>,
-    ) {
-        let active_id = self.active_tab.clone();
-        let Some(active_id) = active_id else {
-            return;
-        };
-
-        let parsed = if let Some(tab) = self.tabs.iter().find(|t| t.id == active_id) {
-            let home_dir = if let Some(group) = self
-                .tab_groups
-                .iter()
-                .find(|g| g.pane_root.contains(&tab.id))
-            {
-                group
-                    .sftp
-                    .as_ref()
-                    .map(|s| s.home_dir.as_str())
-                    .unwrap_or("/")
-            } else {
-                "/"
-            };
-
-            Self::parse_path_from_title(&tab.dynamic_title, home_dir)
-        } else {
-            None
-        };
-
-        if let Some(path) = parsed {
-            self.navigate_sftp(path, cx);
-        }
+    fn terminal_directory_for_sftp(
+        &self,
+    ) -> Result<(String, String, crate::sftp::SftpHandle), String> {
+        let tab = self
+            .tabs
+            .iter()
+            .find(|tab| Some(&tab.id) == self.active_tab.as_ref() && tab.kind == TabKind::Ssh)
+            .ok_or_else(|| t!("cwd_sync_failed").to_string())?;
+        let sftp = self
+            .active_sftp()
+            .filter(|sftp| sftp.home_dir_resolved && tab.connected)
+            .ok_or_else(|| t!("sftp_connection_unavailable").to_string())?;
+        let handle = self
+            .active_sftp_handle()
+            .filter(|handle| !handle.commands.is_closed())
+            .ok_or_else(|| t!("sftp_connection_unavailable").to_string())?;
+        let path = tab
+            .remote_directory(&sftp.home_dir)
+            .ok_or_else(|| t!("cwd_sync_failed").to_string())?;
+        Ok((
+            tab.id.clone(),
+            crate::sftp::normalize_remote_path(&path, "/", &sftp.home_dir),
+            handle.clone(),
+        ))
     }
 
-    fn sync_sftp_path_from_terminal_title(&mut self, tab_id: &str, cx: &mut Context<Self>) {
-        if self.active_tab.as_deref() != Some(tab_id) {
-            return;
-        }
-
-        let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) else {
+    pub(crate) fn sync_cwd_from_terminal(&mut self, manual: bool, cx: &mut Context<Self>) {
+        let target = self.terminal_directory_for_sftp();
+        let Some(sftp) = self.active_sftp_mut() else {
             return;
         };
-        if tab.kind != TabKind::Ssh
-            || !tab.connected
-            || !tab.terminal_title_received
-            || tab.is_alternate_screen_active()
-        {
+        let (tab_id, path, handle) = match target {
+            Ok(target) => target,
+            Err(reason) => {
+                if manual {
+                    sftp.pending_sync = None;
+                    sftp.show_notice(reason, true);
+                    cx.notify();
+                }
+                return;
+            }
+        };
+        let Some(id) = sftp.begin_terminal_sync(&tab_id, &path, manual) else {
             return;
-        }
-        let title = tab.dynamic_title.clone();
-
-        let Some((current_path, home_dir)) = self
-            .active_group
-            .as_ref()
-            .and_then(|group_id| {
-                self.tab_groups
+        };
+        let response = handle.read_directory(path.clone());
+        cx.spawn(async move |this, cx| {
+            let result = response
+                .await
+                .unwrap_or_else(|_| Err(t!("sftp_connection_unavailable").to_string()));
+            let _ = this.update(cx, |this, cx| {
+                if this.active_tab.as_ref() != Some(&tab_id) {
+                    return;
+                }
+                let connected = this
+                    .tabs
                     .iter()
-                    .find(|group| &group.id == group_id && group.pane_root.contains(tab_id))
-            })
-            .and_then(|group| group.sftp.as_ref())
-            .filter(|sftp| sftp.home_dir_resolved)
-            .map(|sftp| (sftp.current_path.clone(), sftp.home_dir.clone()))
-        else {
-            return;
-        };
-
-        let Some(path) = Self::parse_path_from_title(&title, &home_dir) else {
-            return;
-        };
-        let path = crate::sftp::normalize_remote_path(&path, &current_path, &home_dir);
-        if path != current_path {
-            self.navigate_sftp(path, cx);
-        }
-    }
-
-    fn parse_path_from_title(title: &str, home_dir: &str) -> Option<String> {
-        let title = title.strip_prefix("ASHELL_CWD:").unwrap_or(title);
-        let path_part = if let Some(pos) = title.find(':') {
-            title[pos + 1..].trim()
-        } else {
-            title.trim()
-        };
-
-        if path_part.starts_with('/') {
-            Some(path_part.to_string())
-        } else if path_part == "~" {
-            Some(home_dir.to_string())
-        } else if let Some(rest) = path_part.strip_prefix("~/") {
-            let home = home_dir.trim_end_matches('/');
-            Some(format!("{}/{}", home, rest))
-        } else {
-            None
-        }
+                    .any(|tab| tab.id == tab_id && tab.connected);
+                let Some(sftp) = this.active_sftp_mut() else {
+                    return;
+                };
+                if !sftp.finish_terminal_sync(id) {
+                    return;
+                }
+                match result {
+                    _ if !connected => {
+                        if manual {
+                            sftp.show_notice(t!("sftp_connection_unavailable").to_string(), true);
+                        }
+                    }
+                    Ok(entries) => {
+                        if manual {
+                            sftp.show_notice(t!("cwd_synced", path = &path).to_string(), false);
+                        }
+                        this.open_sftp_directory(path, Some(entries), cx);
+                    }
+                    Err(reason) => sftp.show_notice(
+                        t!("cwd_sync_failed_reason", reason = reason).to_string(),
+                        true,
+                    ),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn capture_layout_state(&mut self, window: &mut gpui::Window, cx: &gpui::App) -> bool {

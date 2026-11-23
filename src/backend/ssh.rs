@@ -35,6 +35,7 @@ pub fn spawn_ssh_terminal(
     session: Session,
     cols: u16,
     rows: u16,
+    report_directory: bool,
     events: GuardedBackendEventSender,
 ) -> BackendTx {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<BackendCommand>();
@@ -45,6 +46,7 @@ pub fn spawn_ssh_terminal(
             session,
             cols,
             rows,
+            report_directory,
             cmd_rx,
             events.clone(),
         )
@@ -107,13 +109,17 @@ async fn execute_remote_command_with_handle(
         .await
         .with_context(|| format!("execute {operation}"))?;
 
-    let mut output = Vec::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
     let mut exit_status = None;
     let wait_result = tokio::time::timeout(std::time::Duration::from_secs(20), async {
         while let Some(msg) = channel.wait().await {
             match msg {
-                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, ext: _ } => {
-                    output.extend_from_slice(&data);
+                ChannelMsg::Data { data } => {
+                    stdout.extend_from_slice(&data);
+                }
+                ChannelMsg::ExtendedData { data, ext: _ } => {
+                    stderr.extend_from_slice(&data);
                 }
                 ChannelMsg::ExitStatus {
                     exit_status: status,
@@ -129,19 +135,28 @@ async fn execute_remote_command_with_handle(
         return Err(anyhow!("{operation} timed out after 20 seconds"));
     }
 
-    let output = String::from_utf8_lossy(&output).trim().to_string();
-    if exit_status.is_none_or(|status| status != 0) {
-        let detail = if output.is_empty() {
-            exit_status.map_or_else(
-                || "remote command closed without an exit status".to_string(),
-                |status| format!("exit status {status}"),
-            )
+    let stdout_str = String::from_utf8_lossy(&stdout).trim().to_string();
+    let stderr_str = String::from_utf8_lossy(&stderr).trim().to_string();
+    if let Some(status) = exit_status {
+        if status != 0 {
+            let detail = if !stderr_str.is_empty() {
+                stderr_str
+            } else if !stdout_str.is_empty() {
+                stdout_str
+            } else {
+                format!("exit status {status}")
+            };
+            return Err(anyhow!("{operation} failed: {detail}"));
+        }
+    } else if stdout_str.is_empty() {
+        let detail = if !stderr_str.is_empty() {
+            stderr_str
         } else {
-            output
+            "remote command closed without an exit status or output".to_string()
         };
         return Err(anyhow!("{operation} failed: {detail}"));
     }
-    Ok(output)
+    Ok(stdout_str)
 }
 
 async fn sample_remote_processes_with_handle(
@@ -276,6 +291,7 @@ async fn run_ssh(
     session: Session,
     cols: u16,
     rows: u16,
+    report_directory: bool,
     mut commands: mpsc::UnboundedReceiver<BackendCommand>,
     events: GuardedBackendEventSender,
 ) -> Result<()> {
@@ -287,8 +303,17 @@ async fn run_ssh(
         ),
     });
 
+    let (server_info, server_supports_launcher) = tokio::sync::oneshot::channel();
     let handle = Arc::new(tokio::sync::Mutex::new(
-        connect_and_authenticate(&tab_id, &session, &events).await?,
+        connect_and_authenticate(
+            &tab_id,
+            &session,
+            &events,
+            ClientHandler {
+                server_info: Some(server_info),
+            },
+        )
+        .await?,
     ));
 
     let mut channel = handle
@@ -297,11 +322,27 @@ async fn run_ssh(
         .channel_open_session()
         .await
         .context("open session")?;
+    let integrate = report_directory && server_supports_launcher.await.unwrap_or(false);
     channel
-        .request_pty(true, "xterm-256color", cols.into(), rows.into(), 0, 0, &[])
+        .request_pty(
+            !integrate,
+            "xterm-256color",
+            cols.into(),
+            rows.into(),
+            0,
+            0,
+            &[],
+        )
         .await
         .context("request pty")?;
-    channel.request_shell(true).await.context("request shell")?;
+    if integrate {
+        channel
+            .exec(true, osc7_login_command())
+            .await
+            .context("request interactive shell with directory reporting")?;
+    } else {
+        channel.request_shell(true).await.context("request shell")?;
+    }
 
     let _ = events.send(BackendEvent::Status {
         tab_id: tab_id.clone(),
@@ -313,6 +354,7 @@ async fn run_ssh(
 
     let exit_reason;
     let mut is_graceful_close = false;
+    let mut awaiting_exec_reply = integrate;
 
     loop {
         tokio::select! {
@@ -435,6 +477,13 @@ async fn run_ssh(
             }
             msg = channel.wait() => {
                 match msg {
+                    Some(ChannelMsg::Success) => awaiting_exec_reply = false,
+                    Some(ChannelMsg::Failure) if awaiting_exec_reply => {
+                        // The PTY did not request a reply, so this failure belongs to exec.
+                        // Shell-only servers can use the same PTY for their default login.
+                        awaiting_exec_reply = false;
+                        channel.request_shell(true).await.context("request default shell")?;
+                    }
                     Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, ext: _ }) => {
                         let _ = events.send(BackendEvent::Output {
                             tab_id: tab_id.clone(),
@@ -486,6 +535,7 @@ async fn connect_and_authenticate(
     tab_id: &str,
     session: &Session,
     events: &GuardedBackendEventSender,
+    handler: ClientHandler,
 ) -> Result<russh::client::Handle<ClientHandler>> {
     let config = Arc::new(crate::session::config::ssh_client_config());
     let addr = format!("{}:{}", session.host, session.port);
@@ -511,7 +561,7 @@ async fn connect_and_authenticate(
         text: status_text,
     });
     let stream = crate::session::config::connect_proxy(session).await?;
-    let mut handle = client::connect_stream(config, stream, ClientHandler)
+    let mut handle = client::connect_stream(config, stream, handler)
         .await
         .with_context(|| format!("connect {addr} failed"))?;
 
@@ -1145,12 +1195,47 @@ Get-Process | ForEach-Object { $processNames[[int]$_.Id] = $_.ProcessName }
   Write-Output ("PORT{0}UDP{0}{1}{0}{2}{0}UNCONN{0}{3}{0}{4}" -f $tab, $_.LocalAddress, $_.LocalPort, $ownerPid, $processName)
 }"#;
 
-#[derive(Clone)]
-struct ClientHandler;
+fn osc7_login_command() -> String {
+    let launcher = include_str!("osc7/launch.sh")
+        .replace("@BASH_INIT@", include_str!("osc7/bash.sh"))
+        .replace("@ZSH_INIT@", include_str!("osc7/zshenv.zsh"))
+        .replace("@REPORT@", include_str!("osc7/report.sh"));
+    // A single-line argument also survives login shells such as tcsh which
+    // reject multiline quoted strings. Decode it with the POSIX printf builtin.
+    let encoded = launcher
+        .replace('\\', "\\0134")
+        .replace('\n', "\\0012")
+        .replace('\'', "\\0047")
+        .replace('!', "\\0041");
+    format!("sh -c 'exec sh -c \"$(printf %b \"$1\")\"' ashell '{encoded}'")
+}
+
+fn supports_posix_launcher(server_id: &[u8]) -> bool {
+    let banner = String::from_utf8_lossy(server_id).to_ascii_lowercase();
+    // Appliances and Windows servers can use a non-POSIX command interpreter.
+    (banner.contains("-openssh_") || banner.contains("-dropbear_")) && !banner.contains("windows")
+}
+
+struct ClientHandler {
+    server_info: Option<tokio::sync::oneshot::Sender<bool>>,
+}
 
 #[async_trait]
 impl Handler for ClientHandler {
     type Error = anyhow::Error;
+
+    async fn channel_open_confirmation(
+        &mut self,
+        _: russh::ChannelId,
+        _: u32,
+        _: u32,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(reply) = self.server_info.take() {
+            let _ = reply.send(supports_posix_launcher(session.remote_sshid()));
+        }
+        Ok(())
+    }
 
     async fn check_server_key(
         &mut self,
@@ -1159,3 +1244,7 @@ impl Handler for ClientHandler {
         Ok(true)
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "osc7/tests.rs"]
+mod osc7_tests;

@@ -331,6 +331,10 @@ pub struct ConfigFile {
     pub transfers: Vec<crate::terminal::Transfer>,
     #[serde(default)]
     pub show_hidden_files: bool,
+    #[serde(default = "default_enabled")]
+    pub sftp_auto_follow: bool,
+    #[serde(default = "default_enabled")]
+    pub ssh_report_directory: bool,
     #[serde(default)]
     pub lock_layout: bool,
     #[serde(default = "default_monitoring_position")]
@@ -395,6 +399,10 @@ fn default_s3_region() -> String {
 
 fn default_s3_object_key() -> String {
     "ashell-sync.json".to_string()
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 fn default_follow_system_theme() -> bool {
@@ -485,6 +493,8 @@ impl Default for ConfigFile {
             sftp_file_columns_customized: false,
             transfers: Vec::new(),
             show_hidden_files: false,
+            sftp_auto_follow: default_enabled(),
+            ssh_report_directory: default_enabled(),
             lock_layout: false,
             monitoring_position: default_monitoring_position(),
             sidebar_collapsed: false,
@@ -1523,6 +1533,8 @@ impl ConfigStore {
         disk_config.sftp_file_columns = local_config.sftp_file_columns;
         disk_config.sftp_file_columns_customized = local_config.sftp_file_columns_customized;
         disk_config.show_hidden_files = local_config.show_hidden_files;
+        disk_config.sftp_auto_follow = local_config.sftp_auto_follow;
+        disk_config.ssh_report_directory = local_config.ssh_report_directory;
         disk_config.lock_layout = local_config.lock_layout;
         disk_config.monitoring_position = local_config.monitoring_position;
         disk_config.sidebar_collapsed = local_config.sidebar_collapsed;
@@ -1919,6 +1931,8 @@ mod tests {
     fn test_remember_tabs_defaults_to_disabled_for_older_configs() {
         let config: ConfigFile = serde_json::from_str("{}").unwrap();
 
+        assert!(config.sftp_auto_follow);
+        assert!(config.ssh_report_directory);
         assert!(!config.remember_tabs);
         assert!(config.saved_tabs.is_none());
         assert!(config.sftp_tree_panels.is_none());
@@ -1931,6 +1945,13 @@ mod tests {
             LocalTerminalShell::WindowsPowerShell
         );
         assert!(config.collapsed_connection_groups.is_empty());
+    }
+
+    #[test]
+    fn osc7_reporting_defaults_on_and_respects_saved_opt_out() {
+        assert!(ConfigFile::default().ssh_report_directory);
+        let config: ConfigFile = serde_json::from_str(r#"{"ssh_report_directory":false}"#).unwrap();
+        assert!(!config.ssh_report_directory);
     }
 
     #[test]
@@ -2108,6 +2129,8 @@ mod tests {
             local_terminal_encoding: TextEncoding::Gbk,
             local_terminal_shell: LocalTerminalShell::GitBash,
             show_hidden_files: true,
+            sftp_auto_follow: false,
+            ssh_report_directory: true,
             sftp_file_columns_customized: true,
             remember_tabs: true,
             use_proxy: true,
@@ -2147,6 +2170,8 @@ mod tests {
         assert_eq!(decrypted.local_terminal_encoding, TextEncoding::Gbk);
         assert_eq!(decrypted.local_terminal_shell, LocalTerminalShell::GitBash);
         assert!(decrypted.show_hidden_files);
+        assert!(!decrypted.sftp_auto_follow);
+        assert!(decrypted.ssh_report_directory);
         assert!(decrypted.sftp_file_columns_customized);
         assert!(decrypted.remember_tabs);
         assert!(decrypted.saved_tabs.is_some());

@@ -1,4 +1,5 @@
 pub mod custom_blocks;
+mod directory;
 pub mod element;
 pub mod highlight;
 pub mod input;
@@ -40,6 +41,8 @@ pub enum TabKind {
 const TERMINAL_ACTIVITY_GRACE: Duration = Duration::from_secs(2);
 const CLICK_CURSOR_PREDICTION_TTL: Duration = Duration::from_millis(750);
 const MAX_OSC_PAYLOAD_BYTES: usize = 4096;
+// A 4 KiB path can occupy three times as many bytes in a file URI.
+const MAX_OSC7_PAYLOAD_BYTES: usize = 16 * 1024;
 const MAX_NOTIFICATION_TEXT_BYTES: usize = 8192;
 const MAX_OSC99_IDENTIFIER_BYTES: usize = 128;
 const MAX_PENDING_OSC99_NOTIFICATIONS: usize = 32;
@@ -116,6 +119,7 @@ enum OscTerminalState {
 enum OscTerminalEvent {
     Notification(TerminalNotification),
     ProtocolReply(Vec<u8>),
+    WorkingDirectory(directory::Source, String),
     PromptStarted {
         click_mode: Option<PromptClickMode>,
         secondary: bool,
@@ -288,7 +292,7 @@ impl OscTerminalParser {
                 OscTerminalState::Command => match byte {
                     b';' if matches!(
                         self.command.as_slice(),
-                        b"9" | b"99" | b"133" | b"633" | b"777"
+                        b"0" | b"2" | b"7" | b"9" | b"99" | b"133" | b"633" | b"777"
                     ) =>
                     {
                         self.payload.clear();
@@ -301,6 +305,16 @@ impl OscTerminalParser {
                     _ => self.state = OscTerminalState::Ignore,
                 },
                 OscTerminalState::Payload => match byte {
+                    // ST (0x9c) can also be part of a UTF-8 character in a title.
+                    0x9c if matches!(
+                        self.payload.as_slice(),
+                        [.., 0xc2..=0xf4]
+                            | [.., 0xe0..=0xf4, 0x80..=0xbf]
+                            | [.., 0xf0..=0xf4, 0x80..=0xbf, 0x80..=0xbf]
+                    ) =>
+                    {
+                        self.push_payload_byte(byte)
+                    }
                     0x07 | 0x9c => {
                         if let Some(event) = self.complete_event() {
                             events.push((index + 1, event));
@@ -352,7 +366,12 @@ impl OscTerminalParser {
     }
 
     fn push_payload_byte(&mut self, byte: u8) {
-        if self.payload.len() >= MAX_OSC_PAYLOAD_BYTES {
+        let limit = if self.command == b"7" {
+            MAX_OSC7_PAYLOAD_BYTES
+        } else {
+            MAX_OSC_PAYLOAD_BYTES
+        };
+        if self.payload.len() >= limit {
             self.payload.clear();
             self.state = OscTerminalState::Ignore;
         } else {
@@ -366,6 +385,14 @@ impl OscTerminalParser {
         let payload = std::mem::take(&mut self.payload);
         self.reset();
 
+        if command == b"0" || command == b"2" {
+            return directory::title_path(std::str::from_utf8(&payload).ok()?)
+                .map(|path| OscTerminalEvent::WorkingDirectory(directory::Source::Title, path));
+        }
+        if command == b"7" {
+            return parse_osc7_directory(std::str::from_utf8(&payload).ok()?)
+                .map(|path| OscTerminalEvent::WorkingDirectory(directory::Source::Osc7, path));
+        }
         let payload = String::from_utf8_lossy(&payload);
         let trimmed = payload.trim();
         match command.as_slice() {
@@ -519,6 +546,18 @@ fn parse_osc777(payload: &str) -> Option<TerminalNotification> {
         occasion: TerminalNotificationOccasion::Always,
         source: TerminalNotificationSource::Osc777,
     })
+}
+
+fn parse_osc7_directory(payload: &str) -> Option<String> {
+    let location = payload.strip_prefix("file://")?;
+    let (_, path) = location.split_once('/')?;
+    let path = percent_encoding::percent_decode_str(path)
+        .decode_utf8()
+        .ok()?;
+    if path.chars().any(char::is_control) {
+        return None;
+    }
+    Some(format!("/{path}"))
 }
 
 fn parse_shell_integration_event(payload: &str) -> Option<OscTerminalEvent> {
@@ -711,6 +750,7 @@ pub enum BackendEvent {
     },
     SftpStatus {
         tab_id: String,
+        error: bool,
         text: String,
     },
     RemoteSystem {
@@ -872,8 +912,7 @@ impl BackendTx {
 pub struct TerminalTab {
     pub id: String,
     pub title: String,
-    pub dynamic_title: String,
-    pub terminal_title_received: bool,
+    pub(crate) remote_directories: directory::Reports,
     pub local_cwd: Option<PathBuf>,
     pub kind: TabKind,
     pub status: String,
@@ -975,10 +1014,21 @@ pub(crate) struct SftpTreeRow {
     pub(crate) error: Option<String>,
 }
 
+#[derive(Clone)]
+pub(crate) struct PendingDirectorySync {
+    pub id: uuid::Uuid,
+    pub tab_id: String,
+    pub manual: bool,
+    pub started: Instant,
+    pub progress_visible: bool,
+}
+
 #[derive(Clone, Default)]
 pub struct SftpUiState {
     pub current_path: String,
-    pub status: String,
+    pub(crate) notice: Option<(String, Instant)>,
+    pub(crate) pending_sync: Option<PendingDirectorySync>,
+    pub(crate) last_terminal_directory: Option<(String, String)>,
     pub directory_cache: HashMap<String, Vec<RemoteEntry>>,
     pub expanded_directories: HashSet<String>,
     pub loading_directories: HashSet<String>,
@@ -992,6 +1042,64 @@ pub struct SftpUiState {
 }
 
 impl SftpUiState {
+    pub(crate) fn begin_terminal_sync(
+        &mut self,
+        tab_id: &str,
+        path: &str,
+        manual: bool,
+    ) -> Option<uuid::Uuid> {
+        if !manual
+            && self
+                .last_terminal_directory
+                .as_ref()
+                .is_some_and(|(tab, directory)| tab == tab_id && directory == path)
+        {
+            return None;
+        }
+        self.last_terminal_directory = Some((tab_id.to_owned(), path.to_owned()));
+        self.pending_sync = None;
+        if !manual && self.current_path == path {
+            return None;
+        }
+        let id = uuid::Uuid::new_v4();
+        self.pending_sync = Some(PendingDirectorySync {
+            id,
+            tab_id: tab_id.to_owned(),
+            manual,
+            started: Instant::now(),
+            progress_visible: false,
+        });
+        self.notice = None;
+        Some(id)
+    }
+
+    pub(crate) fn finish_terminal_sync(&mut self, id: uuid::Uuid) -> bool {
+        self.pending_sync.take_if(|sync| sync.id == id).is_some()
+    }
+
+    pub(crate) fn show_notice(&mut self, text: String, error: bool) {
+        let duration = Duration::from_secs(if error { 5 } else { 2 });
+        self.notice = Some((text, Instant::now() + duration));
+    }
+
+    pub(crate) fn update_notice(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        if self.notice.as_ref().is_some_and(|(_, until)| now >= *until) {
+            self.notice = None;
+            changed = true;
+        }
+        if let Some(sync) = &mut self.pending_sync {
+            if sync.manual
+                && !sync.progress_visible
+                && now.duration_since(sync.started) >= Duration::from_millis(300)
+            {
+                sync.progress_visible = true;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub(crate) fn current_entries(&self) -> &[RemoteEntry] {
         self.directory_cache
             .get(&self.current_path)
@@ -1095,6 +1203,44 @@ mod sftp_ui_tests {
             size: 0,
             modified: 0,
         }
+    }
+
+    #[test]
+    fn automatic_follow_preserves_browsing_and_stale_requests_cannot_finish() {
+        let mut sftp = SftpUiState {
+            current_path: "/srv".into(),
+            ..Default::default()
+        };
+        assert!(sftp.begin_terminal_sync("tab", "/srv", false).is_none());
+        sftp.current_path = "/manual".into();
+        assert!(sftp.begin_terminal_sync("tab", "/srv", false).is_none());
+        let manual = sftp.begin_terminal_sync("tab", "/srv", true).unwrap();
+        let newer = sftp.begin_terminal_sync("tab", "/tmp", false).unwrap();
+        assert!(!sftp.finish_terminal_sync(manual));
+        assert!(sftp.finish_terminal_sync(newer));
+        assert_eq!(sftp.current_path, "/manual");
+        assert!(
+            sftp.begin_terminal_sync("other-pane", "/tmp", false)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn progress_is_delayed_and_replaced_notices_get_their_own_deadline() {
+        use std::time::Duration;
+        let mut sftp = SftpUiState::default();
+        let request = sftp.begin_terminal_sync("tab", "/work", true).unwrap();
+        let start = sftp.pending_sync.as_ref().unwrap().started;
+        assert!(!sftp.update_notice(start + Duration::from_millis(299)));
+        assert!(sftp.update_notice(start + Duration::from_millis(300)));
+        assert!(sftp.finish_terminal_sync(request));
+        sftp.show_notice("done".into(), false);
+        let first_deadline = sftp.notice.as_ref().unwrap().1;
+        sftp.show_notice("permission denied".into(), true);
+        let next_deadline = sftp.notice.as_ref().unwrap().1;
+        assert!(!sftp.update_notice(first_deadline));
+        assert!(sftp.update_notice(next_deadline));
+        assert!(sftp.notice.is_none());
     }
 
     #[test]
@@ -1202,6 +1348,66 @@ mod terminal_tab_backend_tests {
             ),
             events_rx,
         )
+    }
+
+    #[test]
+    fn ssh_directory_follows_changed_sources_and_resets_on_reconnect() {
+        let (mut tab, _) = pending_tab();
+        tab.kind = super::TabKind::Ssh;
+        tab.feed(b"\x1b]0;root@host: ~\x07\x1b]7;file://host/tmp/a%20");
+        tab.feed(b"%E4%B8%AD\x1b\\\x1b]2;root@host: /old\x07");
+        assert!(tab.remote_directories.finish_batch());
+        assert_eq!(tab.remote_directory("/root").as_deref(), Some("/tmp/a 中"));
+
+        tab.feed(b"\x1b]2;root@host: /var/log\x07");
+        assert!(tab.remote_directories.finish_batch());
+        assert_eq!(tab.remote_directory("/root").as_deref(), Some("/var/log"));
+        tab.feed(b"\x1b]7;file://host/tmp/a%20%E4%B8%AD\x07");
+        assert!(!tab.remote_directories.finish_batch());
+        assert_eq!(tab.remote_directory("/root").as_deref(), Some("/var/log"));
+
+        tab.feed(b"\x1b]2;root@host: ~/new\x07\x1b]7;file:///srv\x07");
+        tab.remote_directories.finish_batch();
+        tab.feed(b"\x1b]0;root@host: ~/new\x07");
+        assert!(!tab.remote_directories.finish_batch());
+        assert_eq!(tab.remote_directory("/root").as_deref(), Some("/srv"));
+        tab.advance_backend_events();
+        assert_eq!(tab.remote_directory("/root"), None);
+    }
+
+    #[test]
+    fn directory_reports_handle_unicode_titles_and_long_encoded_paths() {
+        let (mut tab, _) = pending_tab();
+        tab.kind = super::TabKind::Ssh;
+        // The last UTF-8 byte of 东 is 0x9c, also used as an OSC terminator.
+        tab.feed("\x1b]0;root@host: /东方\x07".as_bytes());
+        assert!(tab.remote_directories.finish_batch());
+        assert_eq!(tab.remote_directory("/root").as_deref(), Some("/东方"));
+
+        let encoded = "%E4%B8%AD".repeat(24) + "/";
+        let path = "中".repeat(24) + "/";
+        tab.feed(format!("\x1b]7;file:///{}end\x07", encoded.repeat(20)).as_bytes());
+        assert!(tab.remote_directories.finish_batch());
+        assert_eq!(
+            tab.remote_directory("/root"),
+            Some(format!("/{}end", path.repeat(20)))
+        );
+    }
+
+    #[test]
+    fn ignores_invalid_and_alternate_screen_directory_reports() {
+        let (mut tab, _) = pending_tab();
+        tab.kind = super::TabKind::Ssh;
+        tab.feed(b"\x1b]7;https://host/tmp\x07\x1b]7;file://host\x07\x1b]7;file:///tmp/%00\x07");
+        assert!(!tab.remote_directories.finish_batch());
+        tab.feed(b"\x1b]7;file:///shell\x07\x1b[?1049h\x1b]7;file:///editor\x07\x1b]0;/editor\x07");
+        tab.remote_directories.finish_batch();
+        assert_eq!(tab.remote_directory("/home/test"), None);
+        tab.feed(b"\x1b[?1049l");
+        assert_eq!(
+            tab.remote_directory("/home/test").as_deref(),
+            Some("/shell")
+        );
     }
 
     #[test]
@@ -1862,9 +2068,8 @@ impl TerminalTab {
         let events = backend_events.unguarded_sender();
         Self {
             id: id.clone(),
-            title: title.clone(),
-            dynamic_title: title,
-            terminal_title_received: false,
+            title,
+            remote_directories: Default::default(),
             local_cwd: None,
             kind,
             status,
@@ -1887,6 +2092,13 @@ impl TerminalTab {
             scroll_pixel_y: 0.0,
             highlight_cache: std::cell::RefCell::new(None),
         }
+    }
+
+    pub(crate) fn remote_directory(&self, home: &str) -> Option<String> {
+        if self.is_alternate_screen_active() {
+            return None;
+        }
+        self.remote_directories.path(home)
     }
 
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<TerminalNotification> {
@@ -1916,6 +2128,11 @@ impl TerminalTab {
         notifications: &mut Vec<TerminalNotification>,
     ) {
         match event {
+            OscTerminalEvent::WorkingDirectory(source, path) => {
+                if self.kind == TabKind::Ssh && !self.is_alternate_screen_active() {
+                    self.remote_directories.record(source, path);
+                }
+            }
             OscTerminalEvent::Notification(notification) => {
                 notifications.push(notification);
             }
@@ -2097,6 +2314,8 @@ impl TerminalTab {
     /// Call this before closing the old backend so all of its remaining events
     /// are discarded immediately.
     pub fn advance_backend_events(&mut self) -> GuardedBackendEventSender {
+        self.remote_directories = Default::default();
+        self.osc_terminal_parser = OscTerminalParser::default();
         let next = self.backend_events.next_generation();
         self.backend_events = next.clone();
         next

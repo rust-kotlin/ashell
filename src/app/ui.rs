@@ -486,6 +486,48 @@ impl Ashell {
         })
     }
 
+    fn render_status_indicator(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let status = self
+            .active_sftp()
+            .and_then(|sftp| {
+                if sftp
+                    .pending_sync
+                    .as_ref()
+                    .is_some_and(|sync| sync.progress_visible)
+                {
+                    Some(t!("syncing_cwd").to_string())
+                } else {
+                    sftp.notice
+                        .as_ref()
+                        .filter(|(_, until)| *until > Instant::now())
+                        .map(|(text, _)| text.clone())
+                }
+            })
+            .unwrap_or_default();
+        h_flex()
+            .id("sftp-status-indicator")
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .items_center()
+            .gap_1p5()
+            .when(!status.is_empty(), |this| {
+                let tooltip_text = status.clone();
+                this.tooltip(move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(tooltip_text.clone()).build(window, cx)
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_size(ui_rems(0.85))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(status),
+                )
+            })
+    }
+
     fn render_sftp_minimized_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .flex_none()
@@ -499,7 +541,7 @@ impl Ashell {
             .border_t_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().tab_bar)
-            .child(div().flex_1())
+            .child(self.render_status_indicator(cx))
             .child(self.render_transfers_button("sftp-transfers-minimized", cx))
             .child(self.render_command_history_popover(
                 "sftp-command-history-minimized-popover",
@@ -528,6 +570,8 @@ impl Ashell {
         let active_sftp = self.active_sftp();
 
         let show_hidden_files = self.show_hidden_files;
+        let auto_follow = self.config.cache.sftp_auto_follow;
+        let report_directory = self.config.cache.ssh_report_directory;
         let header_view = cx.entity();
         let header = h_flex()
             .flex_none()
@@ -541,7 +585,7 @@ impl Ashell {
             .border_b_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().tab_bar)
-            .child(div().flex_1().min_w(px(0.)))
+            .child(self.render_status_indicator(cx))
             .when(!self.sftp_panel_minimized, |this| {
                 this.child(self.render_transfers_button("sftp-transfers-header", cx))
                     .child(self.render_command_history_popover(
@@ -584,6 +628,45 @@ impl Ashell {
                                         ),
                                     )
                                     .separator()
+                                    .item(
+                                        PopupMenuItem::new(t!("sftp_auto_follow").to_string())
+                                            .checked(auto_follow)
+                                            .on_click(window.listener_for(
+                                                &view,
+                                                move |this, _, _, cx| {
+                                                    this.config.cache.sftp_auto_follow =
+                                                        !auto_follow;
+                                                    for group in &mut this.tab_groups {
+                                                        if let Some(sftp) = &mut group.sftp {
+                                                            sftp.last_terminal_directory = None;
+                                                            if sftp
+                                                                .pending_sync
+                                                                .as_ref()
+                                                                .is_some_and(|sync| !sync.manual)
+                                                            {
+                                                                sftp.pending_sync = None;
+                                                            }
+                                                        }
+                                                    }
+                                                    this.check_terminal_directory = !auto_follow;
+                                                    this.save_preferences_background();
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
+                                    .item(
+                                        PopupMenuItem::new(t!("ssh_report_directory").to_string())
+                                            .checked(report_directory)
+                                            .on_click(window.listener_for(
+                                                &view,
+                                                move |this, _, _, cx| {
+                                                    this.config.cache.ssh_report_directory =
+                                                        !report_directory;
+                                                    this.save_preferences_background();
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
                                     .item(
                                         PopupMenuItem::new(t!("hidden").to_string())
                                             .checked(show_hidden_files)
@@ -864,8 +947,8 @@ impl Ashell {
                                 .icon(IconName::Replace)
                                 .label(t!("sync_cwd").to_string())
                                 .tooltip(t!("sync_cwd_tooltip").to_string())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.sync_cwd_from_terminal(window, cx);
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.sync_cwd_from_terminal(true, cx);
                                 })),
                         )
                         .child(

@@ -65,6 +65,10 @@ pub struct PreviewData {
 #[derive(Debug)]
 pub enum SftpCommand {
     ListDir(String),
+    ReadDirectory {
+        path: String,
+        reply: oneshot::Sender<Result<Vec<RemoteEntry>, String>>,
+    },
     #[allow(dead_code)]
     Preview(String),
     Download {
@@ -169,6 +173,17 @@ pub struct SftpHandle {
 }
 
 impl SftpHandle {
+    pub(crate) fn read_directory(
+        &self,
+        path: String,
+    ) -> oneshot::Receiver<Result<Vec<RemoteEntry>, String>> {
+        let (reply, response) = oneshot::channel();
+        let _ = self
+            .commands
+            .send(SftpCommand::ReadDirectory { path, reply });
+        response
+    }
+
     pub fn list_dir(&self, path: String) {
         let _ = self.commands.send(SftpCommand::ListDir(path));
     }
@@ -266,6 +281,7 @@ pub fn spawn_sftp(
         {
             let _ = events.send(BackendEvent::SftpStatus {
                 tab_id: tab_id.clone(),
+                error: true,
                 text: format!("sftp error: {err:#}"),
             });
         }
@@ -280,11 +296,6 @@ async fn run_sftp(
     commands_tx: UnboundedSender<SftpCommand>,
     events: std::sync::mpsc::Sender<BackendEvent>,
 ) -> Result<()> {
-    let _ = events.send(BackendEvent::SftpStatus {
-        tab_id: tab_id.clone(),
-        text: t!("sftp_connecting").to_string(),
-    });
-
     let handle = connect_and_authenticate(&session).await?;
     let sftp = open_sftp_session(&handle).await?;
 
@@ -324,6 +335,14 @@ async fn run_sftp(
             SftpCommand::TransferFinished(id) => {
                 active_transfers.remove(&id);
             }
+            SftpCommand::ReadDirectory { path, reply } => {
+                if !reply.is_closed() {
+                    let result = list_dir_impl(&sftp, &path)
+                        .await
+                        .map_err(|err| format!("{err:#}"));
+                    let _ = reply.send(result);
+                }
+            }
             SftpCommand::ListDir(path) => {
                 let actual_path = if path == "~" {
                     home.clone()
@@ -338,11 +357,7 @@ async fn run_sftp(
                     let _ = events.send(BackendEvent::SftpDirectoryFailed {
                         tab_id: tab_id.clone(),
                         path: actual_path,
-                        reason: reason.clone(),
-                    });
-                    let _ = events.send(BackendEvent::SftpStatus {
-                        tab_id: tab_id.clone(),
-                        text: reason,
+                        reason,
                     });
                 }
             }
@@ -356,6 +371,7 @@ async fn run_sftp(
                 Err(err) => {
                     let _ = events.send(BackendEvent::SftpStatus {
                         tab_id: tab_id.clone(),
+                        error: true,
                         text: t!("preview_failed", err = format!("{err:#}")).into(),
                     });
                 }
@@ -386,10 +402,6 @@ async fn run_sftp(
                 tokio::spawn(async move {
                     let result = async {
                         let sftp_session = open_sftp_session(&handle_clone).await?;
-                        let _ = events_clone.send(BackendEvent::SftpStatus {
-                            tab_id: tab_id_clone.clone(),
-                            text: t!("downloading_file", base = base_name(&remote)).to_string(),
-                        });
                         let transfer = TransferContext {
                             flag: &flag,
                             events: &events_clone,
@@ -410,6 +422,7 @@ async fn run_sftp(
                         Ok(summary) => {
                             let _ = events_clone.send(BackendEvent::SftpStatus {
                                 tab_id: tab_id_clone,
+                                error: false,
                                 text: summary,
                             });
                         }
@@ -425,6 +438,7 @@ async fn run_sftp(
                             };
                             let _ = events_clone.send(BackendEvent::SftpStatus {
                                 tab_id: tab_id_clone,
+                                error: true,
                                 text: if is_cancelled {
                                     "Transmission cancelled".to_string()
                                 } else {
@@ -494,10 +508,6 @@ async fn run_sftp(
                 tokio::spawn(async move {
                     let result = async {
                         let sftp_session = open_sftp_session(&handle_clone).await?;
-                        let _ = events_clone.send(BackendEvent::SftpStatus {
-                            tab_id: tab_id_clone.clone(),
-                            text: t!("uploading").to_string(),
-                        });
                         upload_paths_impl(
                             &sftp_session,
                             &locals,
@@ -514,6 +524,7 @@ async fn run_sftp(
                         Ok(summary) => {
                             let _ = events_clone.send(BackendEvent::SftpStatus {
                                 tab_id: tab_id_clone,
+                                error: false,
                                 text: summary,
                             });
                             let _ = commands_tx_clone.send(SftpCommand::ListDir(remote_dir));
@@ -530,6 +541,7 @@ async fn run_sftp(
                             };
                             let _ = events_clone.send(BackendEvent::SftpStatus {
                                 tab_id: tab_id_clone,
+                                error: true,
                                 text: if is_cancelled {
                                     "Transmission cancelled".to_string()
                                 } else {
@@ -598,6 +610,7 @@ async fn run_sftp(
                     Ok(_) => {
                         let _ = events.send(BackendEvent::SftpStatus {
                             tab_id: tab_id.clone(),
+                            error: false,
                             text: t!("create_folder_success", name = base_name(&actual_path))
                                 .to_string(),
                         });
@@ -612,6 +625,7 @@ async fn run_sftp(
                     Err(err) => {
                         let _ = events.send(BackendEvent::SftpStatus {
                             tab_id: tab_id.clone(),
+                            error: true,
                             text: t!("create_folder_failed", err = format!("{err:#}")).to_string(),
                         });
                     }
@@ -619,10 +633,6 @@ async fn run_sftp(
             }
             SftpCommand::DeletePaths(paths) => {
                 tracing::info!("[sftp] batch deleting {} paths", paths.len());
-                let _ = events.send(BackendEvent::SftpStatus {
-                    tab_id: tab_id.clone(),
-                    text: t!("deleting_paths", count = paths.len()).to_string(),
-                });
 
                 let mut errors = Vec::new();
                 for path in paths.clone() {
@@ -642,11 +652,13 @@ async fn run_sftp(
                 if errors.is_empty() {
                     let _ = events.send(BackendEvent::SftpStatus {
                         tab_id: tab_id.clone(),
+                        error: false,
                         text: t!("delete_success", count = paths.len()).to_string(),
                     });
                 } else {
                     let _ = events.send(BackendEvent::SftpStatus {
                         tab_id: tab_id.clone(),
+                        error: true,
                         text: t!("delete_failed", err = errors.join(", ")).to_string(),
                     });
                 }
@@ -745,10 +757,6 @@ async fn emit_entries(
         tab_id: tab_id.to_string(),
         path: path.to_string(),
         entries,
-    });
-    let _ = events.send(BackendEvent::SftpStatus {
-        tab_id: tab_id.to_string(),
-        text: path.to_string(),
     });
     Ok(())
 }
@@ -1013,7 +1021,6 @@ pub(crate) fn join_remote(parent: &str, child: &str) -> String {
 }
 
 pub(crate) fn normalize_remote_path(input: &str, current: &str, home: &str) -> String {
-    let input = input.trim();
     let expanded = if input.is_empty() {
         current.to_string()
     } else if input == "~" {

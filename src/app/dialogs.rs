@@ -1940,7 +1940,11 @@ impl Ashell {
                         if is_current {
                             this.active_dialog = None;
                             this.sftp_rename_state = None;
-                            this.status = t!("rename_success", name = new_name).to_string().into();
+                            this.show_sftp_notice(
+                                &group_id,
+                                t!("rename_success", name = new_name).to_string(),
+                                false,
+                            );
                             window.close_dialog(cx);
                             cx.notify();
                         }
