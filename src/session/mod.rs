@@ -2018,22 +2018,9 @@ impl Ashell {
             }
         }
         if event.button == MouseButton::Left {
-            if event.modifiers.platform {
-                if let Some((row, col, _side)) = self.terminal_grid_point_and_side(event.position) {
-                    if let Some((url, _)) = self
-                        .active_terminal_tab()
-                        .and_then(|tab| tab.url_at_cell(row, col))
-                    {
-                        let _ = open::that(&url);
-                        return;
-                    }
-                }
-            }
-            if event.modifiers.alt
-                && !event.modifiers.control
-                && !event.modifiers.shift
-                && !event.modifiers.platform
-                && self.move_terminal_cursor_to_click(event.position, window, cx)
+            if event.modifiers.number_of_modifiers() == 1
+                && (event.modifiers.secondary() || event.modifiers.alt)
+                && self.handle_modified_terminal_click(event, window, cx)
             {
                 return;
             }

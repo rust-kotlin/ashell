@@ -24,7 +24,7 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.cmd_ctrl_pressed = event.keystroke.modifiers.platform;
+        self.link_modifier_pressed = event.keystroke.modifiers.secondary();
         // If the search input is focused, skip terminal key processing
         // so the input can handle text entry, paste, etc. normally.
         if self
@@ -531,13 +531,14 @@ impl Ashell {
         }
     }
 
-    pub(crate) fn move_terminal_cursor_to_click(
+    pub(crate) fn handle_modified_terminal_click(
         &mut self,
-        position: Point<Pixels>,
+        event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some((target_row, target_col, _)) = self.terminal_grid_point_and_side(position) else {
+        let Some((target_row, target_col, _)) = self.terminal_grid_point_and_side(event.position)
+        else {
             return false;
         };
         let Some(active_id) = self.active_tab.clone() else {
@@ -546,8 +547,21 @@ impl Ashell {
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active_id) else {
             return false;
         };
-        let mode = *tab.term.mode();
-        let click_state = if tab.is_alternate_screen_active() || tab.mouse_tracking_enabled() {
+        let mouse_tracking = tab.mouse_tracking_enabled();
+        if event.modifiers.secondary() {
+            if let Some((url, _)) = tab.url_at_cell(target_row, target_col) {
+                let _ = open::that(&url);
+                window.prevent_default();
+                cx.stop_propagation();
+                return true;
+            }
+            if !mouse_tracking {
+                return false;
+            }
+        } else if mouse_tracking {
+            return false;
+        }
+        let click_state = if tab.is_alternate_screen_active() || mouse_tracking {
             None
         } else {
             tab.prompt_input_click_state((target_row, target_col))
@@ -594,8 +608,11 @@ impl Ashell {
                     (movement.bytes, Some(predicted_cursor))
                 }
             }
-        } else if tab.mouse_tracking_enabled() {
-            (terminal_mouse_click((target_row, target_col), mode), None)
+        } else if mouse_tracking {
+            (
+                terminal_mouse_click((target_row, target_col), *tab.term.mode()),
+                None,
+            )
         } else if tab.is_alternate_screen_active() {
             let Some(cursor) = tab.cursor_state_for_click() else {
                 return false;
@@ -668,7 +685,7 @@ impl Ashell {
         }
 
         // Track URL hover
-        let cmd_ctrl_pressed = event.modifiers.platform;
+        let link_modifier_pressed = event.modifiers.secondary();
         let hit = self.terminal_grid_point_and_side(event.position);
         let hovered_url = hit.and_then(|(row, col, _)| {
             let tab = self.active_terminal_tab()?;
@@ -680,9 +697,9 @@ impl Ashell {
             })
         });
 
-        if self.hovered_url != hovered_url || self.cmd_ctrl_pressed != cmd_ctrl_pressed {
+        if self.hovered_url != hovered_url || self.link_modifier_pressed != link_modifier_pressed {
             self.hovered_url = hovered_url;
-            self.cmd_ctrl_pressed = cmd_ctrl_pressed;
+            self.link_modifier_pressed = link_modifier_pressed;
             cx.notify();
         }
 
